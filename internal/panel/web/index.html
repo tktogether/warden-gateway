@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Warden Gateway</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body data-base="/warden">
+<div id="boot" class="boot">正在检查登录状态…</div>
+
+<section id="login" class="login" hidden>
+  <div class="login-visual">
+    <div class="brand-lockup">
+      <span class="brand-mark">WG</span>
+      <div>
+        <h1>Warden Gateway</h1>
+        <p>服务器统一入口控制台</p>
+      </div>
+    </div>
+    <p class="login-lead">管理 SNI 入口、Docker 镜像代理、GitHub 下载代理、DNS 分流、证书和配置备份。</p>
+    <ul class="login-points">
+      <li>访问密钥仅用于登录，服务器保存 SHA-256 摘要。</li>
+      <li>登录会话使用 HMAC 签名 Cookie。</li>
+      <li>所有修改操作需要 CSRF 令牌。</li>
+    </ul>
+  </div>
+  <form id="login-form" class="login-card">
+    <h2>登录</h2>
+    <p class="muted">请输入访问密钥。</p>
+    <label class="field">
+      <span>访问密钥</span>
+      <input id="login-key" type="password" autocomplete="current-password" required minlength="10" spellcheck="false">
+    </label>
+    <p id="login-error" class="form-error" role="alert" hidden></p>
+    <button id="login-submit" class="btn primary wide" type="submit">登录</button>
+    <p class="login-hint">密钥可在登录后的“设置”页面修改。</p>
+  </form>
+</section>
+
+<div id="app" class="app" hidden>
+  <header class="topbar">
+    <div class="brand-lockup small">
+      <span class="brand-mark">WG</span>
+      <div>
+        <strong>Warden Gateway</strong>
+        <span id="top-url" class="muted"></span>
+      </div>
+    </div>
+    <div class="top-actions">
+      <span id="top-status" class="pill">连接中</span>
+      <button id="logout" class="btn ghost" type="button">退出登录</button>
+    </div>
+  </header>
+
+  <div class="shell">
+    <aside class="sidebar">
+      <nav class="nav" aria-label="主导航">
+        <button class="nav-item active" data-view="overview" type="button">总览</button>
+        <button class="nav-item" data-view="metrics" type="button">指标</button>
+        <button class="nav-item" data-view="proxies" type="button">代理</button>
+        <button class="nav-item" data-view="backups" type="button">备份</button>
+        <button class="nav-item" data-view="audit" type="button">审计</button>
+        <button class="nav-item" data-view="settings" type="button">设置</button>
+      </nav>
+      <div class="sidebar-foot">
+        <span id="panel-version" class="muted"></span>
+        <span id="panel-key" class="muted"></span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <section id="view-overview" class="view">
+        <div class="page-head">
+          <div><h2>总览</h2><p id="overview-note" class="muted">加载中…</p></div>
+          <button id="refresh-overview" class="btn" type="button">刷新</button>
+        </div>
+        <div id="overview-content"></div>
+      </section>
+
+      <section id="view-metrics" class="view" hidden>
+        <div class="page-head">
+          <div><h2>指标</h2><p id="metrics-note" class="muted">主机资源与网络趋势</p></div>
+          <div class="range-bar" id="metrics-range">
+            <button class="range active" data-range="1h" type="button">1 小时</button>
+            <button class="range" data-range="6h" type="button">6 小时</button>
+            <button class="range" data-range="24h" type="button">24 小时</button>
+          </div>
+        </div>
+        <div id="metrics-content"></div>
+      </section>
+
+      <section id="view-proxies" class="view" hidden>
+        <div class="page-head">
+          <div><h2>代理</h2><p id="proxies-note" class="muted">入口、镜像与下载代理</p></div>
+          <button id="refresh-proxies" class="btn" type="button">刷新</button>
+        </div>
+        <div id="proxies-content"></div>
+      </section>
+
+      <section id="view-backups" class="view" hidden>
+        <div class="page-head">
+          <div><h2>备份</h2><p class="muted">备份配置、ACME 证书和 systemd 单元；恢复后自动重启。</p></div>
+          <button id="create-backup" class="btn primary" type="button">创建备份</button>
+        </div>
+        <div id="backups-content"></div>
+      </section>
+
+      <section id="view-audit" class="view" hidden>
+        <div class="page-head">
+          <div><h2>审计</h2><p class="muted">登录、密钥、服务操作、备份和探测记录。</p></div>
+          <form id="audit-search" class="toolbar">
+            <input id="audit-q" type="search" placeholder="搜索关键字">
+            <button class="btn" type="submit">搜索</button>
+          </form>
+        </div>
+        <div id="audit-content"></div>
+      </section>
+
+      <section id="view-settings" class="view" hidden>
+        <div class="page-head">
+          <div><h2>设置</h2><p class="muted">访问密钥、证书与运行配置。</p></div>
+        </div>
+        <div id="settings-content"></div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<div id="modal" class="modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-head">
+      <h3 id="modal-title"></h3>
+      <button id="modal-close" class="btn ghost" type="button">关闭</button>
+    </div>
+    <div id="modal-body" class="modal-body"></div>
+  </div>
+</div>
+<div id="toast" class="toast" role="status" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

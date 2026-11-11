@@ -1,0 +1,311 @@
+package gateway
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/tktogether/warden-gateway/internal/config"
+	"github.com/tktogether/warden-gateway/internal/logging"
+)
+
+type HostMatcher struct {
+	exact    map[string]struct{}
+	suffixes []string
+}
+
+func NewHostMatcher(patterns []string) *HostMatcher {
+	m := &HostMatcher{exact: map[string]struct{}{}}
+	for _, raw := range patterns {
+		p := normalizeHost(raw)
+		if p == "" {
+			continue
+		}
+		if strings.HasPrefix(p, "*.") {
+			s := strings.TrimPrefix(p, "*.")
+			if s != "" {
+				m.suffixes = append(m.suffixes, s)
+			}
+			continue
+		}
+		m.exact[p] = struct{}{}
+	}
+	return m
+}
+
+func (m *HostMatcher) Match(host string) bool {
+	if m == nil {
+		return false
+	}
+	h := normalizeHost(host)
+	if h == "" {
+		return false
+	}
+	if _, ok := m.exact[h]; ok {
+		return true
+	}
+	for _, s := range m.suffixes {
+		if strings.HasSuffix(h, "."+s) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeHost(h string) string {
+	h = strings.TrimSpace(strings.ToLower(h))
+	h = strings.TrimSuffix(h, ".")
+	if h == "" || len(h) > 253 {
+		return ""
+	}
+	for _, r := range h {
+		if r <= 32 || r == 127 {
+			return ""
+		}
+	}
+	if strings.ContainsAny(h, "/\\@:") {
+		return ""
+	}
+	return h
+}
+
+type SNIProxy struct {
+	cfg       config.SNIConfig
+	entryAddr string
+	panelAddr string
+	matcher   *HostMatcher
+	log       *logging.Logger
+	listener  net.Listener
+	wg        sync.WaitGroup
+}
+
+func NewSNIProxy(cfg config.SNIConfig, entryAddr, panelAddr string, log *logging.Logger) *SNIProxy {
+	return &SNIProxy{
+		cfg:       cfg,
+		entryAddr: entryAddr,
+		panelAddr: panelAddr,
+		matcher:   NewHostMatcher(cfg.Passthrough),
+		log:       log,
+	}
+}
+
+func (s *SNIProxy) Listen() error {
+	ln, err := net.Listen("tcp", s.entryAddr)
+	if err != nil {
+		return fmt.Errorf("listen entry %s: %w", s.entryAddr, err)
+	}
+	s.listener = ln
+	return nil
+}
+
+func (s *SNIProxy) Addr() string {
+	if s.listener == nil {
+		return ""
+	}
+	return s.listener.Addr().String()
+}
+
+func (s *SNIProxy) Serve() error {
+	if s.listener == nil {
+		return errors.New("sni listener is not initialized")
+	}
+	for {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			return err
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.handle(conn)
+		}()
+	}
+}
+
+func (s *SNIProxy) Close() error {
+	if s.listener == nil {
+		return nil
+	}
+	err := s.listener.Close()
+	s.wg.Wait()
+	return err
+}
+
+func (s *SNIProxy) handle(client net.Conn) {
+	defer client.Close()
+	_ = client.SetDeadline(time.Now().Add(15 * time.Second))
+	hello, serverName, err := readClientHello(client)
+	if err != nil {
+		s.log.Debugf("sni: read client hello: %v", err)
+		return
+	}
+	_ = client.SetDeadline(time.Time{})
+	name := normalizeHost(serverName)
+	if name == "" {
+		return
+	}
+	var target string
+	switch {
+	case strings.EqualFold(name, normalizeHost(s.cfg.PanelDomain)):
+		target = s.panelAddr
+	case s.matcher.Match(name):
+		target = net.JoinHostPort(name, "443")
+	default:
+		s.log.Debugf("sni: rejected host %q", name)
+		return
+	}
+	upstream, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if err != nil {
+		s.log.Warnf("sni: dial %s: %v", target, err)
+		return
+	}
+	defer upstream.Close()
+	_ = upstream.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := upstream.Write(hello); err != nil {
+		s.log.Debugf("sni: write hello to %s: %v", target, err)
+		return
+	}
+	_ = upstream.SetDeadline(time.Time{})
+	relay(client, upstream)
+}
+
+func relay(a, b net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	cp := func(dst, src net.Conn) {
+		defer wg.Done()
+		_, _ = io.Copy(dst, src)
+		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		} else {
+			_ = dst.Close()
+		}
+	}
+	go cp(a, b)
+	go cp(b, a)
+	wg.Wait()
+}
+
+func readClientHello(conn net.Conn) ([]byte, string, error) {
+	var raw []byte
+	var payload []byte
+	handshakeLen := -1
+	for len(raw) < 128*1024 {
+		header := make([]byte, 5)
+		if _, err := io.ReadFull(conn, header); err != nil {
+			return nil, "", err
+		}
+		if header[0] != 22 {
+			return nil, "", errors.New("not a TLS handshake record")
+		}
+		n := int(header[3])<<8 | int(header[4])
+		if n <= 0 || n > 65535 {
+			return nil, "", errors.New("invalid TLS record length")
+		}
+		body := make([]byte, n)
+		if _, err := io.ReadFull(conn, body); err != nil {
+			return nil, "", err
+		}
+		raw = append(raw, header...)
+		raw = append(raw, body...)
+		payload = append(payload, body...)
+		if handshakeLen < 0 && len(payload) >= 4 {
+			if payload[0] != 1 {
+				return nil, "", errors.New("not a ClientHello")
+			}
+			handshakeLen = int(payload[1])<<16 | int(payload[2])<<8 | int(payload[3])
+		}
+		if handshakeLen >= 0 && len(payload) >= 4+handshakeLen {
+			name, err := parseServerName(payload[4 : 4+handshakeLen])
+			return raw, name, err
+		}
+	}
+	return nil, "", errors.New("client hello too large")
+}
+
+func parseServerName(hello []byte) (string, error) {
+	pos := 0
+	if len(hello) < 2+32+1 {
+		return "", io.ErrUnexpectedEOF
+	}
+	pos += 2 + 32
+	sidLen := int(hello[pos])
+	pos++
+	if pos+sidLen > len(hello) {
+		return "", io.ErrUnexpectedEOF
+	}
+	pos += sidLen
+	if pos+2 > len(hello) {
+		return "", io.ErrUnexpectedEOF
+	}
+	cipherLen := int(hello[pos])<<8 | int(hello[pos+1])
+	pos += 2
+	if pos+cipherLen > len(hello) {
+		return "", io.ErrUnexpectedEOF
+	}
+	pos += cipherLen
+	if pos >= len(hello) {
+		return "", errors.New("client hello has no compression methods")
+	}
+	compLen := int(hello[pos])
+	pos++
+	if pos+compLen > len(hello) {
+		return "", io.ErrUnexpectedEOF
+	}
+	pos += compLen
+	if pos+2 > len(hello) {
+		return "", errors.New("client hello has no extensions")
+	}
+	extLen := int(hello[pos])<<8 | int(hello[pos+1])
+	pos += 2
+	end := pos + extLen
+	if end > len(hello) {
+		return "", io.ErrUnexpectedEOF
+	}
+	for pos+4 <= end {
+		typ := int(hello[pos])<<8 | int(hello[pos+1])
+		n := int(hello[pos+2])<<8 | int(hello[pos+3])
+		pos += 4
+		if pos+n > end {
+			return "", io.ErrUnexpectedEOF
+		}
+		if typ == 0 {
+			return parseServerNameExtension(hello[pos : pos+n])
+		}
+		pos += n
+	}
+	return "", errors.New("client hello has no server name")
+}
+
+func parseServerNameExtension(ext []byte) (string, error) {
+	if len(ext) < 2 {
+		return "", io.ErrUnexpectedEOF
+	}
+	listLen := int(ext[0])<<8 | int(ext[1])
+	pos := 2
+	if pos+listLen > len(ext) {
+		return "", io.ErrUnexpectedEOF
+	}
+	end := pos + listLen
+	for pos+3 <= end {
+		nameType := ext[pos]
+		n := int(ext[pos+1])<<8 | int(ext[pos+2])
+		pos += 3
+		if pos+n > end {
+			return "", io.ErrUnexpectedEOF
+		}
+		if nameType == 0 {
+			return string(ext[pos : pos+n]), nil
+		}
+		pos += n
+	}
+	return "", errors.New("server name extension is empty")
+}

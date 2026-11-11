@@ -1,0 +1,83 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+  packages: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            goarch: amd64
+            goarm: ""
+          - arch: arm64
+            goarch: arm64
+            goarm: ""
+          - arch: armv7
+            goarch: arm
+            goarm: "7"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: 构建
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          BUILD_TIME: ${{ github.event.repository.updated_at }}
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/tktogether/warden-gateway/internal/version.Version=${VERSION} -X github.com/tktogether/warden-gateway/internal/version.Commit=${COMMIT} -X github.com/tktogether/warden-gateway/internal/version.BuildTime=${BUILD_TIME}" -o dist/warden-gateway ./cmd/warden-gateway
+          tar -czf dist/warden-gateway_linux_${{ matrix.arch }}.tar.gz -C dist warden-gateway
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: dist/warden-gateway_linux_${{ matrix.arch }}.tar.gz
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: 校验和
+        run: cd dist && sha256sum *.tar.gz > checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          generate_release_notes: true
+  image:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:latest
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
