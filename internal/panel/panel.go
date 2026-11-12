@@ -1026,9 +1026,12 @@ func (s *Server) scheduleRestart() {
 		time.Sleep(700 * time.Millisecond)
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		out, err := exec.CommandContext(ctx, "systemctl", "restart", s.serviceName).CombinedOutput()
+		// --no-block returns before systemd stops this unit: without it the
+		// client process runs in the service cgroup and is killed by the very
+		// stop it requested, which leaves the unit stopped instead of restarted.
+		out, err := exec.CommandContext(ctx, "systemctl", "restart", "--no-block", s.serviceName).CombinedOutput()
 		if err != nil {
-			s.log.Errorf("restart after restore failed: %v %s", err, strings.TrimSpace(string(out)))
+			s.log.Errorf("restart request failed: %v %s", err, strings.TrimSpace(string(out)))
 		}
 	}()
 }

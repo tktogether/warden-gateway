@@ -82,6 +82,9 @@ type SNIProxy struct {
 	stats     *telemetry.Store
 	log       *logging.Logger
 	listener  net.Listener
+	mu        sync.Mutex
+	conns     map[net.Conn]struct{}
+	closing   bool
 	wg        sync.WaitGroup
 }
 
@@ -96,6 +99,7 @@ func NewSNIProxy(cfg config.SNIConfig, entryAddr, panelAddr string, stats *telem
 		matcher:   NewHostMatcher(cfg.Passthrough),
 		stats:     stats,
 		log:       log,
+		conns:     make(map[net.Conn]struct{}),
 	}
 }
 
@@ -105,6 +109,11 @@ func (s *SNIProxy) Listen() error {
 		return fmt.Errorf("listen entry %s: %w", s.entryAddr, err)
 	}
 	s.listener = ln
+	s.mu.Lock()
+	if s.conns == nil {
+		s.conns = make(map[net.Conn]struct{})
+	}
+	s.mu.Unlock()
 	return nil
 }
 
@@ -128,7 +137,9 @@ func (s *SNIProxy) Serve() error {
 			}
 			return err
 		}
-		s.wg.Add(1)
+		if !s.track(conn) {
+			continue
+		}
 		go func() {
 			defer s.wg.Done()
 			s.handle(conn)
@@ -136,17 +147,59 @@ func (s *SNIProxy) Serve() error {
 	}
 }
 
-func (s *SNIProxy) Close() error {
-	if s.listener == nil {
-		return nil
+// track registers a freshly accepted connection, refusing new ones once Close
+// has started so WaitGroup.Add is never raced by Wait.
+func (s *SNIProxy) track(conn net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		_ = conn.Close()
+		return false
 	}
-	err := s.listener.Close()
-	s.wg.Wait()
+	if s.conns == nil {
+		s.conns = make(map[net.Conn]struct{})
+	}
+	s.conns[conn] = struct{}{}
+	s.wg.Add(1)
+	return true
+}
+
+func (s *SNIProxy) untrack(conn net.Conn) {
+	s.mu.Lock()
+	delete(s.conns, conn)
+	s.mu.Unlock()
+}
+
+// Close stops accepting and force-closes every relay connection so a long-lived
+// client cannot block systemd shutdown for its full stop timeout.
+func (s *SNIProxy) Close() error {
+	var err error
+	if s.listener != nil {
+		err = s.listener.Close()
+	}
+	s.mu.Lock()
+	s.closing = true
+	active := len(s.conns)
+	for conn := range s.conns {
+		_ = conn.Close()
+	}
+	s.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		s.log.Warnf("sni: %d connection(s) still active after close timeout", active)
+	}
 	return err
 }
 
 func (s *SNIProxy) handle(client net.Conn) {
 	defer client.Close()
+	defer s.untrack(client)
 	call := s.stats.Begin("sni")
 	remote := ""
 	if addr := client.RemoteAddr(); addr != nil {
