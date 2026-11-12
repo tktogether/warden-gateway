@@ -104,7 +104,10 @@ func (s *Server) handleCNCommands(w http.ResponseWriter, r *http.Request) {
 	for _, splitMode := range []string{"hosts", "dns", "both"} {
 		commands[splitMode] = cnCommand(splitMode)
 	}
-	restoreCommand := "sudo bash bootstrap.sh cn-restore"
+	// Restore must not assume a bootstrap.sh in the current directory: either
+	// download the script again, or reuse the copy that cn-setup registered as
+	// warden-cn on that machine.
+	restoreCommand := "sudo warden-cn cn-restore"
 	if origin != "" {
 		restoreCommand = "curl -fsSL " + scriptURL + " -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh cn-restore"
 	}

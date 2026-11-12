@@ -18,9 +18,15 @@ import (
 
 func newPanel(t *testing.T) (*Server, string) {
 	t.Helper()
+	return newPanelAt(t, "/warden")
+}
+
+func newPanelAt(t *testing.T, panelPath string) (*Server, string) {
+	t.Helper()
 	dir := t.TempDir()
 	cfg := config.Default()
-	cfg.PublicURL = "http://127.0.0.1:18080/warden"
+	cfg.PanelPath = panelPath
+	cfg.PublicURL = "http://127.0.0.1:18080" + panelPath
 	cfg.Domain = ""
 	cfg.TLS.Mode = "self"
 	cfg.Listen.HTTP = "127.0.0.1:18080"
@@ -198,7 +204,7 @@ func TestEffectOverheadUsesOnlyUpstreamSamples(t *testing.T) {
 // login performs a login and returns the session cookie plus CSRF token.
 func login(t *testing.T, srv *Server, key string) (*http.Cookie, string) {
 	t.Helper()
-	rec := do(t, srv, "POST", "/warden/api/login", map[string]string{"key": key}, nil, "")
+	rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/login", map[string]string{"key": key}, nil, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("login status %d: %s", rec.Code, rec.Body)
 	}
@@ -354,6 +360,49 @@ func TestDNSEndpointsExposeStatus(t *testing.T) {
 		if _, ok := dns[field]; !ok {
 			t.Fatalf("dns status missing %q", field)
 		}
+	}
+}
+
+func TestPanelPathRedirectsToTrailingSlash(t *testing.T) {
+	srv, _ := newPanel(t)
+	rec := do(t, srv, "GET", "/warden?tab=metrics", nil, nil, "")
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status %d, want 302", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/warden/?tab=metrics" {
+		t.Fatalf("location %q", loc)
+	}
+	rec = do(t, srv, "GET", "/warden/", nil, nil, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("index status %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `data-base="/warden"`) {
+		t.Fatal("index does not carry the default base path")
+	}
+	if rec := do(t, srv, "GET", "/warden/style.css", nil, nil, ""); rec.Code != http.StatusOK {
+		t.Fatalf("style status %d", rec.Code)
+	}
+}
+
+func TestPanelPathRewritesIndexBaseAndAssets(t *testing.T) {
+	srv, key := newPanelAt(t, "/console")
+	if rec := do(t, srv, "GET", "/console/style.css", nil, nil, ""); rec.Code != http.StatusOK {
+		t.Fatalf("assets must be served under the custom panel path, got %d", rec.Code)
+	}
+	rec := do(t, srv, "GET", "/console", nil, nil, "")
+	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/console/" {
+		t.Fatalf("redirect %d %q", rec.Code, rec.Header().Get("Location"))
+	}
+	rec = do(t, srv, "GET", "/console/", nil, nil, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("index status %d", rec.Code)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `data-base="/console"`) {
+		t.Fatalf("index base path not rewritten: %s", body)
+	}
+	cookie, _ := login(t, srv, key)
+	if rec := do(t, srv, "GET", "/console/api/session", nil, cookie, ""); rec.Code != http.StatusOK {
+		t.Fatalf("session under custom path status %d: %s", rec.Code, rec.Body)
 	}
 }
 

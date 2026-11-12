@@ -62,7 +62,7 @@ sudo bash toolbox.sh gateway logs
 
 ## 国内机设置
 
-国内机设置不在工具箱和维护命令中执行。网关只生成命令，需在国内机上运行 `bootstrap.sh cn-setup`：
+国内机设置不在工具箱和维护命令中执行。网关只生成命令，需在国内机上运行 `bootstrap.sh cn-setup`；执行后脚本会保存为 `warden-cn`，之后用 `sudo warden-cn cn-restore` 恢复：
 
 ```bash
 curl -fsSL https://panel.example.com/bootstrap.sh -o /tmp/wg-bootstrap.sh

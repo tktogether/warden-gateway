@@ -107,6 +107,8 @@ GET 请求，返回最近 `minutes`（5 到 60，默认 60）的承载统计。�
 
 响应字段：`as_of`、`origin`、`gateway_ip`、`panel_host`、`domains`、`script_url`、`command`、`commands`（`hosts`、`dns`、`both`）、`restore_command`、`cn_mode`、`dns`、`dns_ready`。
 
+`restore_command` 重新下载脚本；国内机执行过 `cn-setup` 后脚本保存为 `/usr/local/bin/warden-cn`，也可直接运行 `sudo warden-cn cn-restore`。
+
 `dns_ready` 为 true 表示网关 DNS 服务正在 53 端口运行，此时默认给出 `both` 模式命令；否则给出 `hosts` 模式命令。
 
 ## 脚本下载

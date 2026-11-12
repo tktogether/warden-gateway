@@ -240,14 +240,13 @@ sudo bash /tmp/wg-bootstrap.sh cn-setup --gateway-ip 192.0.2.10 \
 
 分流方式由 `--cn-mode` 选择：`hosts`（默认，只改 hosts）、`dns`（只改 resolver）、`both`（两者互为兜底）、`none`（都不改）。参与分流的域名用 `--cn-domains` 指定。面板「设置」页选择分流方式后给出对应命令，「诊断」页同时列出 hosts、DNS、both 三种命令。
 
-每次修改前自动备份到 `/var/backups/warden-gateway-cn`，最多保留 10 个。恢复：
+每次修改前自动备份到 `/var/backups/warden-gateway-cn`，最多保留 10 个。执行 `cn-setup` 时脚本同时保存为 `/usr/local/bin/warden-cn`，恢复时直接调用：
 
 ```bash
-curl -fsSL https://panel.example.com/bootstrap.sh -o /tmp/wg-bootstrap.sh
-sudo bash /tmp/wg-bootstrap.sh cn-restore --id latest
+sudo warden-cn cn-restore --id latest
 ```
 
-不带 `--id` 时使用最新备份。
+不带 `--id` 时使用最新备份。`warden-cn` 不可用时，重新下载脚本后执行 `sudo bash /tmp/wg-bootstrap.sh cn-restore`。
 
 ## 一键诊断
 

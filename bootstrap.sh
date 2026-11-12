@@ -11,6 +11,7 @@ SCRIPT_DIR="/opt/warden-gateway"
 UNIT_PATH="/etc/systemd/system/$SERVICE.service"
 LOGROTATE_PATH="/etc/logrotate.d/$SERVICE"
 CLI_PATH="/usr/local/bin/warden"
+CN_CLI_PATH="/usr/local/bin/warden-cn"
 PANEL_BASE_PATH="/warden"
 HTTP_LISTEN="127.0.0.1:8080"
 REPO="tktogether/warden-gateway"
@@ -193,7 +194,9 @@ Warden Gateway 一键安装脚本
 
 安装完成后会注册维护命令 warden，常用操作：
   sudo warden status | update | doctor | backup | restore | logs | version
-  国内机设置不在维护命令中，请在国内机上运行 bootstrap.sh cn-setup。
+  国内机设置不在维护命令中，请在国内机上执行面板设置页生成的命令。
+  国内机执行过 cn-setup 后，脚本同时保存为 warden-cn，可直接运行：
+  sudo warden-cn cn-restore
 
 安装选项：
   --domain DOMAIN        面板域名（留空则使用 IP 自签名证书）
@@ -656,6 +659,37 @@ install_scripts() {
   return 0
 }
 
+# script_self_path 返回当前脚本的绝对路径。脚本被 source 时 $0 是调用者，
+# 优先使用 BASH_SOURCE。
+script_self_path() {
+  local src dir
+  src="${BASH_SOURCE[0]:-$0}"
+  dir="$(cd "$(dirname "$src")" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/%s\n' "$dir" "$(basename "$src")"
+}
+
+# script_public_url 返回网关托管的安装脚本地址；无法确定时输出空。
+script_public_url() {
+  local origin
+  origin="$(printf '%s' "${PUBLIC_URL:-}" | sed -n 's#^\([a-zA-Z][a-zA-Z0-9+.-]*://[^/]*\).*#\1#p')"
+  [ -n "$origin" ] || return 0
+  printf '%s/bootstrap.sh\n' "$origin"
+}
+
+# install_cn_cli 把当前脚本保存为 warden-cn，供国内机恢复设置时直接调用，
+# 不再依赖当前目录是否存在 bootstrap.sh。
+install_cn_cli() {
+  local self dest_dir
+  self="$(script_self_path)" || return 1
+  [ -n "$self" ] && [ -f "$self" ] || return 1
+  if [ "$DRY_RUN" -eq 1 ]; then printf '  + install %s %s\n' "$self" "$CN_CLI_PATH"; return 0; fi
+  mkdir -p "$(dirname "$CN_CLI_PATH")" || return 1
+  dest_dir="$(cd "$(dirname "$CN_CLI_PATH")" 2>/dev/null && pwd -P)" || dest_dir=""
+  if [ -n "$dest_dir" ] && [ "$self" = "$dest_dir/$(basename "$CN_CLI_PATH")" ]; then return 0; fi
+  install -m 0755 "$self" "$CN_CLI_PATH" || return 1
+  ok "已注册命令 $CN_CLI_PATH"
+}
+
 install_cli() {
   step "命令" "注册维护命令 $CLI_PATH"
   if [ "$DRY_RUN" -eq 1 ]; then printf '  + write %s\n' "$CLI_PATH"; return 0; fi
@@ -666,7 +700,8 @@ set -euo pipefail
 BOOTSTRAP="$SCRIPT_DIR/bootstrap.sh"
 case "\${1:-}" in
   cn-setup|cn-restore)
-    printf '该命令用于国内机，请在目标机执行：bash bootstrap.sh %s\n' "\$1" >&2
+    printf '该命令用于国内机，请在国内机上执行面板设置页生成的命令。\n' >&2
+    printf '国内机已执行过 cn-setup 时，可直接运行：sudo warden-cn %s\n' "\$1" >&2
     exit 2;;
 esac
 if [ ! -f "\$BOOTSTRAP" ]; then
@@ -1256,7 +1291,19 @@ cn_setup() {
   title "国内机设置完成"
   if [ -n "$CN_BACKUP_DIR" ] && [ "$DRY_RUN" -eq 0 ]; then
     kv "备份" "$CN_BACKUP_DIR"
-    say "恢复命令：sudo bash bootstrap.sh cn-restore"
+    if install_cn_cli; then
+      kv "恢复命令" "sudo $CN_CLI_PATH cn-restore"
+    else
+      local self
+      self="$(script_self_path || true)"
+      warn "未能注册 $CN_CLI_PATH"
+      if [ -n "$self" ]; then
+        kv "脚本路径" "$self"
+        kv "恢复命令" "sudo bash $self cn-restore"
+      else
+        say "请保留当前脚本，之后执行：bash <脚本路径> cn-restore"
+      fi
+    fi
   fi
   if [ "$failed" -eq 1 ]; then
     warn "部分设置未成功，请查看上方输出"
@@ -1572,7 +1619,17 @@ cmd_install() {
   title "维护命令"
   kv "维护命令" "$CLI_PATH"
   say "常用操作：sudo warden status | doctor | logs | backup | restore | update"
-  say "国内机设置请在目标机执行：bash bootstrap.sh cn-setup"
+  local cn_url cn_script
+  cn_url="$(script_public_url || true)"
+  cn_script="$SCRIPT_DIR/bootstrap.sh"
+  if [ -n "$cn_url" ]; then
+    say "国内机设置：在面板设置页复制生成好的命令，或先执行"
+    kv "下载脚本" "curl -fsSL $cn_url -o /tmp/wg-bootstrap.sh"
+    kv "再执行" "sudo bash /tmp/wg-bootstrap.sh cn-setup"
+  else
+    say "国内机设置：把 $cn_script 复制到国内机后执行"
+    kv "执行" "sudo bash bootstrap.sh cn-setup"
+  fi
 }
 
 cmd_update() {
@@ -1616,7 +1673,7 @@ cmd_uninstall() {
     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
     systemctl disable "$SERVICE" >/dev/null 2>&1 || true
     docker rm -f "$SERVICE" >/dev/null 2>&1 || true
-    rm -f "$UNIT_PATH" "$LOGROTATE_PATH" "$BIN_PATH" "$CLI_PATH"
+    rm -f "$UNIT_PATH" "$LOGROTATE_PATH" "$BIN_PATH" "$CLI_PATH" "$CN_CLI_PATH"
     systemctl daemon-reload
   fi
   if [ "$PURGE" -eq 1 ]; then

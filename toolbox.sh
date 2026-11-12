@@ -269,10 +269,8 @@ main_menu() {
     printf '  6) 常用工具\n'
     printf '  7) BBR 配置与测试\n'
     printf '  8) 一键诊断\n'
-    printf '  9) 国内机设置\n'
-    printf ' 10) 恢复国内机设置\n'
-    printf ' 11) 卸载\n'
-    printf ' 12) 运行工具箱自检\n'
+    printf '  9) 卸载\n'
+    printf ' 10) 运行工具箱自检\n'
     printf '  0) 退出\n'
     if ! read -r -p '选择: ' choice; then
       return 0
@@ -287,10 +285,8 @@ main_menu() {
       6) menu_action run_module common ;;
       7) menu_action run_module bbr ;;
       8) menu_action run_module gateway doctor ;;
-      9) menu_action run_module gateway cn-setup ;;
-     10) menu_action run_module gateway cn-restore ;;
-     11) menu_action run_module gateway uninstall ;;
-     12) menu_action self_test ;;
+      9) menu_action run_module gateway uninstall ;;
+     10) menu_action self_test ;;
       *) warn "无效选择。" ;;
     esac
     pause_if_tty
@@ -345,7 +341,7 @@ main() {
     self-test)
       self_test
       ;;
-    install|update|status|uninstall|backup|restore|doctor|cn-setup|cn-restore)
+    install|update|status|uninstall|backup|restore|doctor)
       run_gateway_action "$@"
       ;;
     common|tools)

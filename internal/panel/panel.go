@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"io/fs"
 	"net"
@@ -133,12 +134,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'")
-	if strings.HasPrefix(r.URL.Path, s.cfg.PanelPath) {
-		rel := strings.TrimPrefix(r.URL.Path, s.cfg.PanelPath)
-		if rel == "" {
-			rel = "/"
+	if r.URL.Path == s.cfg.PanelPath {
+		target := s.cfg.PanelPath + "/"
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
 		}
-		s.route(w, r, rel)
+		http.Redirect(w, r, target, http.StatusFound)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, s.cfg.PanelPath+"/") {
+		s.route(w, r, strings.TrimPrefix(r.URL.Path, s.cfg.PanelPath))
 		return
 	}
 	s.route(w, r, r.URL.Path)
@@ -254,6 +259,9 @@ func (s *Server) serveAsset(w http.ResponseWriter, name, contentType string, noS
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	if name == "index.html" {
+		raw = s.rewriteIndex(raw)
+	}
 	w.Header().Set("Content-Type", contentType)
 	if noStore {
 		w.Header().Set("Cache-Control", "no-store")
@@ -261,6 +269,18 @@ func (s *Server) serveAsset(w http.ResponseWriter, name, contentType string, noS
 		w.Header().Set("Cache-Control", "public, max-age=300")
 	}
 	_, _ = w.Write(raw)
+}
+
+// rewriteIndex pins the panel base path into the served document so that a
+// custom --panel-path keeps resolving its assets and API calls. The placeholder
+// in the embedded file is the default path.
+func (s *Server) rewriteIndex(raw []byte) []byte {
+	base := html.EscapeString(s.cfg.PanelPath)
+	if base == "" {
+		base = html.EscapeString(config.DefaultPanelPath)
+	}
+	doc := strings.Replace(string(raw), "data-base=\""+config.DefaultPanelPath+"\"", "data-base=\""+base+"\"", 1)
+	return []byte(doc)
 }
 
 // serveScript serves the installer and toolbox scripts hosted on this node so
