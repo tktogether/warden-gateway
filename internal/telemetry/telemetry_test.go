@@ -144,6 +144,25 @@ func TestLatencyPercentilesNeverExceedMax(t *testing.T) {
 	}
 }
 
+// Sub-millisecond samples round Max down to 0; the percentiles must follow so a
+// card never reports P90 10 ms above Max 0 ms.
+func TestLatencyPercentilesClampToZeroMax(t *testing.T) {
+	s := NewStore()
+	s.Begin("dns").Done(200, 51, 54, "", "127.0.0.1:5300", "DNS", "github.com.")
+	lat := s.Detail(60, false)[0].Latency
+	if lat.Count != 1 {
+		t.Fatalf("latency count %d", lat.Count)
+	}
+	if lat.Max != 0 {
+		t.Fatalf("expected sub-millisecond max to round to 0, got %d", lat.Max)
+	}
+	for name, v := range map[string]int64{"p50": lat.P50, "p90": lat.P90, "p99": lat.P99} {
+		if v != 0 {
+			t.Fatalf("%s=%d should be clamped to max 0", name, v)
+		}
+	}
+}
+
 func TestRatesAreRounded(t *testing.T) {
 	s := NewStore()
 	s.Begin("dns").Done(200, 30, 60, "", "127.0.0.1:5300", "DNS", "github.com.")

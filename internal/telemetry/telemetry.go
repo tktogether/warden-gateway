@@ -573,8 +573,9 @@ func latencySummary(hist []int64, count, sum, max int64) Latency {
 	out.P99 = histogramPercentile(hist, count, 99)
 	// Bucket percentiles report the bucket's upper bound, which can sit above
 	// the slowest real sample; clamp them so a card never shows a larger P90
-	// than Max.
-	if out.Max > 0 {
+	// than Max. Sub-millisecond samples leave Max at 0, so the clamp has to run
+	// for every non-empty sample set rather than only when Max > 0.
+	if count > 0 {
 		out.P50 = clampMillis(out.P50, out.Max)
 		out.P90 = clampMillis(out.P90, out.Max)
 		out.P99 = clampMillis(out.P99, out.Max)
