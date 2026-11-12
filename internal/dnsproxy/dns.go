@@ -272,8 +272,35 @@ func (p *Proxy) serveDNS(w dns.ResponseWriter, req *dns.Msg) {
 		}
 	}
 	out = resp.Len()
-	_ = w.WriteMsg(resp)
-	call.DoneTarget(qname, resp.Rcode, int64(in), int64(out), "", w.RemoteAddr().String(), "DNS", qname)
+	errText := ""
+	if err := w.WriteMsg(resp); err != nil {
+		errText = err.Error()
+	}
+	call.DoneTarget(qname, httpStatusForRcode(resp.Rcode), int64(in), int64(out), errText, w.RemoteAddr().String(), "DNS", qname)
+}
+
+// httpStatusForRcode maps a DNS response code onto the HTTP-like status
+// vocabulary used by the telemetry store. The store counts statuses >= 500,
+// status 0 and non-empty errors as failures, so NOERROR must become 200 and
+// SERVFAIL must become 5xx; passing the raw rcode made every successful lookup
+// look like a failure.
+func httpStatusForRcode(rcode int) int {
+	switch rcode {
+	case dns.RcodeSuccess:
+		return 200
+	case dns.RcodeFormatError:
+		return 400
+	case dns.RcodeServerFailure:
+		return 502
+	case dns.RcodeNameError:
+		return 404
+	case dns.RcodeNotImplemented:
+		return 501
+	case dns.RcodeRefused:
+		return 403
+	default:
+		return 502
+	}
 }
 
 func (p *Proxy) matches(name string) bool {

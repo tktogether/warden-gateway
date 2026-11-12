@@ -68,6 +68,8 @@
 
 `recent` 为最近 100 条请求记录。
 
+DNS 通道没有 HTTP 状态码，返回码按语义映射：NOERROR 记 200、FORMERR 记 400、SERVFAIL 与上游不可达记 502、NXDOMAIN 记 404、NOTIMP 记 501、REFUSED 记 403。因此正常解析计入 2xx，上游故障才计入失败。
+
 ### /api/effect
 
 GET 请求，返回最近 `minutes`（5 到 60，默认 60）的承载统计。数据来自真实请求，不主动探测上游：
