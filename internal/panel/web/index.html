@@ -61,6 +61,7 @@
         <button class="nav-item active" data-view="overview" type="button">总览</button>
         <button class="nav-item" data-view="metrics" type="button">指标</button>
         <button class="nav-item" data-view="proxies" type="button">代理</button>
+        <button class="nav-item" data-view="singbox" type="button">节点</button>
         <button class="nav-item" data-view="effect" type="button">承载</button>
         <button class="nav-item" data-view="diagnostics" type="button">诊断</button>
         <button class="nav-item" data-view="backups" type="button">备份</button>
@@ -100,6 +101,14 @@
           <button id="refresh-proxies" class="btn" type="button">刷新</button>
         </div>
         <div id="proxies-content"></div>
+      </section>
+
+      <section id="view-singbox" class="view" hidden>
+        <div class="page-head">
+          <div><h2>节点</h2><p id="singbox-note" class="muted">sing-box 节点、分享链接与实时连接</p></div>
+          <button id="refresh-singbox" class="btn" type="button">刷新</button>
+        </div>
+        <div id="singbox-content"></div>
       </section>
 
       <section id="view-effect" class="view" hidden>

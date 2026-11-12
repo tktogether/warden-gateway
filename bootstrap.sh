@@ -33,6 +33,7 @@ NO_GITHUB=0
 NO_SNI=0
 PURGE=0
 RESTORE_ID="latest"
+SINGBOX_ARGS=()
 NEW_ACCESS_KEY=""
 ACCESS_KEY=""
 IMAGE=""
@@ -189,11 +190,12 @@ Warden Gateway 一键安装脚本
   bootstrap.sh restore [--id ID]    恢复备份（默认最新）
   bootstrap.sh doctor               一键诊断（仅网关自身）
   bootstrap.sh self-test            自检
+  bootstrap.sh singbox [命令]       管理 sing-box 内核（status/install/rollback-previous/rollback-preinstall/restart/uninstall）
   bootstrap.sh cn-setup             在需要走网关的国内机上应用设置
   bootstrap.sh cn-restore [--id ID] 恢复国内机设置（默认最新备份）
 
 安装完成后会注册维护命令 warden，常用操作：
-  sudo warden status | update | doctor | backup | restore | logs | version
+  sudo warden status | update | doctor | backup | restore | logs | version | singbox
   国内机设置不在维护命令中，请在国内机上执行面板设置页生成的命令。
   国内机执行过 cn-setup 后，脚本同时保存为 warden-cn，可直接运行：
   sudo warden-cn cn-restore
@@ -252,6 +254,8 @@ parse_args() {
     case "$1" in
       install|update|uninstall|status|logs|version|backup|restore|doctor|self-test|cn-setup|cn-restore)
         COMMAND="$1"; shift;;
+      singbox)
+        COMMAND="singbox"; shift; SINGBOX_ARGS=("$@"); return 0;;
       --domain) DOMAIN="$2"; shift 2;;
       --public-url) PUBLIC_URL="$2"; shift 2;;
       --email) EMAIL="$2"; shift 2;;
@@ -1755,6 +1759,16 @@ cmd_self_test() {
   ok "自检通过"
 }
 
+cmd_singbox() {
+  need_root
+  title "sing-box 内核"
+  if [ "${#SINGBOX_ARGS[@]}" -eq 0 ]; then
+    run_bin singbox status --config "$CONFIG_FILE"
+  else
+    run_bin singbox "${SINGBOX_ARGS[@]}" --config "$CONFIG_FILE"
+  fi
+}
+
 main() {
   ORIG_ARGS=("$@")
   parse_args "$@"
@@ -1770,6 +1784,7 @@ main() {
     doctor) cmd_doctor;;
     cn-setup) cn_setup;;
     cn-restore) cn_restore;;
+    singbox) cmd_singbox;;
     self-test) cmd_self_test;;
     *) usage; exit 2;;
   esac

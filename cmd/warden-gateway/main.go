@@ -10,10 +10,12 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/tktogether/warden-gateway/internal/app"
 	"github.com/tktogether/warden-gateway/internal/config"
 	"github.com/tktogether/warden-gateway/internal/logging"
+	"github.com/tktogether/warden-gateway/internal/singbox"
 	"github.com/tktogether/warden-gateway/internal/version"
 )
 
@@ -42,6 +44,8 @@ func main() {
 		err = runRestore(args)
 	case "config":
 		err = runConfig(args)
+	case "singbox":
+		err = runSingbox(args)
 	case "version", "--version", "-v":
 		fmt.Println(version.String())
 	case "help", "--help", "-h":
@@ -66,6 +70,7 @@ func usage() {
 		"  warden-gateway key   [--config PATH] [--reset]\n" +
 		"  warden-gateway backup|backups|restore [options]\n" +
 		"  warden-gateway config show|set [options]\n" +
+		"  warden-gateway singbox [status|install|rollback-previous|rollback-preinstall|restart|uninstall] [--version V]\n" +
 		"  warden-gateway version\n\n" +
 		"Run \"warden-gateway init -h\" for the options that create a new configuration.\n")
 }
@@ -300,5 +305,87 @@ func runKey(args []string) error {
 	}
 	fmt.Printf("access_key=%s\n", key)
 	fmt.Println("restart warden-gateway to apply the new key")
+	return nil
+}
+
+func runSingbox(args []string) error {
+	action := "status"
+	rest := args
+	if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		action = rest[0]
+		rest = rest[1:]
+	}
+	fs := flag.NewFlagSet("singbox", flag.ExitOnError)
+	cfgPath := fs.String("config", defaultConfigPath(), "configuration file")
+	coreVersion := fs.String("version", "", "sing-box core version to install (empty or latest)")
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+	manager := singbox.New(singbox.Options{
+		Root:    cfg.SingBox.Root,
+		DataDir: config.DefaultDataDir,
+		Service: cfg.SingBox.Service,
+		Host:    cfg.SingBox.Host,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+	defer cancel()
+	logf := func(format string, a ...interface{}) {
+		fmt.Printf(format+"\n", a...)
+	}
+	printStatus := func(status singbox.CoreStatus) {
+		fmt.Printf("installed=%t\n", status.Installed)
+		fmt.Printf("version=%s\n", status.Version)
+		fmt.Printf("latest=%s\n", status.Latest)
+		if status.LatestError != "" {
+			fmt.Printf("latest_error=%s\n", status.LatestError)
+		}
+		fmt.Printf("update_available=%t\n", status.UpdateAvailable)
+		fmt.Printf("platform=%s\n", status.Platform)
+		fmt.Printf("binary=%s\n", status.Binary)
+		fmt.Printf("unit_installed=%t\n", status.UnitInstalled)
+		fmt.Printf("backups=%d\n", len(status.Backups))
+		if status.Note != "" {
+			fmt.Printf("note=%s\n", status.Note)
+		}
+	}
+	switch action {
+	case "status":
+		printStatus(manager.CoreStatus(ctx))
+	case "install", "update":
+		status, err := manager.InstallCore(ctx, *coreVersion, logf)
+		if err != nil {
+			return err
+		}
+		printStatus(status)
+	case "rollback-previous":
+		status, err := manager.RollbackPrevious(ctx)
+		if err != nil {
+			return err
+		}
+		printStatus(status)
+	case "rollback-preinstall":
+		status, err := manager.RollbackPreinstall(ctx)
+		if err != nil {
+			return err
+		}
+		printStatus(status)
+	case "restart":
+		if err := manager.RestartCore(ctx); err != nil {
+			return err
+		}
+		printStatus(manager.CoreStatus(ctx))
+	case "uninstall":
+		status, err := manager.UninstallCore(ctx)
+		if err != nil {
+			return err
+		}
+		printStatus(status)
+	default:
+		return fmt.Errorf("unknown singbox action %q (status, install, rollback-previous, rollback-preinstall, restart, uninstall)", action)
+	}
 	return nil
 }

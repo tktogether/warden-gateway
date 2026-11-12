@@ -180,6 +180,7 @@ curl -fL https://panel.example.com/https://github.com/owner/repo/releases/downlo
 - 总览：主机负载、内存、磁盘、证书、服务与代理状态，代理卡片带成功率和请求速率。
 - 指标：CPU、负载 1/5/15、内存与交换分区、网络吞吐（含分网卡明细）、磁盘 IO、TCP 连接状态分布、连接跟踪、DNS 分流命中率，以及全部代理通道的请求量与流量曲线。
 - 代理：每个通道的请求总数、成功率、进行中请求、近一分钟请求与流量、状态码分布、延迟平均/P50/P90/P99/最大与直方图、热点目标、上游响应耗时、近六十分钟曲线和连通性测试。
+- 节点：sing-box 内核安装、更新、回滚与卸载，以及节点的创建、链接二维码、配置编辑、启停与删除。
 - 承载：网关最近实际承载的流量。按 Docker、GitHub、DNS、SNI 四个通道给出请求量、成功率、平均与 P90 耗时、上游等待、网关转发耗时、入出流量与热点目标，并附请求与流量趋势。
 - 服务：Warden Gateway 的启动、停止和重启。
 - 备份：创建、下载、恢复和删除备份。恢复后自动重启服务。
@@ -187,6 +188,28 @@ curl -fL https://panel.example.com/https://github.com/owner/repo/releases/downlo
 - 设置：修改访问密钥、查看证书和配置。
 
 访问密钥至少 10 个字符。修改后所有旧会话立即失效。
+
+## sing-box 节点管理
+
+面板「节点」页管理本机 sing-box。内核由本项目安装、更新、回滚与卸载，节点配置写入 `/etc/sing-box/conf`，保存前自动校验，失败时回滚原文件。
+
+- 内核：安装最新版、更新、回滚上一版、回滚到安装前、重启、卸载。安装先把旧内核与单元快照到数据目录；卸载把内核和单元归档后删除，节点配置保留。
+- 节点：支持 Hysteria2、VLESS Reality、Trojan、Shadowsocks 2022、SOCKS5，新建时自动选择空闲端口并生成凭据。
+- 节点操作：查看分享链接与二维码、编辑配置、重置密钥、停用/启用、删除。删除前自动备份到 `/etc/sing-box/backups`。
+- 连接：主配置含 `experimental.clash_api` 时可在面板查看活动连接与流量。
+- 日志：查看服务日志尾部。
+
+内核操作也可用命令行：
+
+```bash
+sudo warden singbox status
+sudo warden singbox install --version 1.14.4
+sudo warden singbox rollback-previous
+sudo warden singbox rollback-preinstall
+sudo warden singbox uninstall
+```
+
+下载从 GitHub 发布页开始，失败时依次尝试 `gh-proxy.com`、`ghfast.top`。可用 `WARDEN_SINGBOX_CORE_MIRRORS` 覆盖镜像前缀。
 
 ## 备份与恢复
 
@@ -212,6 +235,8 @@ warden-gateway backup --config /etc/warden-gateway/config.json
 warden-gateway backups --config /etc/warden-gateway/config.json
 warden-gateway restore --config /etc/warden-gateway/config.json --id latest
 warden-gateway config show --config /etc/warden-gateway/config.json
+warden-gateway singbox status --config /etc/warden-gateway/config.json
+warden-gateway singbox install --config /etc/warden-gateway/config.json --version 1.14.4
 warden-gateway version
 ```
 

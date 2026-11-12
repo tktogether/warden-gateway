@@ -19,6 +19,7 @@ import (
 	"github.com/tktogether/warden-gateway/internal/githubproxy"
 	"github.com/tktogether/warden-gateway/internal/logging"
 	"github.com/tktogether/warden-gateway/internal/panel"
+	"github.com/tktogether/warden-gateway/internal/singbox"
 	"github.com/tktogether/warden-gateway/internal/telemetry"
 )
 
@@ -97,6 +98,19 @@ func New(opts Options) (*App, error) {
 		return nil, err
 	}
 	backups := backup.New(cfg.Backup.Dir, opts.Paths.ConfigPath, opts.Paths.DataDir, opts.Paths.ServicePath, cfg.Backup.Retain)
+	var singboxMgr *singbox.Manager
+	if cfg.SingBox.Enabled {
+		singboxMgr = singbox.New(singbox.Options{
+			Root:    cfg.SingBox.Root,
+			DataDir: opts.Paths.DataDir,
+			Service: cfg.SingBox.Service,
+			Host:    cfg.SingBox.Host,
+			Log:     logger,
+		})
+		if singboxMgr.Host() == "" {
+			singboxMgr.SetHost(cfg.PublicHost())
+		}
+	}
 	var dnsProxy *dnsproxy.Proxy
 	if cfg.DNS.Enabled {
 		dnsProxy, err = dnsproxy.New(cfg.DNS, stats, logger)
@@ -108,7 +122,7 @@ func New(opts Options) (*App, error) {
 		Config: cfg, ConfigPath: opts.Paths.ConfigPath, DataDir: opts.Paths.DataDir,
 		ScriptDir:   opts.Paths.ScriptDir,
 		ServiceName: "warden-gateway.service", Auth: authMgr, Backups: backups,
-		Stats: stats, Log: logger, Started: time.Now(), DNS: dnsProxy,
+		Stats: stats, Log: logger, Started: time.Now(), DNS: dnsProxy, SingBox: singboxMgr,
 	})
 	if err != nil {
 		return nil, err

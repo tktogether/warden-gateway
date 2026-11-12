@@ -97,6 +97,27 @@ GET 请求，返回最近 `minutes`（5 到 60，默认 60）的承载统计。�
 
 启用时自动选择监听地址：优先配置值（默认 `0.0.0.0:53`），被占用时依次尝试 `5353`、`5300`、`9053`，成功后退回响应 `note` 说明原因，并把实际地址写入配置。没有可用地址时返回 400。
 
+## sing-box
+
+`singbox.enabled` 为 false 时以下接口均返回 503。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/singbox` | 内核、节点、校验结果、备份与流量总览 |
+| POST | `/api/singbox` | 新建节点，body `{"type":"hysteria2","name":"手机"}`，可带 `port`、`server`、`method` |
+| POST | `/api/singbox/action` | 节点操作，body `{"action":"reset","id":"Hysteria2-12538"}`；动作 `reset`、`enable`、`disable`、`delete`、`restart`、`check` |
+| GET | `/api/singbox/config?id=ID` | 读取节点配置文本 |
+| POST | `/api/singbox/config` | 保存节点配置，body `{"id":"...","text":"..."}`；校验失败返回 400 并附 `check`，原文件不变 |
+| GET | `/api/singbox/qr?id=ID&user=0&size=320` | 分享链接二维码，返回 PNG |
+| GET | `/api/singbox/connections` | 活动连接，需要主配置含 `experimental.clash_api` |
+| GET | `/api/singbox/log?lines=120` | 服务日志尾部 |
+| GET | `/api/singbox/core` | 内核状态 |
+| POST | `/api/singbox/core` | 内核操作，body `{"action":"install","version":"1.14.4"}`；动作 `install`、`update`、`rollback-previous`、`rollback-preinstall`、`restart`、`uninstall` |
+
+`core` 对象字段：`installed`、`version`、`latest`、`latest_error`、`update_available`、`platform`、`binary`、`unit_installed`、`backups`、`note`。
+
+`install` 与 `update` 从 GitHub 发布页下载对应架构压缩包，解压后执行 `sing-box version` 核对版本再原子替换；`rollback-previous` 恢复上一份内核备份；`rollback-preinstall` 精确恢复首次安装前的内核、单元与服务状态；`uninstall` 把内核与单元归档到数据目录，节点配置保留。
+
 ## 国内机设置
 
 `/api/cn` 只生成给国内机使用的命令，网关本身不执行国内机设置。

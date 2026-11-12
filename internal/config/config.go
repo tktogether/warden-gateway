@@ -34,21 +34,22 @@ const (
 var hostPattern = regexp.MustCompile("^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$")
 
 type Config struct {
-	Version         int          `json:"version"`
-	PublicURL       string       `json:"public_url"`
-	PanelPath       string       `json:"panel_path"`
-	AccessKeySHA256 string       `json:"access_key_sha256"`
-	SessionSecret   string       `json:"session_secret"`
-	Domain          string       `json:"domain"`
-	Email           string       `json:"email,omitempty"`
-	Listen          ListenConfig `json:"listen"`
-	TLS             TLSConfig    `json:"tls"`
-	Docker          DockerConfig `json:"docker"`
-	GitHub          GitHubConfig `json:"github"`
-	SNI             SNIConfig    `json:"sni"`
-	DNS             DNSConfig    `json:"dns"`
-	Backup          BackupConfig `json:"backup"`
-	Log             LogConfig    `json:"log"`
+	Version         int           `json:"version"`
+	PublicURL       string        `json:"public_url"`
+	PanelPath       string        `json:"panel_path"`
+	AccessKeySHA256 string        `json:"access_key_sha256"`
+	SessionSecret   string        `json:"session_secret"`
+	Domain          string        `json:"domain"`
+	Email           string        `json:"email,omitempty"`
+	Listen          ListenConfig  `json:"listen"`
+	TLS             TLSConfig     `json:"tls"`
+	Docker          DockerConfig  `json:"docker"`
+	GitHub          GitHubConfig  `json:"github"`
+	SNI             SNIConfig     `json:"sni"`
+	DNS             DNSConfig     `json:"dns"`
+	SingBox         SingBoxConfig `json:"singbox"`
+	Backup          BackupConfig  `json:"backup"`
+	Log             LogConfig     `json:"log"`
 }
 
 type ListenConfig struct {
@@ -91,6 +92,14 @@ type DNSConfig struct {
 	GatewayIP string   `json:"gateway_ip"`
 	Domains   []string `json:"domains"`
 	Upstream  string   `json:"upstream"`
+}
+
+// SingBoxConfig points the panel at the sing-box installation it manages.
+type SingBoxConfig struct {
+	Enabled bool   `json:"enabled"`
+	Root    string `json:"root"`
+	Service string `json:"service"`
+	Host    string `json:"host,omitempty"`
 }
 
 type BackupConfig struct {
@@ -137,6 +146,11 @@ func Default() Config {
 			Listen:   "0.0.0.0:53",
 			Domains:  DefaultSplitDomains(),
 			Upstream: "1.1.1.1:53",
+		},
+		SingBox: SingBoxConfig{
+			Enabled: true,
+			Root:    "/etc/sing-box",
+			Service: "sing-box.service",
 		},
 		Backup: BackupConfig{
 			Dir:    filepath.Join(DefaultDataDir, "backups"),
@@ -238,6 +252,15 @@ func (c *Config) Normalize() {
 	c.DNS.Listen = strings.TrimSpace(c.DNS.Listen)
 	c.DNS.GatewayIP = strings.TrimSpace(c.DNS.GatewayIP)
 	c.DNS.Upstream = strings.TrimSpace(c.DNS.Upstream)
+	c.SingBox.Root = strings.TrimSpace(c.SingBox.Root)
+	c.SingBox.Service = strings.TrimSpace(c.SingBox.Service)
+	c.SingBox.Host = strings.TrimSpace(c.SingBox.Host)
+	if c.SingBox.Root == "" {
+		c.SingBox.Root = "/etc/sing-box"
+	}
+	if c.SingBox.Service == "" {
+		c.SingBox.Service = "sing-box.service"
+	}
 	c.Backup.Dir = strings.TrimSpace(c.Backup.Dir)
 	c.Log.File = strings.TrimSpace(c.Log.File)
 	c.Log.Level = strings.ToLower(strings.TrimSpace(c.Log.Level))
@@ -422,6 +445,17 @@ func (c *Config) Validate() error {
 		}
 		if err := validateListen("dns.upstream", c.DNS.Upstream, false); err != nil {
 			return err
+		}
+	}
+	if c.SingBox.Enabled {
+		if !strings.HasPrefix(c.SingBox.Root, "/") {
+			return errors.New("singbox.root must be an absolute path")
+		}
+		if strings.Contains(c.SingBox.Root, "..") {
+			return errors.New("singbox.root must not contain ..")
+		}
+		if strings.ContainsAny(c.SingBox.Service, " \t/") {
+			return errors.New("singbox.service is not a valid unit name")
 		}
 	}
 	if c.Backup.Dir == "" {

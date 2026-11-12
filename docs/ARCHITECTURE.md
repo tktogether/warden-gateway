@@ -12,6 +12,8 @@
 | ACME | `0.0.0.0:80` | 证书 HTTP-01 校验 |
 | DNS | `0.0.0.0:53` | 可选域名分流，默认关闭；53 被占用时自动回退到 5353、5300、9053 |
 
+sing-box 不由本进程托管：主配置 `/etc/sing-box/config.json` 引用 `/etc/sing-box/conf/*.json` 节点，内核在 `/etc/sing-box/bin/sing-box`，单元为 `sing-box.service`。面板与命令行通过 `sing-box check` 校验配置、通过 `systemctl` 重载服务；内核安装、备份与回滚由 `internal/singbox` 完成。
+
 ## 请求路径
 
 ### 面板
@@ -53,6 +55,8 @@ GET https://panel.example.com/https://github.com/owner/repo/... -> SNI -> 8443 -
 | `/var/lib/warden-gateway/gateway.log` | 运行日志 |
 | `/var/lib/warden-gateway/audit.log` | 审计日志 |
 | `/var/lib/warden-gateway/history.db` | 指标历史 |
+| `/etc/sing-box/` | sing-box 主配置、节点配置、内核与证书 |
+| `/var/lib/warden-gateway/singbox-core/` | 内核安装前快照与卸载归档 |
 
 ## 认证
 

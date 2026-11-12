@@ -12,12 +12,13 @@
     effect: null,
     diagnostics: null,
     cn: null,
+    singbox: null,
     backups: [],
     audit: [],
     settings: null,
     loading: {}
   };
-  var views = ['overview', 'metrics', 'proxies', 'effect', 'diagnostics', 'backups', 'audit', 'settings'];
+  var views = ['overview', 'metrics', 'proxies', 'singbox', 'effect', 'diagnostics', 'backups', 'audit', 'settings'];
 
   function qs(sel) { return document.querySelector(sel); }
   function el(tag, cls, text) {
@@ -152,6 +153,7 @@
     if (view === 'overview') { loadOverview(); }
     if (view === 'metrics') { loadMetrics(); }
     if (view === 'proxies') { loadProxies(); }
+    if (view === 'singbox') { loadSingbox(); }
     if (view === 'effect') { loadEffect(); }
     if (view === 'diagnostics') { loadDiagnostics(); }
     if (view === 'backups') { loadBackups(); }
@@ -1383,6 +1385,560 @@
     });
   }
 
+
+  var sbNames = {
+    'hysteria2': 'Hysteria2',
+    'vless-reality': 'VLESS Reality',
+    'trojan': 'Trojan',
+    'shadowsocks': 'Shadowsocks',
+    'socks': 'SOCKS5'
+  };
+  function sbName(id) { return sbNames[id] || id || '节点'; }
+
+  function openModal(title, build) {
+    var body = qs('#modal-body');
+    qs('#modal-title').textContent = title;
+    clear(body);
+    build(body);
+    qs('#modal').hidden = false;
+  }
+  function closeModal() { qs('#modal').hidden = true; }
+
+  async function loadSingbox() {
+    var box = qs('#singbox-content');
+    if (!state.singbox) { clear(box); box.appendChild(el('div', 'skeleton')); }
+    pageNote('#singbox-note', '加载中…');
+    try {
+      var data = await api('/api/singbox');
+      state.singbox = data;
+      renderSingbox(data);
+      pageNote('#singbox-note', (data.installed && data.version ? 'sing-box ' + data.version + ' · ' : '') + '更新于 ' + fmtTime(data.as_of));
+    } catch (err) {
+      clear(box);
+      box.appendChild(el('div', 'empty', err.message));
+      pageNote('#singbox-note', '加载失败');
+    }
+  }
+
+  function renderSingbox(data) {
+    var box = qs('#singbox-content');
+    clear(box);
+    var tips = [];
+    var level = 'good';
+    var stateText = '运行中';
+    if (!data.installed) {
+      level = 'bad';
+      stateText = '未安装';
+      tips.push('未检测到 sing-box。在下方“内核”卡片点击“安装内核”，本项目会下载并安装，无需手动操作服务器。');
+    } else if (!data.running) {
+      level = 'warn';
+      stateText = '已停止';
+      tips.push('sing-box 已安装但当前没有运行，点击下方“启动服务”。');
+    } else {
+      tips.push('sing-box 运行中，节点改动保存后立即生效。');
+    }
+    if (data.check && data.check.ok === false) {
+      level = 'bad';
+      tips.push('配置校验未通过：' + (data.check.output || 'sing-box check 失败'));
+    }
+    (data.warnings || []).forEach(function (w) { tips.push(w); });
+    var banner = el('div', 'alert ' + level);
+    add(banner, el('span', '', tips.join(' ')));
+    add(banner, el('span', '', [data.service, data.installed ? (stateText + ' · ' + data.version) : ''].filter(Boolean).join(' · ')));
+    box.appendChild(banner);
+    box.appendChild(sbCorePanel(data));
+
+    var nodes = data.nodes || [];
+    var enabled = nodes.filter(function (n) { return n.enabled; }).length;
+    var conn = data.connections || {};
+    var stats = el('div', 'stat-grid');
+    stats.appendChild(statCard('节点', String(nodes.length), enabled + ' 个启用'));
+    stats.appendChild(statCard('实时连接', String(conn.connections || 0), conn.available ? '统计已开启' : '统计未开启'));
+    stats.appendChild(statCard('上传', fmtBytes(conn.upload_total), 'sing-box 累计'));
+    stats.appendChild(statCard('下载', fmtBytes(conn.download_total), 'sing-box 累计'));
+    box.appendChild(stats);
+
+    var bar = el('div', 'sb-toolbar');
+    var create = el('button', 'btn primary', '新建节点');
+    create.type = 'button';
+    create.disabled = !data.installed;
+    create.addEventListener('click', function () { sbCreateDialog(data); });
+    bar.appendChild(create);
+
+    var restart = el('button', 'btn', data.running ? '重启服务' : '启动服务');
+    restart.type = 'button';
+    restart.disabled = !data.installed;
+    restart.addEventListener('click', async function () {
+      var yes = await confirmDialog('重启 sing-box', '重启约需一秒，已连接的客户端会短暂断开后自动重连。确认继续？');
+      if (!yes) { return; }
+      setBusy(restart, true);
+      try {
+        await api('/api/singbox/action', { method: 'POST', body: { id: '', action: 'restart' } });
+        showToast('sing-box 已重启');
+        setTimeout(loadSingbox, 1200);
+      } catch (err) { showToast(err.message, true); }
+      finally { setBusy(restart, false); }
+    });
+    bar.appendChild(restart);
+
+    var verify = el('button', 'btn', '校验配置');
+    verify.type = 'button';
+    verify.disabled = !data.installed;
+    verify.addEventListener('click', async function () {
+      setBusy(verify, true);
+      try {
+        var out = await api('/api/singbox/action', { method: 'POST', body: { id: '', action: 'check' } });
+        var check = out.check || {};
+        showToast(check.ok ? '配置校验通过（' + (check.duration || 0) + ' ms）' : ('配置校验失败：' + (check.output || '')), !check.ok);
+      } catch (err) { showToast(err.message, true); }
+      finally { setBusy(verify, false); }
+    });
+    bar.appendChild(verify);
+
+    var logs = el('button', 'btn', '查看日志');
+    logs.type = 'button';
+    logs.disabled = !data.installed;
+    logs.addEventListener('click', function () { sbLogDialog(); });
+    bar.appendChild(logs);
+    box.appendChild(bar);
+
+    if (!nodes.length) {
+      box.appendChild(el('div', 'empty', data.installed ? '还没有节点。点击“新建节点”生成第一个可用节点。' : '安装 sing-box 后才能创建节点。'));
+    } else {
+      var list = el('div', 'sb-nodes');
+      nodes.forEach(function (node) { list.appendChild(sbNodeCard(node, data)); });
+      box.appendChild(list);
+    }
+
+    box.appendChild(sbTrafficPanel(conn));
+
+    var backups = data.backups || [];
+    if (backups.length) {
+      box.appendChild(tablePanel('配置备份', ['文件', '大小', '时间'], backups.map(function (b) {
+        return [b.name, fmtBytes(b.size), fmtTime(b.modified)];
+      })));
+    }
+  }
+
+  async function sbCoreAction(btn, action, message) {
+    var yes = await confirmDialog("内核操作", message);
+    if (!yes) { return; }
+    setBusy(btn, true);
+    showToast("操作进行中，下载或写入可能需要一段时间…");
+    try {
+      await api("/api/singbox/core", { method: "POST", body: { action: action } });
+      showToast("内核操作完成");
+      setTimeout(loadSingbox, 900);
+    } catch (err) {
+      showToast(err.message, true);
+      setBusy(btn, false);
+    }
+  }
+
+  function sbCorePanel(data) {
+    var core = data.core || {};
+    var wrap = el("div", "panel sb-core");
+    add(wrap, el("h3", "", "内核"));
+    add(wrap, el("p", "muted", ["sing-box 内核由本项目负责安装、更新与回滚", core.platform ? ("平台 " + core.platform) : ""].filter(Boolean).join(" · ")));
+
+    var stats = el("div", "stat-grid");
+    stats.appendChild(statCard("当前版本", core.installed ? core.version : "未安装", core.unit_installed ? "系统服务由本项目管理" : "使用主机已有服务"));
+    var latestCard = statCard("最新版本", "检查中…", "正在向 GitHub 查询");
+    stats.appendChild(latestCard);
+    wrap.appendChild(stats);
+
+    var hint = el("div", "sb-core-hint muted", core.note || "");
+    wrap.appendChild(hint);
+
+    var bar = el("div", "sb-toolbar");
+    var install = el("button", "btn primary", core.installed ? "更新到最新" : "安装内核");
+    install.type = "button";
+    install.addEventListener("click", function () {
+      sbCoreAction(install, "install", core.installed
+        ? "将下载最新内核并替换当前版本，期间 sing-box 会短暂重启。确认继续？"
+        : "将从 GitHub 下载 sing-box 内核并安装为系统服务，确认继续？");
+    });
+    bar.appendChild(install);
+
+    if (core.installed) {
+      var back = el("button", "btn", "回滚上一版");
+      back.type = "button";
+      back.disabled = !(core.backups && core.backups.length);
+      if (back.disabled) { back.title = "没有可回滚的内核备份"; }
+      back.addEventListener("click", function () {
+        sbCoreAction(back, "rollback-previous", "将把内核恢复为上一个备份版本并重启 sing-box。确认继续？");
+      });
+      bar.appendChild(back);
+
+      var pre = el("button", "btn", "回滚到安装前");
+      pre.type = "button";
+      pre.addEventListener("click", function () {
+        sbCoreAction(pre, "rollback-preinstall", "将恢复到本项目第一次安装内核之前的状态（内核、系统服务与启停状态）。确认继续？");
+      });
+      bar.appendChild(pre);
+
+      var restart = el("button", "btn", "重启内核");
+      restart.type = "button";
+      restart.addEventListener("click", function () {
+        sbCoreAction(restart, "restart", "重启 sing-box 服务，已连接客户端会短暂断开。确认继续？");
+      });
+      bar.appendChild(restart);
+
+      var uninstall = el("button", "btn danger", "卸载内核");
+      uninstall.type = "button";
+      uninstall.addEventListener("click", function () {
+        sbCoreAction(uninstall, "uninstall", "将停止服务、移除本项目安装的内核与系统服务（节点配置保留，归档到数据目录）。确认继续？");
+      });
+      bar.appendChild(uninstall);
+    }
+    wrap.appendChild(bar);
+
+    api("/api/singbox/core").then(function (status) {
+      var latest = status.latest || "";
+      latestCard.querySelector(".value").textContent = latest ? ("v" + String(latest).replace(/^v/, "")) : "未知";
+      var sub = latestCard.querySelector(".sub");
+      if (sub) {
+        if (status.latest_error) { sub.textContent = "检查失败：" + status.latest_error; }
+        else if (status.update_available) { sub.textContent = "有新版本，可点击“更新到最新”"; }
+        else if (status.installed) { sub.textContent = "已是最新"; }
+        else { sub.textContent = "点击“安装内核”完成安装"; }
+      }
+      if (latest && !status.latest_error) {
+        install.textContent = status.update_available ? "更新到最新" : "重新安装最新版";
+      }
+    }).catch(function () {
+      latestCard.querySelector(".value").textContent = "未知";
+      var sub = latestCard.querySelector(".sub");
+      if (sub) { sub.textContent = "无法获取 GitHub 版本信息"; }
+    });
+
+    return wrap;
+  }
+  function sbNodeCard(node, data) {
+    var card = el('div', 'sb-node');
+    var head = el('div', 'sb-node-head');
+    var left = el('div');
+    add(left, el('h3', '', node.tag || node.id));
+    var meta = [sbName(node.type), '端口 ' + node.port, node.transport || '', node.listen || ''].filter(Boolean).join(' · ');
+    add(left, el('div', 'sb-node-meta', meta));
+    add(head, left);
+    head.appendChild(statusPill(node.enabled ? '启用' : '已停用', node.enabled ? 'ok' : 'warn'));
+    card.appendChild(head);
+
+    if (node.error) {
+      add(card, el('div', 'alert bad', node.error));
+    } else {
+      var links = node.links || [];
+      if (!links.length) {
+        add(card, el('div', 'muted', '这个节点还没有可用的分享链接。'));
+      } else {
+        var linkBox = el('div', 'sb-links');
+        links.forEach(function (link, i) {
+          var row = el('div', 'sb-link');
+          add(row, el('div', 'sb-link-label', link.label || ('用户 ' + (i + 1))));
+          row.appendChild(el('code', '', link.uri || link.error || '—'));
+          var copy = el('button', 'btn small', '复制');
+          copy.type = 'button';
+          copy.addEventListener('click', function () { copyText(link.uri, copy); });
+          row.appendChild(copy);
+          var qr = el('button', 'btn small', '二维码');
+          qr.type = 'button';
+          qr.addEventListener('click', function () { sbShowQR(node, link); });
+          row.appendChild(qr);
+          linkBox.appendChild(row);
+        });
+        card.appendChild(linkBox);
+      }
+    }
+
+    var actions = el('div', 'sb-actions');
+    var edit = el('button', 'btn small', '编辑配置');
+    edit.type = 'button';
+    edit.addEventListener('click', function () { sbConfigDialog(node); });
+    actions.appendChild(edit);
+
+    var reset = el('button', 'btn small', '重置密钥');
+    reset.type = 'button';
+    reset.disabled = !node.enabled;
+    reset.addEventListener('click', async function () {
+      var yes = await confirmDialog('重置密钥', '重新生成 ' + (node.tag || node.id) + ' 的密钥，旧链接立即失效，需要把新链接重新发给客户端。确认重置？');
+      if (!yes) { return; }
+      setBusy(reset, true);
+      try {
+        var out = await api('/api/singbox/action', { method: 'POST', body: { id: node.id, action: 'reset' } });
+        showToast('已重置，请复制新链接');
+        await loadSingbox();
+        if (out.node) { sbShowLinks(out.node); }
+      } catch (err) { showToast(err.message, true); }
+      finally { setBusy(reset, false); }
+    });
+    actions.appendChild(reset);
+
+    var toggle = el('button', 'btn small', node.enabled ? '停用' : '启用');
+    toggle.type = 'button';
+    toggle.addEventListener('click', async function () {
+      var next = !node.enabled;
+      setBusy(toggle, true);
+      try {
+        await api('/api/singbox/action', { method: 'POST', body: { id: node.id, action: next ? 'enable' : 'disable' } });
+        showToast(next ? '节点已启用' : '节点已停用');
+        await loadSingbox();
+      } catch (err) { showToast(err.message, true); }
+      finally { setBusy(toggle, false); }
+    });
+    actions.appendChild(toggle);
+
+    var del = el('button', 'btn small danger', '删除');
+    del.type = 'button';
+    del.addEventListener('click', async function () {
+      var yes = await confirmDialog('删除节点', '删除 ' + (node.tag || node.id) + '（端口 ' + node.port + '）。删除前会自动备份配置文件，确认删除？');
+      if (!yes) { return; }
+      setBusy(del, true);
+      try {
+        await api('/api/singbox/action', { method: 'POST', body: { id: node.id, action: 'delete' } });
+        showToast('节点已删除');
+        await loadSingbox();
+      } catch (err) { showToast(err.message, true); }
+      finally { setBusy(del, false); }
+    });
+    actions.appendChild(del);
+    card.appendChild(actions);
+    return card;
+  }
+
+  function sbTrafficPanel(conn) {
+    var panel = el('div', 'panel');
+    add(panel, el('h3', '', '实时连接'));
+    if (!conn || !conn.available) {
+      add(panel, el('p', 'muted', '未开启实时连接统计。在 sing-box 主配置的 experimental.clash_api 中设置 external_controller（例如 127.0.0.1:9090）后重启 sing-box，这里就会显示连接与速率。'));
+      if (conn && conn.error) { add(panel, el('p', 'muted', conn.error)); }
+      return panel;
+    }
+    var items = conn.items || [];
+    if (!items.length) {
+      add(panel, el('div', 'empty', '当前没有活动连接。'));
+      return panel;
+    }
+    var rows = items.slice(0, 50).map(function (c) {
+      return [
+        c.network || '—',
+        c.target || '—',
+        c.inbound || '—',
+        c.outbound || '—',
+        fmtBytes(c.upload),
+        fmtBytes(c.download)
+      ];
+    });
+    panel.appendChild(tablePanel('当前连接（最多 50 条）', ['网络', '目标', '入站', '出站', '上传', '下载'], rows));
+    return panel;
+  }
+
+  function sbShowQR(node, link) {
+    openModal('扫描二维码', function (body) {
+      add(body, el('p', 'muted', (node.tag || node.id) + ' · ' + (sbName(node.type)) + ' · 端口 ' + node.port));
+      if (!link || !link.uri) {
+        add(body, el('div', 'empty', (link && link.error) || '没有可用的分享链接'));
+        return;
+      }
+      var wrap = el('div', 'sb-qr');
+      var img = el('img', 'sb-qr-img');
+      img.alt = '节点二维码';
+      img.src = BASE + '/api/singbox/qr?id=' + encodeURIComponent(node.id) + '&user=' + encodeURIComponent(link.user || 0);
+      wrap.appendChild(img);
+      body.appendChild(wrap);
+      var box = el('div', 'command-box');
+      box.appendChild(el('code', '', link.uri));
+      var copy = el('button', 'btn small', '复制');
+      copy.type = 'button';
+      copy.addEventListener('click', function () { copyText(link.uri, copy); });
+      box.appendChild(copy);
+      body.appendChild(box);
+      add(body, el('p', 'muted', '用客户端扫描二维码，或复制上面的链接导入。'));
+    });
+  }
+
+  function sbShowLinks(node) {
+    openModal('节点已就绪', function (body) {
+      add(body, el('p', 'muted', '把下面的链接发给客户端，或直接扫码导入。链接里包含密码，请通过可信渠道传递。'));
+      var links = node.links || [];
+      if (!links.length) {
+        add(body, el('div', 'empty', '没有生成分享链接，请检查配置。'));
+        return;
+      }
+      var list = el('div', 'sb-links');
+      links.forEach(function (link) {
+        var row = el('div', 'sb-link');
+        add(row, el('div', 'sb-link-label', link.label || '链接'));
+        row.appendChild(el('code', '', link.uri || link.error || '—'));
+        var copy = el('button', 'btn small', '复制');
+        copy.type = 'button';
+        copy.addEventListener('click', function () { copyText(link.uri, copy); });
+        row.appendChild(copy);
+        var qr = el('button', 'btn small', '二维码');
+        qr.type = 'button';
+        qr.addEventListener('click', function () { sbShowQR(node, link); });
+        row.appendChild(qr);
+        list.appendChild(row);
+      });
+      body.appendChild(list);
+    });
+  }
+
+  function sbCreateDialog(data) {
+    var types = data.types || [];
+    var choice = types.length ? types[0].id : 'hysteria2';
+    openModal('新建节点', function (body) {
+      add(body, el('p', 'muted', '第一步选协议，第二步填名称和端口。密钥、证书与 Reality 密钥对自动生成，创建后立即生效。'));
+      var grid = el('div', 'sb-types');
+      var portField = null;
+      var methodField = null;
+      types.forEach(function (t) {
+        var b = el('button', 'sb-type');
+        b.type = 'button';
+        add(b, el('div', 'sb-type-name', t.label || sbName(t.id)));
+        add(b, el('div', 'sb-type-hint', t.hint || ''));
+        add(b, el('div', 'sb-type-meta', (t.transport ? t.transport + ' · ' : '') + '默认端口 ' + t.default_port));
+        if (t.id === choice) { b.classList.add('active'); }
+        b.addEventListener('click', function () {
+          choice = t.id;
+          Array.prototype.forEach.call(grid.children, function (c) { c.classList.remove('active'); });
+          b.classList.add('active');
+          if (portField) { portField.input.placeholder = String(t.default_port); }
+          if (methodField) { methodField.wrap.hidden = t.id !== 'shadowsocks'; }
+        });
+        grid.appendChild(b);
+      });
+      body.appendChild(grid);
+
+      var form = el('form', 'form-grid sb-form');
+      var nameField = field('名称（可选，方便区分）', 'text');
+      nameField.input.placeholder = '例如 手机';
+      portField = field('端口（留空自动选择）', 'number');
+      portField.input.placeholder = String((types[0] && types[0].default_port) || '');
+      methodField = selectField('Shadowsocks 加密方式', [
+        { value: '2022-blake3-aes-128-gcm', label: '2022-blake3-aes-128-gcm' },
+        { value: '2022-blake3-aes-256-gcm', label: '2022-blake3-aes-256-gcm' },
+        { value: '2022-blake3-chacha20-poly1305', label: '2022-blake3-chacha20-poly1305' }
+      ], '2022-blake3-aes-128-gcm');
+      methodField.wrap.hidden = choice !== 'shadowsocks';
+      form.appendChild(nameField.wrap);
+      form.appendChild(portField.wrap);
+      form.appendChild(methodField.wrap);
+      var err = el('p', 'form-error');
+      err.hidden = true;
+      form.appendChild(err);
+      var actions = el('div', 'form-actions');
+      var cancel = el('button', 'btn', '取消');
+      cancel.type = 'button';
+      cancel.addEventListener('click', closeModal);
+      var submit = el('button', 'btn primary', '创建节点');
+      submit.type = 'button';
+      submit.addEventListener('click', async function () {
+        err.hidden = true;
+        setBusy(submit, true);
+        try {
+          var out = await api('/api/singbox/nodes', {
+            method: 'POST',
+            body: {
+              type: choice,
+              name: nameField.input.value.trim(),
+              port: Number(portField.input.value) || 0,
+              method: methodField.select.value
+            }
+          });
+          closeModal();
+          showToast('节点已创建并生效');
+          await loadSingbox();
+          if (out.node) { sbShowLinks(out.node); }
+        } catch (e) {
+          err.textContent = e.message;
+          err.hidden = false;
+        } finally {
+          setBusy(submit, false);
+        }
+      });
+      add(actions, cancel);
+      add(actions, submit);
+      form.appendChild(actions);
+      body.appendChild(form);
+    });
+  }
+
+  async function sbConfigDialog(node) {
+    openModal('编辑配置', function (body) {
+      add(body, el('p', 'muted', '直接编辑 ' + (node.file || node.id + '.json') + '。保存前会先校验，校验失败不写入。'));
+      var box = el('div');
+      var ta = el('textarea', 'config-editor');
+      ta.spellcheck = false;
+      ta.value = '加载中…';
+      box.appendChild(ta);
+      body.appendChild(box);
+      var err = el('p', 'form-error');
+      err.hidden = true;
+      body.appendChild(err);
+      var actions = el('div', 'form-actions');
+      var cancel = el('button', 'btn', '关闭');
+      cancel.type = 'button';
+      cancel.addEventListener('click', closeModal);
+      var save = el('button', 'btn primary', '保存并校验');
+      save.type = 'button';
+      save.disabled = true;
+      save.addEventListener('click', async function () {
+        err.hidden = true;
+        setBusy(save, true);
+        try {
+          var out = await api('/api/singbox/config', { method: 'POST', body: { id: node.id, text: ta.value } });
+          closeModal();
+          showToast('配置已保存并通过校验');
+          await loadSingbox();
+          return out;
+        } catch (e) {
+          err.textContent = e.message;
+          err.hidden = false;
+        } finally {
+          setBusy(save, false);
+        }
+      });
+      add(actions, cancel);
+      add(actions, save);
+      body.appendChild(actions);
+      api('/api/singbox/config?id=' + encodeURIComponent(node.id)).then(function (data) {
+        ta.value = data.text || '';
+        save.disabled = false;
+      }).catch(function (e) {
+        ta.value = '';
+        err.textContent = e.message;
+        err.hidden = false;
+      });
+    });
+  }
+
+  async function sbLogDialog() {
+    openModal('sing-box 日志', function (body) {
+      var pre = el('pre', '', '加载中…');
+      body.appendChild(pre);
+      var actions = el('div', 'form-actions');
+      var refresh = el('button', 'btn', '刷新');
+      refresh.type = 'button';
+      refresh.addEventListener('click', function () { load(); });
+      var close = el('button', 'btn primary', '关闭');
+      close.type = 'button';
+      close.addEventListener('click', closeModal);
+      add(actions, refresh);
+      add(actions, close);
+      body.appendChild(actions);
+      function load() {
+        api('/api/singbox/log?lines=120').then(function (data) {
+          var lines = data.lines || [];
+          pre.textContent = lines.length ? lines.join('\n') : '没有日志输出';
+        }).catch(function (e) {
+          pre.textContent = e.message;
+        });
+      }
+      load();
+    });
+  }
+
   function bind() {
     qs('#login-form').addEventListener('submit', async function (ev) {
       ev.preventDefault();
@@ -1410,6 +1966,7 @@
     });
     qs('#refresh-overview').addEventListener('click', loadOverview);
     qs('#refresh-proxies').addEventListener('click', loadProxies);
+    qs('#refresh-singbox').addEventListener('click', function () { loadSingbox(); });
     qs('#refresh-effect').addEventListener('click', loadEffect);
     qs('#refresh-diagnostics').addEventListener('click', loadDiagnostics);
     qs('#create-backup').addEventListener('click', function () { createBackup(this); });

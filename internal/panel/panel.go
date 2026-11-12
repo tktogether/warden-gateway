@@ -27,6 +27,7 @@ import (
 	"github.com/tktogether/warden-gateway/internal/dnsproxy"
 	"github.com/tktogether/warden-gateway/internal/gateway"
 	"github.com/tktogether/warden-gateway/internal/logging"
+	"github.com/tktogether/warden-gateway/internal/singbox"
 	"github.com/tktogether/warden-gateway/internal/telemetry"
 	"github.com/tktogether/warden-gateway/internal/version"
 )
@@ -53,6 +54,7 @@ type Options struct {
 	Log         *logging.Logger
 	Started     time.Time
 	DNS         *dnsproxy.Proxy
+	SingBox     *singbox.Manager
 }
 
 type Server struct {
@@ -68,6 +70,7 @@ type Server struct {
 	started     time.Time
 	host        *hostMetrics
 	dns         *dnsproxy.Proxy
+	singbox     *singbox.Manager
 	auditPath   string
 	sampleMu    sync.Mutex
 	restartMu   sync.Mutex
@@ -105,7 +108,7 @@ func New(opts Options) (*Server, error) {
 		cfg: opts.Config, cfgPath: opts.ConfigPath, dataDir: opts.DataDir, scriptDir: opts.ScriptDir,
 		serviceName: opts.ServiceName, auth: opts.Auth, backups: opts.Backups,
 		stats: opts.Stats, log: opts.Log, started: opts.Started,
-		host: newHostMetrics(5760), dns: opts.DNS,
+		host: newHostMetrics(5760), dns: opts.DNS, singbox: opts.SingBox,
 		auditPath: filepath.Join(opts.DataDir, "audit.log"),
 	}
 	s.host.Sample()
@@ -240,6 +243,30 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, p string) {
 		return
 	case "/api/dns/config":
 		s.handleDNSConfig(w, r)
+		return
+	case "/api/singbox":
+		s.handleSingbox(w, r)
+		return
+	case "/api/singbox/nodes":
+		s.handleSingboxCreate(w, r)
+		return
+	case "/api/singbox/action":
+		s.handleSingboxAction(w, r)
+		return
+	case "/api/singbox/core":
+		s.handleSingboxCore(w, r)
+		return
+	case "/api/singbox/config":
+		s.handleSingboxConfig(w, r)
+		return
+	case "/api/singbox/qr":
+		s.handleSingboxQR(w, r)
+		return
+	case "/api/singbox/connections":
+		s.handleSingboxConnections(w, r)
+		return
+	case "/api/singbox/log":
+		s.handleSingboxLog(w, r)
 		return
 	}
 	if strings.HasPrefix(p, "/api/services/") {
