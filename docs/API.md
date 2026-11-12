@@ -105,14 +105,16 @@ GET 请求，返回最近 `minutes`（5 到 60，默认 60）的承载统计。�
 | --- | --- | --- |
 | GET | `/api/singbox` | 内核、节点、校验结果、备份与流量总览 |
 | POST | `/api/singbox` | 新建节点，body `{"type":"hysteria2","name":"手机"}`，可带 `port`、`server`、`method` |
-| POST | `/api/singbox/action` | 节点操作，body `{"action":"reset","id":"Hysteria2-12538"}`；动作 `reset`、`enable`、`disable`、`delete`、`restart`、`check` |
+| POST | `/api/singbox/action` | 节点操作，body `{"action":"reset","id":"Hysteria2-12538"}`；动作 `reset`、`enable`、`disable`、`delete`、`restart`、`check`、`stats-enable`、`stats-disable` |
 | GET | `/api/singbox/config?id=ID` | 读取节点配置文本 |
 | POST | `/api/singbox/config` | 保存节点配置，body `{"id":"...","text":"..."}`；校验失败返回 400 并附 `check`，原文件不变 |
 | GET | `/api/singbox/qr?id=ID&user=0&size=320` | 分享链接二维码，返回 PNG |
-| GET | `/api/singbox/connections` | 活动连接，需要主配置含 `experimental.clash_api` |
+| GET | `/api/singbox/connections` | 活动连接，需要先开启实时统计（主配置含 `experimental.clash_api`） |
 | GET | `/api/singbox/log?lines=120` | 服务日志尾部 |
 | GET | `/api/singbox/core` | 内核状态 |
 | POST | `/api/singbox/core` | 内核操作，body `{"action":"install","version":"1.14.4"}`；动作 `install`、`update`、`rollback-previous`、`rollback-preinstall`、`restart`、`uninstall` |
+
+`stats` 对象字段：`enabled`、`controller`、`secret`。`stats-enable` 把 `experimental.clash_api` 写入主配置（默认 `127.0.0.1:19090`，自动生成 32 位密钥），`stats-disable` 移除该块；两者都会备份主配置、执行 `sing-box check` 并重启 sing-box，失败时恢复原文件。
 
 `core` 对象字段：`installed`、`version`、`latest`、`latest_error`、`update_available`、`platform`、`binary`、`unit_installed`、`backups`、`note`。
 

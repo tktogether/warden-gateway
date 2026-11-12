@@ -1394,6 +1394,7 @@
     'socks': 'SOCKS5'
   };
   function sbName(id) { return sbNames[id] || id || '节点'; }
+  function sbNodeLabel(node) { return node.name || sbNodeLabel(node); }
 
   function openModal(title, build) {
     var body = qs('#modal-body');
@@ -1453,7 +1454,7 @@
     var conn = data.connections || {};
     var stats = el('div', 'stat-grid');
     stats.appendChild(statCard('节点', String(nodes.length), enabled + ' 个启用'));
-    stats.appendChild(statCard('实时连接', String(conn.connections || 0), conn.available ? '统计已开启' : '统计未开启'));
+    stats.appendChild(statCard('实时连接', String(conn.connections || 0), conn.available ? '统计已开启' : '未开启，可在下方开启'));
     stats.appendChild(statCard('上传', fmtBytes(conn.upload_total), 'sing-box 累计'));
     stats.appendChild(statCard('下载', fmtBytes(conn.download_total), 'sing-box 累计'));
     box.appendChild(stats);
@@ -1510,7 +1511,7 @@
       box.appendChild(list);
     }
 
-    box.appendChild(sbTrafficPanel(conn));
+    box.appendChild(sbTrafficPanel(conn, data));
 
     var backups = data.backups || [];
     if (backups.length) {
@@ -1618,8 +1619,9 @@
     var card = el('div', 'sb-node');
     var head = el('div', 'sb-node-head');
     var left = el('div');
-    add(left, el('h3', '', node.tag || node.id));
-    var meta = [sbName(node.type), '端口 ' + node.port, node.transport || '', node.listen || ''].filter(Boolean).join(' · ');
+    add(left, el('h3', '', sbNodeLabel(node)));
+    var listen = node.listen && node.listen !== '::' && node.listen !== '0.0.0.0' ? node.listen : '';
+    var meta = [sbName(node.type), '端口 ' + node.port, node.transport || '', listen].filter(Boolean).join(' · ');
     add(left, el('div', 'sb-node-meta', meta));
     add(head, left);
     head.appendChild(statusPill(node.enabled ? '启用' : '已停用', node.enabled ? 'ok' : 'warn'));
@@ -1661,7 +1663,7 @@
     reset.type = 'button';
     reset.disabled = !node.enabled;
     reset.addEventListener('click', async function () {
-      var yes = await confirmDialog('重置密钥', '重新生成 ' + (node.tag || node.id) + ' 的密钥，旧链接立即失效，需要把新链接重新发给客户端。确认重置？');
+      var yes = await confirmDialog('重置密钥', '重新生成 ' + (sbNodeLabel(node)) + ' 的密钥，旧链接立即失效，需要把新链接重新发给客户端。确认重置？');
       if (!yes) { return; }
       setBusy(reset, true);
       try {
@@ -1691,7 +1693,7 @@
     var del = el('button', 'btn small danger', '删除');
     del.type = 'button';
     del.addEventListener('click', async function () {
-      var yes = await confirmDialog('删除节点', '删除 ' + (node.tag || node.id) + '（端口 ' + node.port + '）。删除前会自动备份配置文件，确认删除？');
+      var yes = await confirmDialog('删除节点', '删除 ' + (sbNodeLabel(node)) + '（端口 ' + node.port + '）。删除前会自动备份配置文件，确认删除？');
       if (!yes) { return; }
       setBusy(del, true);
       try {
@@ -1706,14 +1708,44 @@
     return card;
   }
 
-  function sbTrafficPanel(conn) {
+  function sbTrafficPanel(conn, data) {
     var panel = el('div', 'panel');
-    add(panel, el('h3', '', '实时连接'));
+    var head = el('div', 'sb-node-head');
+    add(head, el('h3', '', '实时连接'));
+    panel.appendChild(head);
+    var controller = (data && data.stats && data.stats.controller) || '127.0.0.1:19090';
     if (!conn || !conn.available) {
-      add(panel, el('p', 'muted', '未开启实时连接统计。在 sing-box 主配置的 experimental.clash_api 中设置 external_controller（例如 127.0.0.1:9090）后重启 sing-box，这里就会显示连接与速率。'));
+      add(panel, el('p', 'muted', '开启后可以查看当前连接、来源、目标与上下行流量。面板会把 Clash API 写入 sing-box 主配置（只监听 ' + controller + '），然后重启 sing-box 使其生效。'));
+      var on = el('button', 'btn primary', '开启实时统计');
+      on.type = 'button';
+      on.disabled = !(data && data.installed);
+      on.addEventListener('click', async function () {
+        var yes = await confirmDialog('开启实时统计', '将写入 experimental.clash_api 并重启 sing-box，已连接的客户端会短暂断开后自动重连。确认继续？');
+        if (!yes) { return; }
+        setBusy(on, true);
+        try {
+          await api('/api/singbox/action', { method: 'POST', body: { id: '', action: 'stats-enable' } });
+          showToast('实时统计已开启');
+          setTimeout(loadSingbox, 1600);
+        } catch (err) { showToast(err.message, true); setBusy(on, false); }
+      });
+      panel.appendChild(on);
       if (conn && conn.error) { add(panel, el('p', 'muted', conn.error)); }
       return panel;
     }
+    var off = el('button', 'btn small', '停用统计');
+    off.type = 'button';
+    off.addEventListener('click', async function () {
+      var yes = await confirmDialog('停用实时统计', '将从 sing-box 主配置移除 Clash API 并重启 sing-box，实时连接与速率不再显示。确认停用？');
+      if (!yes) { return; }
+      setBusy(off, true);
+      try {
+        await api('/api/singbox/action', { method: 'POST', body: { id: '', action: 'stats-disable' } });
+        showToast('实时统计已停用');
+        setTimeout(loadSingbox, 1600);
+      } catch (err) { showToast(err.message, true); setBusy(off, false); }
+    });
+    head.appendChild(off);
     var items = conn.items || [];
     if (!items.length) {
       add(panel, el('div', 'empty', '当前没有活动连接。'));
@@ -1735,7 +1767,7 @@
 
   function sbShowQR(node, link) {
     openModal('扫描二维码', function (body) {
-      add(body, el('p', 'muted', (node.tag || node.id) + ' · ' + (sbName(node.type)) + ' · 端口 ' + node.port));
+      add(body, el('p', 'muted', (sbNodeLabel(node)) + ' · ' + (sbName(node.type)) + ' · 端口 ' + node.port));
       if (!link || !link.uri) {
         add(body, el('div', 'empty', (link && link.error) || '没有可用的分享链接'));
         return;

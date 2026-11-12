@@ -44,6 +44,7 @@ func (s *Server) singboxPayload() map[string]interface{} {
 		"check":       checkJSON(summary.Check),
 		"warnings":    summary.Warnings,
 		"connections": s.singboxTraffic(),
+		"stats":       statsJSON(s.singbox.StatsStatus()),
 		"core":        coreJSON(s.singbox.CoreLocalStatus()),
 	}
 }
@@ -61,6 +62,7 @@ func nodeJSON(node singbox.Node) map[string]interface{} {
 	entry := map[string]interface{}{
 		"id":        node.ID,
 		"file":      node.File,
+		"name":      node.Name(),
 		"tag":       node.Tag,
 		"type":      node.Type,
 		"listen":    node.Listen,
@@ -97,6 +99,17 @@ func checkJSON(check singbox.Check) map[string]interface{} {
 		out["checked_at"] = check.Checked.UTC().Format("2006-01-02T15:04:05Z")
 	}
 	return out
+}
+
+// statsJSON reports whether the Clash API the panel reads live counters from is
+// configured, so the view can offer the one-click switch instead of asking the
+// operator to edit the main configuration by hand.
+func statsJSON(status singbox.StatsStatus) map[string]interface{} {
+	return map[string]interface{}{
+		"enabled":    status.Enabled,
+		"controller": status.Controller,
+		"secret":     status.Secret,
+	}
 }
 
 // singboxTraffic returns live connection counters or an unavailable block.
@@ -236,6 +249,21 @@ func (s *Server) handleSingboxAction(w http.ResponseWriter, r *http.Request) {
 	case "check":
 		check := s.singbox.Check()
 		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": check.OK, "check": checkJSON(check)})
+	case "stats-enable", "stats-disable":
+		var status singbox.StatsStatus
+		var err error
+		if action == "stats-enable" {
+			status, err = s.singbox.EnableStats("")
+		} else {
+			status, err = s.singbox.DisableStats()
+		}
+		if err != nil {
+			s.audit("singbox."+action, "", "fail", ip)
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.audit("singbox."+action, "", "ok", ip)
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "stats": statsJSON(status)})
 	default:
 		writeError(w, http.StatusBadRequest, "不支持的操作："+action)
 	}

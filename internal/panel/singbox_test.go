@@ -176,6 +176,74 @@ func TestSingboxRejectsBadInput(t *testing.T) {
 	}
 }
 
+func TestSingboxPayloadNamesAndStats(t *testing.T) {
+	srv, key, root := newSingboxPanel(t)
+	legacy := `{"inbounds":[{"type":"hysteria2","tag":"Hysteria2-12538.json","listen_port":12538,"users":[{"password":"6c23c651-5d74-4af6-a4f8-67069aa916fe"}],"tls":{"enabled":true,"server_name":"gateway.example.com"}}]}`
+	if err := os.WriteFile(filepath.Join(root, "conf", "Hysteria2-12538.json"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cookie, csrf := login(t, srv, key)
+	rec := do(t, srv, "GET", "/warden/api/singbox", nil, cookie, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var payload struct {
+		Nodes []struct {
+			ID    string `json:"id"`
+			Name  string `json:"name"`
+			Links []struct {
+				Label string `json:"label"`
+			} `json:"links"`
+		} `json:"nodes"`
+		Stats struct {
+			Enabled    bool   `json:"enabled"`
+			Controller string `json:"controller"`
+		} `json:"stats"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var found bool
+	for _, node := range payload.Nodes {
+		if node.ID != "Hysteria2-12538" {
+			continue
+		}
+		found = true
+		if node.Name != "Hysteria2-12538" {
+			t.Fatalf("name = %q", node.Name)
+		}
+		if len(node.Links) != 1 || node.Links[0].Label != "Hysteria2-12538" {
+			t.Fatalf("links = %#v", node.Links)
+		}
+	}
+	if !found {
+		t.Fatalf("legacy node missing: %#v", payload.Nodes)
+	}
+	if payload.Stats.Enabled || payload.Stats.Controller != "" {
+		t.Fatalf("stats = %#v", payload.Stats)
+	}
+}
+
+func TestSingboxStatsEnableKeepsConfigOnFailure(t *testing.T) {
+	srv, key, root := newSingboxPanel(t)
+	cookie, csrf := login(t, srv, key)
+	before, err := os.ReadFile(filepath.Join(root, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := do(t, srv, "POST", "/warden/api/singbox/action", map[string]string{"action": "stats-enable"}, cookie, csrf)
+	// 测试机没有 systemd，开启会在重启阶段失败，此时主配置必须回到原样。
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	after, err := os.ReadFile(filepath.Join(root, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("config not restored: %s", string(after))
+	}
+}
 func TestSingboxDisabledReturns503(t *testing.T) {
 	srv, key := newPanel(t)
 	cookie, csrf := login(t, srv, key)

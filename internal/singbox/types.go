@@ -55,6 +55,25 @@ type Node struct {
 	Modified  time.Time
 }
 
+// Name is the name shown to a person. Hand written inbound files often carry
+// the file name as the tag, so a trailing configuration suffix is trimmed and
+// the panel never shows "Hysteria2-12538.json" as a node title.
+func (n Node) Name() string {
+	name := strings.TrimSpace(n.Tag)
+	if name == "" {
+		name = n.ID
+	}
+	if strings.HasSuffix(name, disabledExt) {
+		name = strings.TrimSuffix(name, disabledExt)
+	} else if strings.HasSuffix(name, enabledExt) {
+		name = strings.TrimSuffix(name, enabledExt)
+	}
+	if name = strings.TrimSpace(name); name == "" {
+		name = n.ID
+	}
+	return name
+}
+
 // Check is the outcome of `sing-box check` for the whole configuration.
 type Check struct {
 	OK       bool

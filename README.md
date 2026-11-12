@@ -196,7 +196,7 @@ curl -fL https://panel.example.com/https://github.com/owner/repo/releases/downlo
 - 内核：安装最新版、更新、回滚上一版、回滚到安装前、重启、卸载。安装先把旧内核与单元快照到数据目录；卸载把内核和单元归档后删除，节点配置保留。
 - 节点：支持 Hysteria2、VLESS Reality、Trojan、Shadowsocks 2022、SOCKS5，新建时自动选择空闲端口并生成凭据。
 - 节点操作：查看分享链接与二维码、编辑配置、重置密钥、停用/启用、删除。删除前自动备份到 `/etc/sing-box/backups`。
-- 连接：主配置含 `experimental.clash_api` 时可在面板查看活动连接与流量。
+- 连接：面板可一键开启实时统计，自动把 `experimental.clash_api` 写入主配置（只监听 127.0.0.1）并重启 sing-box，之后可查看活动连接与累计流量；也可一键停用。写入前备份主配置，校验或重启失败会恢复原文件。
 - 日志：查看服务日志尾部。
 
 内核操作也可用命令行：

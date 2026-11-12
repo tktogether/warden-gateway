@@ -42,9 +42,9 @@ func (m *Manager) ShareLinks(id, fallbackHost string) (Node, []ShareLink, error)
 			user := asMap(raw)
 			label := asString(user["name"])
 			if label == "" {
-				label = node.Tag
+				label = node.Name()
 				if len(users) > 1 {
-					label = fmt.Sprintf("%s-%d", node.Tag, userIndex+1)
+					label = fmt.Sprintf("%s-%d", node.Name(), userIndex+1)
 				}
 			}
 			link := ShareLink{Label: label, Inbound: inboundIndex, User: userIndex}
@@ -57,7 +57,7 @@ func (m *Manager) ShareLinks(id, fallbackHost string) (Node, []ShareLink, error)
 			links = append(links, link)
 		}
 		if len(users) == 0 {
-			link := ShareLink{Label: node.Tag, Inbound: inboundIndex, Error: "该节点没有可生成链接的用户"}
+			link := ShareLink{Label: node.Name(), Inbound: inboundIndex, Error: "该节点没有可生成链接的用户"}
 			links = append(links, link)
 		}
 	}
@@ -167,10 +167,7 @@ func shareURI(node Node, inbound, user map[string]interface{}, host string) (str
 
 // shareLabel builds the fragment shown in clients.
 func shareLabel(node Node, user map[string]interface{}) string {
-	base := node.Tag
-	if base == "" {
-		base = node.ID
-	}
+	base := node.Name()
 	if label := asString(user["name"]); label != "" {
 		return base + "-" + label
 	}
