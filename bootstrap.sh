@@ -605,14 +605,21 @@ install_scripts() {
     printf '  + install -m 0755 bootstrap.sh toolbox.sh %s\n' "$SCRIPT_DIR"
     return 0
   fi
-  local self dir
+  local self dir dest_dir
   self="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
   dir="$(dirname "$self")"
   mkdir -p "$SCRIPT_DIR"
   chmod 0755 "$SCRIPT_DIR"
-  [ -f "$self" ] && install -m 0755 "$self" "$SCRIPT_DIR/bootstrap.sh"
+  dest_dir="$(cd "$SCRIPT_DIR" && pwd -P)"
+  # 从已安装位置执行（如 warden update）时源与目标是同一文件，install 会报
+  # “are the same file” 并以非零退出；同目录时跳过复制。
+  if [ -f "$self" ] && [ "$self" != "$dest_dir/bootstrap.sh" ]; then
+    install -m 0755 "$self" "$dest_dir/bootstrap.sh"
+  fi
   if [ -f "$dir/toolbox.sh" ]; then
-    install -m 0755 "$dir/toolbox.sh" "$SCRIPT_DIR/toolbox.sh"
+    if [ "$dir/toolbox.sh" != "$dest_dir/toolbox.sh" ]; then
+      install -m 0755 "$dir/toolbox.sh" "$dest_dir/toolbox.sh"
+    fi
   elif [ ! -f "$SCRIPT_DIR/toolbox.sh" ]; then
     # 单文件安装时本地没有 toolbox.sh，从仓库下载；失败不影响安装。
     if ! fetch_repo_file toolbox.sh "$SCRIPT_DIR/toolbox.sh"; then
@@ -621,12 +628,14 @@ install_scripts() {
     [ -f "$SCRIPT_DIR/toolbox.sh" ] && chmod 0755 "$SCRIPT_DIR/toolbox.sh"
   fi
   # 仓库内安装时一并复制工具箱源码，安装后的 toolbox.sh 可直接运行，不再联网下载。
-  if [ -d "$dir/toolbox" ]; then
+  if [ -d "$dir/toolbox" ] && [ "$dir/toolbox" != "$dest_dir/toolbox" ]; then
     rm -rf "$SCRIPT_DIR/toolbox"
     cp -R "$dir/toolbox" "$SCRIPT_DIR/toolbox"
     chmod -R 0755 "$SCRIPT_DIR/toolbox"
   fi
-  [ -f "$dir/VERSION" ] && install -m 0644 "$dir/VERSION" "$SCRIPT_DIR/VERSION"
+  if [ -f "$dir/VERSION" ] && [ "$dir/VERSION" != "$dest_dir/VERSION" ]; then
+    install -m 0644 "$dir/VERSION" "$dest_dir/VERSION"
+  fi
   return 0
 }
 
