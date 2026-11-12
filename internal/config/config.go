@@ -26,6 +26,9 @@ const (
 	DefaultACMEAddr  = "0.0.0.0:80"
 	DefaultDataDir   = "/var/lib/warden-gateway"
 	DefaultConfigDir = "/etc/warden-gateway"
+	// DefaultScriptDir holds bootstrap.sh and toolbox.sh so the panel can serve
+	// them to mainland hosts without reaching GitHub.
+	DefaultScriptDir = "/opt/warden-gateway"
 )
 
 var hostPattern = regexp.MustCompile("^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$")

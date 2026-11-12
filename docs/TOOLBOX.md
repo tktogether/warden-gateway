@@ -11,6 +11,8 @@ sudo bash toolbox.sh status
 sudo bash toolbox.sh backup
 sudo bash toolbox.sh restore --id latest
 sudo bash toolbox.sh doctor
+sudo bash toolbox.sh cn-setup
+sudo bash toolbox.sh cn-restore --id latest
 sudo bash toolbox.sh uninstall
 ```
 
@@ -44,8 +46,21 @@ sudo bash toolbox.sh bbr benchmark --peer 203.0.113.10 --seconds 10 --schemes bb
 工具箱在缺少本地源码时自动下载仓库压缩包。下载顺序：自定义地址、GitHub archive、codeload、代理前缀。
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/tktogether/warden-gateway/main/toolbox.sh)
+curl -fL https://raw.githubusercontent.com/tktogether/warden-gateway/main/toolbox.sh -o /tmp/warden-toolbox.sh
+sudo bash /tmp/warden-toolbox.sh
 ```
+
+不要使用 `bash <(curl ...)` 形式：进程替换依赖 `/dev/fd`，部分系统不可用。
+
+## 诊断与国内机设置
+
+```bash
+sudo bash toolbox.sh doctor        # 项目自身与国内机配置两段诊断
+sudo bash toolbox.sh cn-setup      # 应用 hosts/DNS 分流、APT、Docker、Git 镜像和 BBR
+sudo bash toolbox.sh cn-restore    # 恢复最近一次国内机设置备份
+```
+
+`cn-setup` 和 `cn-restore` 都是 `bootstrap.sh` 的子命令，工具箱直接透传参数。
 
 可用环境变量：
 

@@ -9,12 +9,14 @@
     overview: null,
     metrics: null,
     proxies: null,
+    diagnostics: null,
+    cn: null,
     backups: [],
     audit: [],
     settings: null,
     loading: {}
   };
-  var views = ['overview', 'metrics', 'proxies', 'backups', 'audit', 'settings'];
+  var views = ['overview', 'metrics', 'proxies', 'diagnostics', 'backups', 'audit', 'settings'];
 
   function qs(sel) { return document.querySelector(sel); }
   function el(tag, cls, text) {
@@ -149,6 +151,7 @@
     if (view === 'overview') { loadOverview(); }
     if (view === 'metrics') { loadMetrics(); }
     if (view === 'proxies') { loadProxies(); }
+    if (view === 'diagnostics') { loadDiagnostics(); }
     if (view === 'backups') { loadBackups(); }
     if (view === 'audit') { loadAudit(); }
     if (view === 'settings') { loadSettings(); }
@@ -582,6 +585,180 @@
     return wrap;
   }
 
+  function statusKind(status) {
+    if (status === 'ok') { return ['正常', 'ok']; }
+    if (status === 'warn') { return ['注意', 'warn']; }
+    if (status === 'fail') { return ['异常', 'bad']; }
+    return ['跳过', ''];
+  }
+
+  async function loadDiagnostics() {
+    var box = qs('#diagnostics-content');
+    pageNote('#diagnostics-note', '检查中…');
+    clear(box);
+    box.appendChild(el('div', 'skeleton'));
+    try {
+      var results = await Promise.all([api('/api/diagnostics'), api('/api/cn')]);
+      state.diagnostics = results[0];
+      state.cn = results[1];
+      renderDiagnostics(results[0], results[1]);
+      pageNote('#diagnostics-note', '检查于 ' + fmtTime(results[0].as_of));
+    } catch (err) {
+      clear(box);
+      box.appendChild(el('div', 'empty', err.message));
+      pageNote('#diagnostics-note', '检查失败');
+      showToast(err.message, true);
+    }
+  }
+
+  function renderDiagnostics(report, cn) {
+    var box = qs('#diagnostics-content');
+    clear(box);
+    var warns = 0;
+    [report.project, report.cn].forEach(function (section) {
+      ((section && section.items) || []).forEach(function (item) { if (item.status === 'warn') { warns++; } });
+    });
+    var level = report.ok ? (warns > 0 ? 'warn' : 'good') : 'bad';
+    var banner = el('div', 'alert ' + level);
+    add(banner, el('span', '', report.ok ? (warns > 0 ? '检查完成，有 ' + warns + ' 项需要注意' : '全部检查通过') : '存在异常项，请按提示处理'));
+    add(banner, el('span', '', '项目自身与国内机配置分别列出'));
+    box.appendChild(banner);
+    box.appendChild(diagSection(report.project));
+    box.appendChild(diagSection(report.cn));
+    if (cn) { box.appendChild(cnCommandPanel(cn)); }
+  }
+
+  function diagSection(section) {
+    var p = el('div', 'panel diag-panel');
+    if (!section) { add(p, el('div', 'empty', '没有检查结果')); return p; }
+    var head = el('div', 'diag-head');
+    add(head, el('h3', '', section.title || '检查'));
+    var warns = 0;
+    (section.items || []).forEach(function (item) { if (item.status === 'warn') { warns++; } });
+    if (!section.ok) {
+      head.appendChild(statusPill('待处理', 'bad'));
+    } else if (warns > 0) {
+      head.appendChild(statusPill('注意（' + warns + '）', 'warn'));
+    } else {
+      head.appendChild(statusPill('通过', 'ok'));
+    }
+    p.appendChild(head);
+    var list = el('div', 'diag-list');
+    (section.items || []).forEach(function (item) {
+      var row = el('div', 'diag-item');
+      var main = el('div');
+      add(main, el('div', 'name', item.label || item.id || ''));
+      if (item.detail) { add(main, el('div', 'desc', item.detail)); }
+      add(row, main);
+      var kind = statusKind(item.status);
+      row.appendChild(statusPill(kind[0], kind[1]));
+      list.appendChild(row);
+    });
+    if (!(section.items || []).length) { add(list, el('div', 'empty', '没有检查项')); }
+    p.appendChild(list);
+    if (section.hint) { add(p, el('p', 'muted diag-hint', section.hint)); }
+    return p;
+  }
+
+  function cnCommandPanel(cn) {
+    var p = el('div', 'panel');
+    add(p, el('h3', '', '国内机一键设置'));
+    add(p, el('p', 'muted', '在其他服务器上执行命令，自动配置 hosts、Docker 镜像与 Git 镜像。修改前自动备份，可用恢复命令还原。'));
+    p.appendChild(commandRow('安装脚本', cn.command || ''));
+    p.appendChild(commandRow('工具箱', cn.toolbox_command || ''));
+    p.appendChild(commandRow('恢复命令', cn.restore_command || ''));
+    add(p, infoList([
+      ['网关地址', cn.gateway_ip || '—'],
+      ['面板域名', cn.panel_host || '—'],
+      ['备份目录', cn.backup_root || '—'],
+      ['最新备份', cn.latest_backup || '—']
+    ]));
+    return p;
+  }
+
+  function commandRow(label, command) {
+    var wrap = el('div', 'command-row');
+    add(wrap, el('div', 'command-label', label));
+    var box = el('div', 'command-box');
+    box.appendChild(el('code', '', command || '—'));
+    var btn = el('button', 'btn small', '复制');
+    btn.type = 'button';
+    btn.addEventListener('click', function () { copyText(command, btn); });
+    box.appendChild(btn);
+    wrap.appendChild(box);
+    return wrap;
+  }
+
+  function copyText(text, btn) {
+    if (!text) { showToast('没有可复制的内容', true); return; }
+    function done() {
+      showToast('已复制');
+      if (btn) {
+        var old = btn.textContent;
+        btn.textContent = '已复制';
+        setTimeout(function () { btn.textContent = old; }, 1500);
+      }
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, function () { fallbackCopy(text, done); });
+      return;
+    }
+    fallbackCopy(text, done);
+  }
+
+  function fallbackCopy(text, done) {
+    var ta = el('textarea', 'copy-sink');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    if (ok) { done(); } else { showToast('复制失败，请手动选择文本', true); }
+  }
+
+  async function applyCN(btn) {
+    var cn = state.cn;
+    if (!cn) { showToast('无法读取国内机设置信息', true); return; }
+    var yes = await confirmDialog('在本机应用国内机设置', '将修改本机 hosts、Docker 镜像、Git 镜像、APT 源与 BBR 配置，修改前自动备份。确认继续？');
+    if (!yes) { return; }
+    setBusy(btn, true);
+    try {
+      var report = await api('/api/cn/apply', { method: 'POST', body: {
+        gateway_ip: cn.gateway_ip || '',
+        apt_mirror: 'https://mirrors.aliyun.com',
+        docker_mirror: cn.origin || '',
+        git_mirror: cn.origin || '',
+        domains: cn.domains || [],
+        hosts: true, dns: false, apt: true, bbr: true, docker: true, git: true, apt_update: false
+      } });
+      var failed = (report.steps || []).filter(function (st) { return st.ok === false; });
+      showToast(failed.length ? ('已应用，' + failed.length + ' 项失败') : '已应用国内机设置', failed.length > 0);
+      await loadSettings();
+    } catch (err) {
+      showToast(err.message, true);
+    } finally {
+      setBusy(btn, false);
+    }
+  }
+
+  async function restoreCN(btn) {
+    var cn = state.cn;
+    if (!cn || !cn.latest_backup) { showToast('没有可用的国内机设置备份', true); return; }
+    var yes = await confirmDialog('恢复国内机设置', '将从备份 ' + cn.latest_backup + ' 恢复 hosts、Docker、Git、APT 与 BBR 配置。确认继续？');
+    if (!yes) { return; }
+    setBusy(btn, true);
+    try {
+      await api('/api/cn/restore', { method: 'POST', body: { id: cn.latest_backup } });
+      showToast('已恢复 ' + cn.latest_backup);
+      await loadSettings();
+    } catch (err) {
+      showToast(err.message, true);
+    } finally {
+      setBusy(btn, false);
+    }
+  }
+
   async function loadBackups() {
     var box = qs('#backups-content');
     try {
@@ -693,14 +870,46 @@
   async function loadSettings() {
     var box = qs('#settings-content');
     try {
-      var data = await api('/api/settings');
+      var results = await Promise.all([api('/api/settings'), api('/api/cn')]);
+      var data = results[0];
       state.settings = data;
+      state.cn = results[1];
       renderSettings(data);
     } catch (err) {
       clear(box);
       box.appendChild(el('div', 'empty', err.message));
       showToast(err.message, true);
     }
+  }
+
+  function cnSettingsBody() {
+    var wrap = el('div', 'stack');
+    var cn = state.cn;
+    if (!cn) {
+      add(wrap, el('div', 'empty', '正在读取国内机设置信息…'));
+      return wrap;
+    }
+    wrap.appendChild(commandRow('安装脚本命令', cn.command || ''));
+    wrap.appendChild(commandRow('工具箱命令', cn.toolbox_command || ''));
+    wrap.appendChild(commandRow('恢复命令', cn.restore_command || ''));
+    wrap.appendChild(infoList([
+      ['网关地址', cn.gateway_ip || '—'],
+      ['面板域名', cn.panel_host || '—'],
+      ['hosts 域名', ((cn.domains || []).join(', ') || '—')],
+      ['备份目录', cn.backup_root || '—'],
+      ['最新备份', cn.latest_backup || '—']
+    ]));
+    var actions = el('div', 'form-actions');
+    var apply = el('button', 'btn primary', '在本机应用设置');
+    apply.type = 'button';
+    apply.addEventListener('click', function () { applyCN(apply); });
+    actions.appendChild(apply);
+    var restore = el('button', 'btn', '恢复最近备份');
+    restore.type = 'button';
+    restore.addEventListener('click', function () { restoreCN(restore); });
+    actions.appendChild(restore);
+    wrap.appendChild(actions);
+    return wrap;
   }
 
   function renderSettings(data) {
@@ -774,6 +983,12 @@
     certPanel.appendChild(renew);
     grid.appendChild(certPanel);
 
+    var cnPanel = el('div', 'panel span-2');
+    add(cnPanel, el('h3', '', '国内机一键设置'));
+    add(cnPanel, el('p', 'muted', '把本机作为代理机时，其他国内服务器可用下面的命令配置 hosts、Docker 镜像与 Git 镜像；修改前自动备份，可随时恢复。'));
+    cnPanel.appendChild(cnSettingsBody());
+    grid.appendChild(cnPanel);
+
     var configPanel = el('div', 'panel span-2');
     add(configPanel, el('h3', '', '运行配置'));
     var cv = el('div', 'config-view');
@@ -845,6 +1060,7 @@
     });
     qs('#refresh-overview').addEventListener('click', loadOverview);
     qs('#refresh-proxies').addEventListener('click', loadProxies);
+    qs('#refresh-diagnostics').addEventListener('click', loadDiagnostics);
     qs('#create-backup').addEventListener('click', function () { createBackup(this); });
     qs('#metrics-range').addEventListener('click', function (ev) {
       var b = ev.target.closest('.range');

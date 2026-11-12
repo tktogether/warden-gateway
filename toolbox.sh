@@ -134,7 +134,9 @@ Warden Gateway Toolbox
   sudo bash toolbox.sh status                    查看 Warden Gateway 状态
   sudo bash toolbox.sh backup                    立即创建备份
   sudo bash toolbox.sh restore [--id latest|ID]  恢复备份
-  sudo bash toolbox.sh doctor                    检查环境与域名解析
+  sudo bash toolbox.sh doctor                    一键诊断（项目自身与国内机配置）
+  sudo bash toolbox.sh cn-setup                  对当前机器应用国内机设置
+  sudo bash toolbox.sh cn-restore [--id latest]  恢复国内机设置
   sudo bash toolbox.sh uninstall [选项]          卸载 Warden Gateway
   sudo bash toolbox.sh common [工具] [参数]      常用工具
   sudo bash toolbox.sh bbr [操作]                BBR 配置与测试
@@ -159,9 +161,10 @@ Warden Gateway Toolbox
   sudo bash toolbox.sh update
 
 远程运行（不需要手工下载源码）：
-  sudo bash <(curl -fsSL https://raw.githubusercontent.com/tktogether/warden-gateway/main/toolbox.sh)
-  sudo bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/tktogether/warden-gateway/main/toolbox.sh)
+  curl -fsSL https://raw.githubusercontent.com/tktogether/warden-gateway/main/toolbox.sh -o wg-toolbox.sh
+  sudo bash wg-toolbox.sh
   运行 remote 操作可查看当前可用的下载通道。
+  不使用 bash <(curl ...) 写法，该写法依赖 /dev/fd，部分系统不可用。
 
 说明：
   读取类工具可以直接运行；安装、配置和测试类操作需要 root 权限。
@@ -180,9 +183,10 @@ remote_command() {
   local url
   printf '远程运行命令（按可用性选择）：\n'
   while IFS= read -r url; do
-    printf '  sudo bash <(curl -fsSL %s)\n' "$url"
+    printf '  curl -fsSL %s -o /tmp/warden-toolbox.sh && sudo bash /tmp/warden-toolbox.sh\n' "$url"
   done < <(toolbox_remote_urls)
-  printf '\n安装 Warden Gateway：在命令末尾加 install。\n'
+  printf '\n安装 Warden Gateway：把上一条命令中的 bash 改为 bash /tmp/warden-toolbox.sh install，或执行后选择 1。\n'
+  printf '不使用 bash <(curl ...) 写法，该写法依赖 /dev/fd，部分系统会报 No such file or directory。\n'
 }
 
 module_ids() {
@@ -264,9 +268,11 @@ main_menu() {
     printf '  5) 恢复备份\n'
     printf '  6) 常用工具\n'
     printf '  7) BBR 配置与测试\n'
-    printf '  8) 检查环境\n'
-    printf '  9) 卸载\n'
-    printf ' 10) 运行工具箱自检\n'
+    printf '  8) 一键诊断\n'
+    printf '  9) 国内机设置\n'
+    printf ' 10) 恢复国内机设置\n'
+    printf ' 11) 卸载\n'
+    printf ' 12) 运行工具箱自检\n'
     printf '  0) 退出\n'
     if ! read -r -p '选择: ' choice; then
       return 0
@@ -281,8 +287,10 @@ main_menu() {
       6) menu_action run_module common ;;
       7) menu_action run_module bbr ;;
       8) menu_action run_module gateway doctor ;;
-      9) menu_action run_module gateway uninstall ;;
-     10) menu_action self_test ;;
+      9) menu_action run_module gateway cn-setup ;;
+     10) menu_action run_module gateway cn-restore ;;
+     11) menu_action run_module gateway uninstall ;;
+     12) menu_action self_test ;;
       *) warn "无效选择。" ;;
     esac
     pause_if_tty
@@ -337,7 +345,7 @@ main() {
     self-test)
       self_test
       ;;
-    install|update|status|uninstall|backup|restore|doctor|self-test)
+    install|update|status|uninstall|backup|restore|doctor|cn-setup|cn-restore)
       run_gateway_action "$@"
       ;;
     common|tools)

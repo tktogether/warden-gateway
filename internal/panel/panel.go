@@ -43,6 +43,7 @@ type Options struct {
 	Config      *config.Config
 	ConfigPath  string
 	DataDir     string
+	ScriptDir   string
 	ServiceName string
 	Auth        *auth.Manager
 	Backups     *backup.Manager
@@ -55,6 +56,7 @@ type Server struct {
 	cfg         *config.Config
 	cfgPath     string
 	dataDir     string
+	scriptDir   string
 	serviceName string
 	auth        *auth.Manager
 	backups     *backup.Manager
@@ -77,6 +79,9 @@ func New(opts Options) (*Server, error) {
 	if opts.DataDir == "" {
 		opts.DataDir = config.DefaultDataDir
 	}
+	if opts.ScriptDir == "" {
+		opts.ScriptDir = config.DefaultScriptDir
+	}
 	if opts.ServiceName == "" {
 		opts.ServiceName = defaultService
 	}
@@ -93,7 +98,7 @@ func New(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 	s := &Server{
-		cfg: opts.Config, cfgPath: opts.ConfigPath, dataDir: opts.DataDir,
+		cfg: opts.Config, cfgPath: opts.ConfigPath, dataDir: opts.DataDir, scriptDir: opts.ScriptDir,
 		serviceName: opts.ServiceName, auth: opts.Auth, backups: opts.Backups,
 		stats: opts.Stats, log: opts.Log, started: opts.Started,
 		host: newHostMetrics(5760), auditPath: filepath.Join(opts.DataDir, "audit.log"),
@@ -141,6 +146,14 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, p string) {
 	}
 	if p == "/" || p == "/index.html" {
 		s.serveAsset(w, "index.html", "text/html; charset=utf-8", true)
+		return
+	}
+	switch p {
+	case "/bootstrap.sh":
+		s.serveScript(w, r, "bootstrap.sh")
+		return
+	case "/toolbox.sh":
+		s.serveScript(w, r, "toolbox.sh")
 		return
 	}
 	switch p {
@@ -204,6 +217,18 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, p string) {
 	case "/api/audit":
 		s.handleAudit(w, r)
 		return
+	case "/api/diagnostics":
+		s.handleDiagnostics(w, r)
+		return
+	case "/api/cn":
+		s.handleCNStatus(w, r)
+		return
+	case "/api/cn/apply":
+		s.handleCNApply(w, r)
+		return
+	case "/api/cn/restore":
+		s.handleCNRestore(w, r)
+		return
 	}
 	if strings.HasPrefix(p, "/api/services/") {
 		s.handleServiceAction(w, r, strings.TrimPrefix(p, "/api/services/"))
@@ -228,6 +253,25 @@ func (s *Server) serveAsset(w http.ResponseWriter, name, contentType string, noS
 	} else {
 		w.Header().Set("Cache-Control", "public, max-age=300")
 	}
+	_, _ = w.Write(raw)
+}
+
+// serveScript serves the installer and toolbox scripts hosted on this node so
+// that mainland hosts can fetch them without reaching GitHub.
+func (s *Server) serveScript(w http.ResponseWriter, r *http.Request, name string) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	path := filepath.Join(s.scriptDir, name)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	_, _ = w.Write(raw)
 }
 

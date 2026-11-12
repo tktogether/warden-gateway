@@ -27,6 +27,7 @@ type Paths struct {
 	ConfigPath  string
 	DataDir     string
 	ServicePath string
+	ScriptDir   string
 }
 
 // Options configures an App.
@@ -72,6 +73,9 @@ func New(opts Options) (*App, error) {
 	if opts.Paths.ServicePath == "" {
 		opts.Paths.ServicePath = "/etc/systemd/system/warden-gateway.service"
 	}
+	if opts.Paths.ScriptDir == "" {
+		opts.Paths.ScriptDir = config.DefaultScriptDir
+	}
 	logger := opts.Log
 	if logger == nil {
 		var err error
@@ -95,6 +99,7 @@ func New(opts Options) (*App, error) {
 	backups := backup.New(cfg.Backup.Dir, opts.Paths.ConfigPath, opts.Paths.DataDir, opts.Paths.ServicePath, cfg.Backup.Retain)
 	panelSrv, err := panel.New(panel.Options{
 		Config: cfg, ConfigPath: opts.Paths.ConfigPath, DataDir: opts.Paths.DataDir,
+		ScriptDir:   opts.Paths.ScriptDir,
 		ServiceName: "warden-gateway.service", Auth: authMgr, Backups: backups,
 		Stats: stats, Log: logger, Started: time.Now(),
 	})
@@ -145,6 +150,8 @@ func (a *App) Handler() http.Handler {
 				return
 			}
 			a.docker.ServeHTTP(w, r)
+		case p == "/bootstrap.sh" || p == "/toolbox.sh":
+			a.serveScript(w, r)
 		case strings.HasPrefix(p, "/http://"), strings.HasPrefix(p, "/https://"):
 			if a.github == nil {
 				http.Error(w, "github proxy is disabled", http.StatusServiceUnavailable)
@@ -157,6 +164,25 @@ func (a *App) Handler() http.Handler {
 			http.NotFound(w, r)
 		}
 	})
+}
+
+// serveScript serves the installer and toolbox scripts from the script directory.
+func (a *App) serveScript(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	name := strings.TrimPrefix(r.URL.Path, "/")
+	path := filepath.Join(a.paths.ScriptDir, name)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_, _ = w.Write(raw)
 }
 
 // Start opens every configured listener and blocks until ctx is cancelled.

@@ -26,6 +26,45 @@
 | POST | `/api/cert/renew` | 触发证书续期检查 |
 | GET | `/api/config` | 配置和设置 |
 | GET | `/api/audit?limit=100&q=` | 审计记录 |
+| GET | `/api/diagnostics` | 一键诊断：项目自身与国内机配置 |
+
+## 国内机设置
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/cn` | 国内机设置状态、命令与备份列表 |
+| POST | `/api/cn/apply` | 在本机应用国内机设置，body 见下 |
+| POST | `/api/cn/restore` | 恢复国内机设置，body `{"id":"latest"}` |
+
+`/api/cn/apply` 的 body：
+
+```json
+{
+  "gateway_ip": "192.0.2.10",
+  "apt_mirror": "https://mirrors.aliyun.com",
+  "docker_mirror": "https://panel.example.com",
+  "git_mirror": "https://panel.example.com",
+  "domains": ["github.com", "registry-1.docker.io"],
+  "hosts": true,
+  "dns": false,
+  "apt": true,
+  "bbr": true,
+  "docker": true,
+  "git": true,
+  "apt_update": false
+}
+```
+
+返回 `{"as_of":"...","backup_id":"...","steps":[{"name":"hosts","ok":true,"detail":"..."}],"warnings":[]}`。每次应用前自动备份，最多保留 10 个。
+
+## 脚本下载
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/bootstrap.sh` | 下载安装脚本，无需登录 |
+| GET | `/toolbox.sh` | 下载工具箱脚本，无需登录 |
+
+两个脚本由安装时复制到 `/opt/warden-gateway`，可在任意机器上通过面板地址获取，不依赖 GitHub。
 
 ## 备份
 
