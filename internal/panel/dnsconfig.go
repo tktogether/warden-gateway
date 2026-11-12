@@ -1,18 +1,19 @@
 package panel
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
 
 	"github.com/tktogether/warden-gateway/internal/auth"
-	"github.com/tktogether/warden-gateway/internal/cn"
 	"github.com/tktogether/warden-gateway/internal/config"
+	"github.com/tktogether/warden-gateway/internal/dnsproxy"
 )
 
-// handleDNSConfig turns the gateway DNS service on or off and saves the
-// config. The process is restarted afterwards because the DNS listener is
-// created at startup.
+// handleDNSConfig toggles the gateway DNS listener. Enabling it probes the
+// candidate addresses so the panel can report the address that is actually
+// free instead of leaving the service to crash on a busy port.
 func (s *Server) handleDNSConfig(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.guard(w, r); !ok {
 		return
@@ -33,29 +34,51 @@ func (s *Server) handleDNSConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	next := s.cfg.DNS
-	if host := strings.TrimSpace(body.GatewayIP); host != "" {
-		next.GatewayIP = host
+	if strings.TrimSpace(body.GatewayIP) != "" {
+		next.GatewayIP = strings.TrimSpace(body.GatewayIP)
 	}
-	if listen := strings.TrimSpace(body.Listen); listen != "" {
-		next.Listen = listen
+	if strings.TrimSpace(body.Listen) != "" {
+		next.Listen = strings.TrimSpace(body.Listen)
 	}
-	if upstream := strings.TrimSpace(body.Upstream); upstream != "" {
-		next.Upstream = upstream
+	if strings.TrimSpace(body.Upstream) != "" {
+		next.Upstream = strings.TrimSpace(body.Upstream)
 	}
-	if domains := body.Domains; len(domains) > 0 {
-		next.Domains = domains
+	if len(body.Domains) > 0 {
+		next.Domains = body.Domains
 	}
 	if len(next.Domains) == 0 {
-		next.Domains = cn.DefaultDomains()
+		next.Domains = config.DefaultSplitDomains()
 	}
-	if next.GatewayIP == "" {
+	if strings.TrimSpace(next.GatewayIP) == "" {
 		next.GatewayIP = resolveGateway(s.cfg.PublicHost())
 	}
 	next.Enabled = body.Enabled
-	if next.Enabled {
-		if ip := net.ParseIP(next.GatewayIP); ip == nil || ip.To4() == nil {
-			writeError(w, http.StatusBadRequest, "启用 DNS 分流需要有效的 IPv4 网关地址")
+	if next.Enabled && strings.TrimSpace(next.GatewayIP) == "" {
+		writeError(w, http.StatusBadRequest, "启用 DNS 分流需要有效的 IPv4 网关地址")
+		return
+	}
+	note := ""
+	if next.Enabled && !s.cfg.DNS.Enabled {
+		preferred := next.Listen
+		chosen, err := dnsproxy.SelectListen(next)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("没有可用的 DNS 监听地址（首选 %s）：%v", preferred, err))
 			return
+		}
+		next.Listen = chosen
+		_, port, splitErr := net.SplitHostPort(chosen)
+		if splitErr != nil {
+			port = ""
+		}
+		if port != "53" {
+			note = fmt.Sprintf("端口 53 已被占用，DNS 已回退到 %s；国内机需把 resolver 指向该地址，且 resolver 需支持自定义端口", chosen)
+		}
+		if chosen != preferred {
+			reason := fmt.Sprintf("首选地址 %s 不可用，已改用 %s", preferred, chosen)
+			if note != "" {
+				reason = note + "；" + reason
+			}
+			note = reason
 		}
 	}
 	previous := s.cfg.DNS
@@ -69,16 +92,13 @@ func (s *Server) handleDNSConfig(w http.ResponseWriter, r *http.Request) {
 	if next.Enabled {
 		state = "started"
 	}
-	s.audit("dns.config", state, "ok", auth.ClientIP(r))
+	s.audit("dns.config", state+" "+next.Listen, "ok", auth.ClientIP(r))
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok":         true,
-		"restarting": true,
-		"dns":        s.dnsInfo(),
+		"ok": true, "restarting": true, "note": note, "dns": s.dnsInfo(),
 	})
 	s.scheduleRestart()
 }
 
-// handleDNSStatus reports the gateway DNS settings used by the settings page.
 func (s *Server) handleDNSStatus(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.guard(w, r); !ok {
 		return
@@ -87,20 +107,14 @@ func (s *Server) handleDNSStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	gateway := strings.TrimSpace(s.cfg.DNS.GatewayIP)
+	if gateway == "" {
+		gateway = resolveGateway(s.cfg.PublicHost())
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"as_of":                config.NowUTC(),
 		"dns":                  s.dnsInfo(),
-		"domains":              cn.DefaultDomains(),
-		"suggested_gateway_ip": resolveGateway(s.cfg.PublicHost()),
-		"local_resolver_mode":  localResolverMode(),
+		"domains":              config.DefaultSplitDomains(),
+		"suggested_gateway_ip": gateway,
 	})
-}
-
-// localResolverMode reports how this machine redirects traffic today.
-func localResolverMode() string {
-	status, err := cn.New().Status()
-	if err != nil {
-		return "none"
-	}
-	return status.Mode()
 }

@@ -10,8 +10,9 @@ Warden Gateway 是面向个人和小团队的自托管入口程序。它在一�
 - GitHub 下载代理：`/https://github.com/...` 支持发布包、raw 文件、codeload 和 git 请求。
 - 证书：使用 ACME 自动申请和续期，也支持自有证书或自签名证书。
 - 备份恢复：配置、证书缓存和 systemd 单元打包为带校验和的归档；恢复后自动重启服务。
-- 一键诊断：面板和命令行分别检查项目自身运行状态、以及国内机设置是否生效。
-- 国内机一键设置：自动备份后配置 hosts 分流、APT、Docker 与 Git 镜像；可一键恢复到任一备份。
+- 一键诊断：检查网关自身的配置校验、服务状态、监听端口、证书与上游连通性。
+- 承载统计：按 Docker、GitHub、DNS、SNI 四个通道展示网关实际承载的请求、成功率、耗时与流量。
+- 维护命令：安装时注册 warden 命令，日常执行状态、升级、诊断、日志、备份与恢复。
 - 访问控制：访问密钥只保存 SHA-256 摘要；会话使用 HMAC 签名 Cookie 和 CSRF 校验。
 
 ## 架构
@@ -33,7 +34,7 @@ SNI 路由
 | 443 | TCP | SNI 统一入口 |
 | 8443 | TCP | 面板与路径代理，默认只监听 127.0.0.1 |
 | 8080 | TCP | 本地 HTTP，默认只监听 127.0.0.1 |
-| 53 | UDP/TCP | 可选 DNS 分流，默认关闭 |
+| 53 | UDP/TCP | 可选 DNS 分流；被占用时自动回退到 5353、5300、9053 |
 
 ## 环境要求
 
@@ -46,7 +47,7 @@ SNI 路由
 
 ## 快速安装
 
-推荐先下载再执行。下载后运行会进入交互向导，依次确认面板域名、安装方式、Docker 与 GitHub 代理、SNI 入口、DNS 分流、证书方式、监听地址和国内机设置：
+推荐先下载再执行。下载后运行会进入交互向导，依次确认面板域名、安装方式、Docker 与 GitHub 代理、SNI 入口、DNS 分流、证书方式与监听地址：
 
 ```bash
 curl -fL https://raw.githubusercontent.com/tktogether/warden-gateway/main/bootstrap.sh -o bootstrap.sh
@@ -107,15 +108,26 @@ sudo bash bootstrap.sh install --docker --domain panel.example.com
 | `--dns-domains LIST` | DNS 分流域名，逗号分隔 |
 | `--dns-gateway IP` | DNS 分流返回的网关地址 |
 | `--dns-upstream ADDR` | DNS 上游，默认 `1.1.1.1:53` |
-| `--cn-setup` | 安装后执行国内机设置 |
-| `--no-cn` | 不询问国内机设置 |
-| `--cn-mode hosts\|dns\|both\|none` | 国内机分流方式 |
-| `--cn-domains LIST` | 国内机参与分流的域名，逗号分隔 |
-| `--docker-mirror URL` | 国内机 Docker 镜像地址，默认网关地址 |
-| `--git-mirror URL` | 国内机 Git 镜像地址，默认网关地址 |
 | `--yes` | 自动确认 |
 | `--non-interactive` | 不进行交互 |
 | `--dry-run` | 只打印安装计划 |
+
+## 维护命令
+
+安装和升级会把维护命令注册到 `/usr/local/bin/warden`，它调用 `/opt/warden-gateway/bootstrap.sh`，行为与直接运行脚本一致：
+
+```bash
+sudo warden status            # 服务、端口与配置检查
+sudo warden doctor            # 一键诊断（仅网关自身）
+sudo warden logs              # 最近 100 行日志
+sudo warden version           # 已安装版本
+sudo warden backup            # 立即备份
+sudo warden restore --id latest
+sudo warden update            # 升级程序
+sudo warden uninstall
+```
+
+国内机设置不在维护命令中：这些操作用在国内机上，命令由面板或诊断页生成后复制执行。
 
 ## 安装后配置客户端
 
@@ -168,7 +180,7 @@ curl -fL https://panel.example.com/https://github.com/owner/repo/releases/downlo
 - 总览：主机负载、内存、磁盘、证书、服务与代理状态，代理卡片带成功率和请求速率。
 - 指标：CPU、负载 1/5/15、内存与交换分区、网络吞吐（含分网卡明细）、磁盘 IO、TCP 连接状态分布、连接跟踪、DNS 分流命中率，以及全部代理通道的请求量与流量曲线。
 - 代理：每个通道的请求总数、成功率、进行中请求、近一分钟请求与流量、状态码分布、延迟平均/P50/P90/P99/最大与直方图、热点目标、上游响应耗时、近六十分钟曲线和连通性测试。
-- 效果：直连上游与经代理转发的耗时对比，按 Docker、GitHub、DNS、SNI 四个通道给出差值和结论。
+- 承载：网关最近实际承载的流量。按 Docker、GitHub、DNS、SNI 四个通道给出请求量、成功率、平均与 P90 耗时、上游等待、网关转发耗时、入出流量与热点目标，并附请求与流量趋势。
 - 服务：Warden Gateway 的启动、停止和重启。
 - 备份：创建、下载、恢复和删除备份。恢复后自动重启服务。
 - 审计：登录、配置修改和操作记录。
@@ -205,9 +217,9 @@ warden-gateway version
 
 `init` 生成访问密钥和会话密钥。`key` 生成新的访问密钥并写入配置。
 
-## 国内机一键设置
+## 国内机设置
 
-国内服务器访问 GitHub 和 Docker Hub 不稳定时，可在面板「诊断」页复制命令，在目标机器执行。命令由面板所在的代理机提供，脚本通过面板地址下载，不依赖 GitHub。
+国内服务器访问 GitHub 和 Docker Hub 不稳定时，把分流与镜像设置应用到这些机器上。网关本身不执行国内机设置，只在面板「诊断」「设置」页按所选分流方式生成命令；脚本通过面板地址下载，不依赖 GitHub。
 
 ```bash
 curl -fsSL https://panel.example.com/bootstrap.sh -o /tmp/wg-bootstrap.sh
@@ -226,7 +238,7 @@ sudo bash /tmp/wg-bootstrap.sh cn-setup --gateway-ip 192.0.2.10 \
 | Docker 镜像 | 写入 `/etc/docker/daemon.json` 的 `registry-mirrors`，并 reload Docker |
 | Git 镜像 | 写入 `/etc/gitconfig`，改写 `https`、`http`、`git`、`git@github.com:` 和 `ssh://git@github.com/` 地址 |
 
-分流方式由 `--cn-mode` 选择：`hosts`（默认，只改 hosts）、`dns`（只改 resolver）、`both`（两者互为兜底）、`none`（都不改）。参与分流的域名用 `--cn-domains` 指定。面板「设置」页同样提供四项选择，并按选择给出对应命令。
+分流方式由 `--cn-mode` 选择：`hosts`（默认，只改 hosts）、`dns`（只改 resolver）、`both`（两者互为兜底）、`none`（都不改）。参与分流的域名用 `--cn-domains` 指定。面板「设置」页选择分流方式后给出对应命令，「诊断」页同时列出 hosts、DNS、both 三种命令。
 
 每次修改前自动备份到 `/var/backups/warden-gateway-cn`，最多保留 10 个。恢复：
 
@@ -235,24 +247,19 @@ curl -fsSL https://panel.example.com/bootstrap.sh -o /tmp/wg-bootstrap.sh
 sudo bash /tmp/wg-bootstrap.sh cn-restore --id latest
 ```
 
-不带 `--id` 时使用最新备份。也可以在面板「诊断」页点击「在本机应用设置」和「恢复最近备份」。
+不带 `--id` 时使用最新备份。
 
 ## 一键诊断
 
 ```bash
-sudo bash bootstrap.sh doctor
+sudo warden doctor
 ```
 
-输出分为两部分：
-
-- 项目自身：配置校验、服务状态、面板监听、ACME 监听、SNI 入口、Docker 代理、GitHub 代理、DNS 分流、数据目录。
-- 国内机配置：备份目录、hosts 分流、DNS 设置、Docker 镜像、Git 镜像、APT 镜像、BBR、网关连通性。
-
-面板「诊断」页展示同一份结果，并给出国内机一键设置命令。
+检查项：配置校验、服务状态、面板监听、ACME 监听、SNI 入口、Docker 代理、GitHub 代理、DNS 分流（含回退状态）、数据目录。面板「诊断」页展示同一份结果，并附国内机设置命令。
 
 ## 可选 DNS 分流
 
-DNS 模式让客户端把 DNS 指向网关，由网关把指定域名解析到本机。默认关闭，需要手动在配置中开启：
+DNS 模式让客户端把 DNS 指向网关，由网关把指定域名解析到本机。默认关闭，可在面板「设置」页启用，也可在配置中开启：
 
 ```json
 "dns": {
@@ -264,11 +271,11 @@ DNS 模式让客户端把 DNS 指向网关，由网关把指定域名解析到�
 }
 ```
 
-开启前需要确认 53 端口未被 systemd-resolved 占用。
+启用时自动选择监听地址：优先 `0.0.0.0:53`；53 被占用（例如 systemd-resolved）时依次尝试 5353、5300、9053，并把实际监听地址写回配置。面板显示实际监听与回退提示。国内机 resolver 无法指定端口，回退后 DNS 分流不可用，建议关闭 systemd-resolved 的 53 监听后重新启用。DNS 监听失败只记录日志并显示在面板，不会影响面板、443 入口和其他代理。
 
 ## 工具箱
 
-仓库根目录的 `toolbox.sh` 集成安装、升级、状态、备份、恢复、常用网络工具和 BBR 配置：
+仓库根目录的 `toolbox.sh` 集成安装、升级、维护命令、常用网络工具和 BBR 配置：
 
 ```bash
 sudo bash toolbox.sh
@@ -281,15 +288,16 @@ curl -fL https://raw.githubusercontent.com/tktogether/warden-gateway/main/toolbo
 sudo bash /tmp/warden-toolbox.sh
 ```
 
-工具箱菜单包含安装、升级、状态、备份、恢复、一键诊断、国内机设置、恢复国内机设置、卸载和自检。
+工具箱菜单包含安装、升级、状态、日志、版本、备份、恢复、一键诊断、卸载和远程命令。国内机设置不在工具箱中：按面板生成的命令到国内机执行 `bootstrap.sh cn-setup`。
 
 安装完成后，`bootstrap.sh` 与 `toolbox.sh` 会复制到 `/opt/warden-gateway`，同时复制工具箱源码目录，因此本机可直接运行 `sudo bash /opt/warden-gateway/toolbox.sh`，不需要联网下载。
 
 工具箱也可以直接调用网关命令：
 
 ```bash
-sudo bash toolbox.sh cn-setup --gateway-ip 192.0.2.10 --docker-mirror https://panel.example.com --yes
-sudo bash toolbox.sh cn-restore --id latest
+sudo bash toolbox.sh gateway status
+sudo bash toolbox.sh gateway logs
+sudo bash toolbox.sh gateway doctor
 ```
 
 ## 安全说明

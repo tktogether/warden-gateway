@@ -1,6 +1,5 @@
-// Package diagnostics builds the two-part health report shown by the panel:
-// one part for the Warden Gateway installation itself, one part for the China
-// mainland settings that cn-setup applied to this host.
+// Package diagnostics builds the health report shown by the panel for the
+// Warden Gateway installation itself.
 package diagnostics
 
 import (
@@ -11,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tktogether/warden-gateway/internal/cn"
 	"github.com/tktogether/warden-gateway/internal/config"
 )
 
@@ -45,7 +43,15 @@ type Report struct {
 	AsOf    string  `json:"as_of"`
 	OK      bool    `json:"ok"`
 	Project Section `json:"project"`
-	CN      Section `json:"cn"`
+}
+
+// DNSState is the live listener state supplied by the panel.
+type DNSState struct {
+	Running  bool
+	Listen   string
+	Port     string
+	Fallback bool
+	Error    string
 }
 
 // Checker runs the diagnostics.
@@ -56,14 +62,14 @@ type Checker struct {
 	ServiceName   string
 	ServiceStatus func() (string, string)
 	Command       func(name string, args ...string) (string, error)
+	DNSState      func() DNSState
 }
 
-// Run collects both sections.
-func (c *Checker) Run(ctx context.Context) Report {
+// Run collects the report.
+func (c *Checker) Run(_ context.Context) Report {
 	report := Report{AsOf: time.Now().UTC().Format(time.RFC3339)}
 	report.Project = c.project()
-	report.CN = c.cnSection(ctx)
-	report.OK = report.Project.OK && report.CN.OK
+	report.OK = report.Project.OK
 	return report
 }
 
@@ -123,16 +129,7 @@ func (c *Checker) project() Section {
 	} else {
 		section.Items = append(section.Items, Item{ID: "github", Label: "GitHub 下载代理", Status: StatusSkip, Detail: "未启用"})
 	}
-	if cfg.DNS.Enabled {
-		item := listenItem("dns", "DNS 分流", cfg.DNS.Listen)
-		if item.Status == StatusOK && cfg.DNS.GatewayIP == "" {
-			item.Status = StatusWarn
-			item.Detail += "，未配置分流地址"
-		}
-		section.Items = append(section.Items, item)
-	} else {
-		section.Items = append(section.Items, Item{ID: "dns", Label: "DNS 分流", Status: StatusSkip, Detail: "未启用"})
-	}
+	section.Items = append(section.Items, c.dnsItem(cfg))
 	if c.DataDir != "" {
 		if _, err := os.Stat(c.DataDir); err != nil {
 			section.Items = append(section.Items, Item{ID: "data", Label: "数据目录", Status: StatusFail, Detail: err.Error()})
@@ -144,6 +141,33 @@ func (c *Checker) project() Section {
 	return section
 }
 
+func (c *Checker) dnsItem(cfg *config.Config) Item {
+	if !cfg.DNS.Enabled {
+		return Item{ID: "dns", Label: "DNS 分流", Status: StatusSkip, Detail: "未启用"}
+	}
+	state := DNSState{}
+	if c.DNSState != nil {
+		state = c.DNSState()
+	}
+	if state.Error != "" {
+		return Item{ID: "dns", Label: "DNS 分流", Status: StatusFail, Detail: state.Error}
+	}
+	addr := cfg.DNS.Listen
+	if state.Listen != "" {
+		addr = state.Listen
+	}
+	item := listenItem("dns", "DNS 分流", addr)
+	if item.Status == StatusOK && state.Fallback {
+		item.Status = StatusWarn
+		item.Detail += "，53 端口被占用已回退"
+	}
+	if item.Status == StatusOK && cfg.DNS.GatewayIP == "" {
+		item.Status = StatusWarn
+		item.Detail += "，未配置分流地址"
+	}
+	return item
+}
+
 func listenItem(id, label, addr string) Item {
 	if err := dialHost(addr); err != nil {
 		return Item{ID: id, Label: label, Status: StatusFail, Detail: addr + " " + err.Error()}
@@ -151,126 +175,9 @@ func listenItem(id, label, addr string) Item {
 	return Item{ID: id, Label: label, Status: StatusOK, Detail: addr}
 }
 
-func (c *Checker) cnSection(ctx context.Context) Section {
-	section := Section{Key: "cn", Title: "国内机配置", Items: []Item{}}
-	status, err := cn.New().Status()
-	if err != nil {
-		section.Items = append(section.Items, Item{ID: "status", Label: "读取状态", Status: StatusFail, Detail: err.Error()})
-		section.OK = false
-		return section
-	}
-	if len(status.Backups) == 0 {
-		section.Items = append(section.Items, Item{ID: "backup", Label: "配置备份", Status: StatusSkip, Detail: "尚未执行国内机设置"})
-	} else {
-		section.Items = append(section.Items, Item{ID: "backup", Label: "配置备份", Status: StatusOK, Detail: fmt.Sprintf("%d 个，最新 %s", len(status.Backups), status.LatestBackup)})
-	}
-	gateway := ""
-	if status.Hosts.Managed {
-		gateway = status.Hosts.IP
-	}
-	cfg := c.cfg()
-	if gateway == "" && cfg != nil && cfg.DNS.Enabled {
-		gateway = cfg.DNS.GatewayIP
-	}
-	if status.Hosts.Managed {
-		item := Item{ID: "hosts", Label: "hosts 条目", Status: StatusOK, Detail: fmt.Sprintf("%s，%d 个域名", status.Hosts.IP, len(status.Hosts.Domains))}
-		if !resolvesTo(status.Hosts.Domains, status.Hosts.IP) {
-			item.Status = StatusWarn
-			item.Detail += "，解析未全部指向网关"
-		}
-		section.Items = append(section.Items, item)
-	} else {
-		section.Items = append(section.Items, Item{ID: "hosts", Label: "hosts 条目", Status: StatusSkip, Detail: "未设置"})
-	}
-	nameservers := strings.Join(status.DNS.Nameservers, ", ")
-	switch {
-	case len(status.DNS.Nameservers) == 0:
-		section.Items = append(section.Items, Item{ID: "dns", Label: "DNS 指向", Status: StatusSkip, Detail: "未找到 nameserver"})
-	case gateway != "" && status.DNS.Managed == gateway:
-		section.Items = append(section.Items, Item{ID: "dns", Label: "DNS 指向", Status: StatusOK, Detail: nameservers})
-	case gateway != "" && status.DNS.GatewayOnly && status.DNS.Nameservers[0] == gateway:
-		section.Items = append(section.Items, Item{ID: "dns", Label: "DNS 指向", Status: StatusOK, Detail: nameservers})
-	case gateway != "":
-		section.Items = append(section.Items, Item{ID: "dns", Label: "DNS 指向", Status: StatusWarn, Detail: nameservers + "，未指向网关 " + gateway})
-	default:
-		section.Items = append(section.Items, Item{ID: "dns", Label: "DNS 指向", Status: StatusSkip, Detail: nameservers + "，未使用网关分流"})
-	}
-	if status.Docker.Installed && len(status.Docker.Mirrors) > 0 {
-		section.Items = append(section.Items, Item{ID: "docker", Label: "Docker 镜像", Status: StatusOK, Detail: strings.Join(status.Docker.Mirrors, ", ")})
-	} else if status.Docker.Installed {
-		section.Items = append(section.Items, Item{ID: "docker", Label: "Docker 镜像", Status: StatusSkip, Detail: "未配置加速地址"})
-	} else {
-		section.Items = append(section.Items, Item{ID: "docker", Label: "Docker 镜像", Status: StatusSkip, Detail: "未安装 Docker"})
-	}
-	if len(status.Git.Mirrors) > 0 {
-		section.Items = append(section.Items, Item{ID: "git", Label: "Git 镜像", Status: StatusOK, Detail: strings.Join(status.Git.Mirrors, ", ")})
-	} else {
-		section.Items = append(section.Items, Item{ID: "git", Label: "Git 镜像", Status: StatusSkip, Detail: "未设置"})
-	}
-	if status.APT.Mirrored {
-		section.Items = append(section.Items, Item{ID: "apt", Label: "APT 源", Status: StatusOK, Detail: strings.Join(status.APT.Hosts, ", ")})
-	} else if len(status.APT.Hosts) > 0 {
-		section.Items = append(section.Items, Item{ID: "apt", Label: "APT 源", Status: StatusWarn, Detail: strings.Join(status.APT.Hosts, ", ") + "，未使用国内镜像"})
-	} else {
-		section.Items = append(section.Items, Item{ID: "apt", Label: "APT 源", Status: StatusSkip, Detail: "未找到源地址"})
-	}
-	if status.BBR.Congestion == "bbr" {
-		section.Items = append(section.Items, Item{ID: "bbr", Label: "拥塞控制", Status: StatusOK, Detail: "bbr / " + status.BBR.QDisc})
-	} else if status.BBR.Congestion != "" {
-		section.Items = append(section.Items, Item{ID: "bbr", Label: "拥塞控制", Status: StatusWarn, Detail: status.BBR.Congestion + " / " + status.BBR.QDisc})
-	} else {
-		section.Items = append(section.Items, Item{ID: "bbr", Label: "拥塞控制", Status: StatusSkip, Detail: "无法读取"})
-	}
-	if gateway != "" {
-		item := Item{ID: "gateway", Label: "网关连通性", Status: StatusOK, Detail: gateway}
-		if err := dialContext(ctx, net.JoinHostPort(gateway, "443")); err != nil {
-			item.Status = StatusWarn
-			item.Detail = gateway + ":443 " + err.Error()
-		}
-		section.Items = append(section.Items, item)
-	}
-	section.OK = sectionHealthy(section)
-	if !section.OK && len(status.Backups) == 0 {
-		section.Hint = "使用 bootstrap.sh cn-setup 应用国内机设置"
-	}
-	return section
-}
-
 func sectionHealthy(section Section) bool {
 	for _, item := range section.Items {
 		if item.Status == StatusFail {
-			return false
-		}
-	}
-	return true
-}
-
-// resolvesTo reports whether every probed domain resolves to ip. Only a few
-// representative domains are probed so one slow resolver cannot stall the
-// diagnostics request.
-func resolvesTo(domains []string, ip string) bool {
-	if len(domains) == 0 || ip == "" {
-		return false
-	}
-	limit := len(domains)
-	if limit > 3 {
-		limit = 3
-	}
-	for _, domain := range domains[:limit] {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		addrs, err := net.DefaultResolver.LookupHost(ctx, domain)
-		cancel()
-		if err != nil {
-			return false
-		}
-		found := false
-		for _, addr := range addrs {
-			if addr == ip {
-				found = true
-				break
-			}
-		}
-		if !found {
 			return false
 		}
 	}

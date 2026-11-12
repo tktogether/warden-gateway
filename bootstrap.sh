@@ -10,6 +10,7 @@ DATA_DIR="/var/lib/warden-gateway"
 SCRIPT_DIR="/opt/warden-gateway"
 UNIT_PATH="/etc/systemd/system/$SERVICE.service"
 LOGROTATE_PATH="/etc/logrotate.d/$SERVICE"
+CLI_PATH="/usr/local/bin/warden"
 PANEL_BASE_PATH="/warden"
 HTTP_LISTEN="127.0.0.1:8080"
 REPO="tktogether/warden-gateway"
@@ -65,7 +66,6 @@ HTTPS_LISTEN="127.0.0.1:8443"
 CERT_FILE=""
 KEY_FILE=""
 
-CN_SETUP_AFTER_INSTALL=0
 CN_APT_MIRROR="https://mirrors.aliyun.com"
 CN_DOCKER_MIRROR=""
 CN_GIT_MIRROR=""
@@ -182,12 +182,18 @@ Warden Gateway 一键安装脚本
   bootstrap.sh update [选项]        升级程序（保留配置和数据）
   bootstrap.sh uninstall [--purge]  卸载
   bootstrap.sh status               查看状态
+  bootstrap.sh logs                 查看最近日志
+  bootstrap.sh version              查看版本
   bootstrap.sh backup               立即备份
   bootstrap.sh restore [--id ID]    恢复备份（默认最新）
-  bootstrap.sh doctor               一键诊断（项目自身与国内机配置）
-  bootstrap.sh cn-setup             对国内机应用代理与镜像设置（自动备份）
-  bootstrap.sh cn-restore [--id ID] 恢复国内机设置（默认最新备份）
+  bootstrap.sh doctor               一键诊断（仅网关自身）
   bootstrap.sh self-test            自检
+  bootstrap.sh cn-setup             在需要走网关的国内机上应用设置
+  bootstrap.sh cn-restore [--id ID] 恢复国内机设置（默认最新备份）
+
+安装完成后会注册维护命令 warden，常用操作：
+  sudo warden status | update | doctor | backup | restore | logs | version
+  国内机设置不在维护命令中，请在国内机上运行 bootstrap.sh cn-setup。
 
 安装选项：
   --domain DOMAIN        面板域名（留空则使用 IP 自签名证书）
@@ -213,26 +219,26 @@ Warden Gateway 一键安装脚本
   --dns-domains LIST     参与 DNS 分流的域名，逗号分隔
   --dns-gateway IP       DNS 分流返回的网关地址（默认本机公网 IP）
   --dns-upstream ADDR    上游 DNS，默认 1.1.1.1:53
-  --gateway-ip IP        国内机指向的网关地址（cn-setup 使用）
-  --cn-setup             安装完成后执行国内机设置
-  --no-cn                安装时不询问国内机设置
-  --no-hosts             国内机设置不修改 /etc/hosts
-  --no-apt               国内机设置不修改 APT 镜像
-  --no-bbr               国内机设置不启用 BBR
-  --no-docker-mirror     国内机设置不修改 Docker 镜像
-  --no-git               国内机设置不修改 Git 镜像
-  --no-apt-update        国内机设置不执行 apt-get update
-  --apt-mirror URL       APT 镜像地址，默认 https://mirrors.aliyun.com
-  --docker-mirror URL    国内机 Docker 镜像地址，默认使用网关地址
-  --git-mirror URL       国内机 Git 镜像地址，默认使用网关地址
-  --cn-domains LIST      国内机参与分流的域名，逗号分隔
-  --cn-mode MODE         国内机分流方式：hosts、dns、both、none，默认 hosts
-  --cn-id ID             恢复的国内机设置备份
   --yes                  自动确认
   --non-interactive      不进行交互
   --dry-run              只打印步骤
   --purge                卸载时同时删除配置、数据和备份
   --id ID                恢复指定备份，默认 latest
+
+国内机设置选项（仅 cn-setup / cn-restore 使用）：
+  --gateway-ip IP        国内机指向的网关地址
+  --no-hosts             不修改 /etc/hosts
+  --no-apt               不修改 APT 镜像
+  --no-bbr               不启用 BBR
+  --no-docker-mirror     不修改 Docker 镜像
+  --no-git               不修改 Git 镜像
+  --no-apt-update        不执行 apt-get update
+  --apt-mirror URL       APT 镜像地址，默认 https://mirrors.aliyun.com
+  --docker-mirror URL    Docker 镜像地址，默认使用网关地址
+  --git-mirror URL       Git 镜像地址，默认使用网关地址
+  --cn-domains LIST      参与分流的域名，逗号分隔
+  --cn-mode MODE         分流方式：hosts、dns、both、none，默认 hosts
+  --cn-id ID             恢复的国内机设置备份
 
 不带参数运行且处于终端时进入交互安装向导。
 USAGE
@@ -241,7 +247,7 @@ USAGE
 parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      install|update|uninstall|status|backup|restore|doctor|self-test|cn-setup|cn-restore)
+      install|update|uninstall|status|logs|version|backup|restore|doctor|self-test|cn-setup|cn-restore)
         COMMAND="$1"; shift;;
       --domain) DOMAIN="$2"; shift 2;;
       --public-url) PUBLIC_URL="$2"; shift 2;;
@@ -267,8 +273,6 @@ parse_args() {
       --dns-gateway) DNS_GATEWAY="$2"; shift 2;;
       --dns-upstream) DNS_UPSTREAM="$2"; shift 2;;
       --gateway-ip) GATEWAY_IP="$2"; shift 2;;
-      --cn-setup) CN_SETUP_AFTER_INSTALL=1; EXPLICIT_CN=1; shift;;
-      --no-cn) CN_SETUP_AFTER_INSTALL=0; EXPLICIT_CN=1; INTERACTIVE_SETUP=0; shift;;
       --no-hosts) CN_DO_HOSTS=0; EXPLICIT_CN=1; shift;;
       --no-apt) CN_DO_APT=0; EXPLICIT_CN=1; shift;;
       --no-bbr) CN_DO_BBR=0; EXPLICIT_CN=1; shift;;
@@ -624,6 +628,28 @@ install_scripts() {
   fi
   [ -f "$dir/VERSION" ] && install -m 0644 "$dir/VERSION" "$SCRIPT_DIR/VERSION"
   return 0
+}
+
+install_cli() {
+  step "命令" "注册维护命令 $CLI_PATH"
+  if [ "$DRY_RUN" -eq 1 ]; then printf '  + write %s\n' "$CLI_PATH"; return 0; fi
+  mkdir -p "$(dirname "$CLI_PATH")"
+  cat > "$CLI_PATH" <<CLIEOF
+#!/usr/bin/env bash
+set -euo pipefail
+BOOTSTRAP="$SCRIPT_DIR/bootstrap.sh"
+case "\${1:-}" in
+  cn-setup|cn-restore)
+    printf '该命令用于国内机，请在目标机执行：bash bootstrap.sh %s\n' "\$1" >&2
+    exit 2;;
+esac
+if [ ! -f "\$BOOTSTRAP" ]; then
+  printf '未找到 %s，请重新安装 warden-gateway。\n' "\$BOOTSTRAP" >&2
+  exit 1
+fi
+exec bash "\$BOOTSTRAP" "\$@"
+CLIEOF
+  chmod 0755 "$CLI_PATH"
 }
 
 install_unit() {
@@ -1322,22 +1348,15 @@ interactive_install() {
       DNS_ENABLE=0
     fi
   fi
-  if [ "$EXPLICIT_CN" -eq 0 ]; then
-    if ask_yes "同时执行国内机设置？" 0; then
-      CN_SETUP_AFTER_INSTALL=1
-      interactive_cn_options
-    fi
-  fi
   interactive_network_options
 }
 
 install_summary() {
-  local docker_state github_state sni_state dns_state cn_state
+  local docker_state github_state sni_state dns_state
   if [ "$NO_DOCKER" -eq 1 ]; then docker_state="未启用"; else docker_state="启用"; fi
   if [ "$NO_GITHUB" -eq 1 ]; then github_state="未启用"; else github_state="启用"; fi
   if [ "$NO_SNI" -eq 1 ]; then sni_state="未启用"; else sni_state="启用"; fi
   if [ "$DNS_ENABLE" -eq 1 ]; then dns_state="启用 ${DNS_LISTEN}"; else dns_state="未启用"; fi
-  if [ "$CN_SETUP_AFTER_INSTALL" -eq 1 ]; then cn_state="安装后执行"; else cn_state="未启用"; fi
   kv "安装方式" "$MODE"
   kv "Docker 镜像代理" "$docker_state"
   kv "GitHub 下载代理" "$github_state"
@@ -1347,7 +1366,6 @@ install_summary() {
   kv "证书方式" "$TLS_MODE"
   kv "面板监听" "$HTTPS_LISTEN"
   kv "SNI 监听" "${ENTRY_LISTEN:-未启用}"
-  kv "国内机设置" "$cn_state"
 }
 
 # ---------------------------------------------------------------------------
@@ -1411,93 +1429,12 @@ doctor_project() {
   return 0
 }
 
-doctor_cn() {
-  local root count hosts_line gateway dns_server apt_mirror docker_mirror git_mirror cc
-  title "国内机配置"
-  root="$(cn_backup_root)"
-  count="$(cn_backup_count)"
-  if [ "$count" -gt 0 ]; then
-    doctor_ok "配置备份" "$count 个，最新 $(cn_latest_backup)"
-  else
-    doctor_skip "配置备份" "尚未执行 cn-setup"
-  fi
-  gateway=""
-  if [ -f /etc/hosts ]; then
-    hosts_line="$(awk -v b="$CN_HOSTS_BEGIN" -v e="$CN_HOSTS_END" '$0==b{on=1;next} $0==e{on=0} on' /etc/hosts 2>/dev/null | head -n 1)"
-    gateway="$(printf '%s' "$hosts_line" | awk '{print $1}')"
-  fi
-  if [ -n "$gateway" ]; then
-    doctor_ok "hosts 条目" "$(printf '%s' "$hosts_line" | cut -c1-80)"
-    if have getent && is_ipv4 "$gateway"; then
-      local resolved
-      resolved="$(getent ahostsv4 github.com | awk '{print $1}' | head -n 1)"
-      if [ "$resolved" = "$gateway" ]; then
-        doctor_ok "分流解析" "github.com -> $resolved"
-      else
-        doctor_warn "分流解析" "github.com -> $resolved（期望 $gateway）"
-      fi
-    fi
-  else
-    doctor_skip "hosts 条目" "未写入"
-  fi
-  dns_server=""
-  local resolved_file resolved_dns
-  for resolved_file in /etc/systemd/resolved.conf.d/warden-cn.conf /usr/lib/systemd/resolved.conf.d/warden-cn.conf /run/systemd/resolved.conf.d/warden-cn.conf; do
-    [ -f "$resolved_file" ] || continue
-    resolved_dns="$(awk -F= '/^DNS=/{print $2}' "$resolved_file" | head -n 1 | tr -d ' ' | cut -d, -f1)"
-    [ -n "$resolved_dns" ] || continue
-    dns_server="$resolved_dns"
-    doctor_ok "resolver" "systemd-resolved 指向 $dns_server"
-    break
-  done
-  if [ -z "$dns_server" ] && [ -f /etc/resolv.conf ]; then
-    dns_server="$(awk '$1=="nameserver"{print $2}' /etc/resolv.conf | head -n 1)"
-  fi
-  if [ -n "$gateway" ] && [ "$dns_server" = "$gateway" ]; then
-    doctor_ok "DNS 指向" "$dns_server"
-  elif [ -n "$dns_server" ]; then
-    doctor_skip "DNS 指向" "当前 $dns_server"
-  else
-    doctor_skip "DNS 指向" "未找到 nameserver"
-  fi
-  apt_mirror="$(grep -hoE 'https?://[A-Za-z0-9._:-]+' /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null | head -n 1)"
-  if [ -z "$apt_mirror" ]; then
-    doctor_skip "APT 源" "未找到"
-  elif is_cn_mirror "$apt_mirror"; then
-    doctor_ok "APT 源" "$apt_mirror"
-  else
-    doctor_warn "APT 源" "$apt_mirror（不是国内镜像）"
-  fi
-  docker_mirror=""
-  if [ -f /etc/docker/daemon.json ]; then
-    docker_mirror="$(grep -oE 'https?://[^"[:space:],]+' /etc/docker/daemon.json 2>/dev/null | head -n 1)"
-  fi
-  if [ -n "$docker_mirror" ]; then doctor_ok "Docker 镜像" "$docker_mirror"; else doctor_skip "Docker 镜像" "未配置"; fi
-  git_mirror=""
-  if [ -f "${NW_GIT_CONFIG_FILE:-/etc/gitconfig}" ]; then
-    git_mirror="$(grep -oE 'url "[^"]*/https://github.com/' "${NW_GIT_CONFIG_FILE:-/etc/gitconfig}" 2>/dev/null | head -n 1 | sed -E 's#^url "##; s#/https://github.com/$##')"
-  fi
-  if [ -n "$git_mirror" ]; then doctor_ok "Git 镜像" "$git_mirror"; else doctor_skip "Git 镜像" "未配置"; fi
-  cc="$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true)"
-  if [ "$cc" = "bbr" ]; then doctor_ok "拥塞控制" "bbr"; else doctor_skip "拥塞控制" "$cc"; fi
-  if [ -n "$gateway" ]; then
-    if have timeout; then
-      if timeout 3 bash -c "cat < /dev/null > /dev/tcp/$gateway/443" 2>/dev/null; then
-        doctor_ok "网关连通" "$gateway:443"
-      else
-        doctor_fail "网关连通" "$gateway:443 不可达"
-      fi
-    fi
-  fi
-}
-
 cmd_doctor() {
   need_root
   title "一键诊断"
   doctor_project || true
-  doctor_cn || true
   title "诊断完成"
-  say "国内机配置异常时执行：sudo bash bootstrap.sh cn-setup"
+  say "如某项异常，按提示处理后重新执行 warden doctor。"
 }
 
 
@@ -1532,6 +1469,8 @@ cmd_install() {
   mkdir -p "$CONFIG_DIR" "$DATA_DIR"
   chmod 0700 "$CONFIG_DIR" "$DATA_DIR"
   if [ "$MODE" = "docker" ]; then
+    install_scripts
+    install_cli
     pull_docker_image
     init_docker_config
     run_docker_container
@@ -1540,6 +1479,7 @@ cmd_install() {
     install_binary
     init_config
     install_scripts
+    install_cli
     install_unit
     install_logrotate
     install_service
@@ -1561,15 +1501,10 @@ cmd_install() {
   else
     say "已保留原有配置和访问密钥。"
   fi
-  if [ "$CN_SETUP_AFTER_INSTALL" -eq 1 ]; then
-    if ! cn_setup; then
-      warn "国内机设置未全部完成，可稍后执行：sudo bash bootstrap.sh cn-setup"
-    fi
-  else
-    title "国内机设置（可选）"
-    say "国内服务器可执行以下命令，应用 APT、Docker、Git 镜像和 hosts 分流："
-    say "  sudo bash bootstrap.sh cn-setup"
-  fi
+  title "维护命令"
+  kv "维护命令" "$CLI_PATH"
+  say "常用操作：sudo warden status | doctor | logs | backup | restore | update"
+  say "国内机设置请在目标机执行：bash bootstrap.sh cn-setup"
 }
 
 cmd_update() {
@@ -1579,12 +1514,15 @@ cmd_update() {
   title "Warden Gateway 升级"
   if [ -z "$PUBLIC_URL" ]; then PUBLIC_URL="$(config_public_url)"; fi
   if [ "$MODE" = "docker" ]; then
+    install_scripts
+    install_cli
     pull_docker_image
     run_docker_container
   else
     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
     install_binary
     install_scripts
+    install_cli
     install_unit
     install_logrotate
     systemctl daemon-reload
@@ -1602,7 +1540,7 @@ cmd_uninstall() {
     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
     systemctl disable "$SERVICE" >/dev/null 2>&1 || true
     docker rm -f "$SERVICE" >/dev/null 2>&1 || true
-    rm -f "$UNIT_PATH" "$LOGROTATE_PATH" "$BIN_PATH"
+    rm -f "$UNIT_PATH" "$LOGROTATE_PATH" "$BIN_PATH" "$CLI_PATH"
     systemctl daemon-reload
   fi
   if [ "$PURGE" -eq 1 ]; then
@@ -1650,6 +1588,29 @@ cmd_restore() {
 }
 
 
+cmd_logs() {
+  title "最近日志"
+  detect_installed_mode
+  if [ "$MODE" = "docker" ]; then
+    docker logs --tail 100 "$SERVICE" 2>&1 || true
+  elif have journalctl; then
+    journalctl -u "$SERVICE" -n 100 --no-pager || true
+  elif [ -f "$DATA_DIR/gateway.log" ]; then
+    tail -n 100 "$DATA_DIR/gateway.log"
+  else
+    warn "未找到日志来源"
+  fi
+}
+
+cmd_version() {
+  title "版本"
+  if [ -x "$BIN_PATH" ]; then "$BIN_PATH" version || true
+  elif installed_docker; then docker exec "$SERVICE" /usr/local/bin/warden-gateway version || true
+  fi
+  if [ -f "$SCRIPT_DIR/VERSION" ]; then kv "脚本版本" "$(cat "$SCRIPT_DIR/VERSION")"; fi
+  if [ -f "$CONFIG_FILE" ]; then kv "配置文件" "$CONFIG_FILE"; fi
+}
+
 cmd_self_test() {
   title "自检"
   detect_installed_mode
@@ -1668,6 +1629,8 @@ main() {
     update) cmd_update;;
     uninstall) cmd_uninstall;;
     status) cmd_status;;
+    logs) cmd_logs;;
+    version) cmd_version;;
     backup) cmd_backup;;
     restore) cmd_restore;;
     doctor) cmd_doctor;;

@@ -97,11 +97,18 @@ func New(opts Options) (*App, error) {
 		return nil, err
 	}
 	backups := backup.New(cfg.Backup.Dir, opts.Paths.ConfigPath, opts.Paths.DataDir, opts.Paths.ServicePath, cfg.Backup.Retain)
+	var dnsProxy *dnsproxy.Proxy
+	if cfg.DNS.Enabled {
+		dnsProxy, err = dnsproxy.New(cfg.DNS, stats, logger)
+		if err != nil {
+			return nil, err
+		}
+	}
 	panelSrv, err := panel.New(panel.Options{
 		Config: cfg, ConfigPath: opts.Paths.ConfigPath, DataDir: opts.Paths.DataDir,
 		ScriptDir:   opts.Paths.ScriptDir,
 		ServiceName: "warden-gateway.service", Auth: authMgr, Backups: backups,
-		Stats: stats, Log: logger, Started: time.Now(),
+		Stats: stats, Log: logger, Started: time.Now(), DNS: dnsProxy,
 	})
 	if err != nil {
 		return nil, err
@@ -121,13 +128,7 @@ func New(opts Options) (*App, error) {
 	if cfg.GitHub.Enabled {
 		a.github = githubproxy.New(cfg.GitHub, stats, logger)
 	}
-	if cfg.DNS.Enabled {
-		dns, err := dnsproxy.New(cfg.DNS, stats, logger)
-		if err != nil {
-			return nil, err
-		}
-		a.dns = dns
-	}
+	a.dns = dnsProxy
 	if cfg.SNI.Enabled {
 		a.sni = gateway.NewSNIProxy(cfg.SNI, cfg.Listen.Entry, cfg.Listen.HTTPS, stats, logger)
 	}
@@ -237,7 +238,9 @@ func (a *App) Start(ctx context.Context) error {
 
 	if a.dns != nil {
 		if err := a.dns.Serve(); err != nil {
-			return fmt.Errorf("dns: %w", err)
+			// A busy DNS port must never take the panel, the ACME listener or the
+			// proxies down: log it and keep the rest of the gateway running.
+			a.log.Errorf("dns unavailable, split DNS disabled until restart: %v", err)
 		}
 	}
 	if a.sni != nil {

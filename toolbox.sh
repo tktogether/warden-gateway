@@ -132,11 +132,11 @@ Warden Gateway Toolbox
   sudo bash toolbox.sh install [选项]            一键安装 Warden Gateway（统一入口、面板、GitHub 与 Docker 代理）
   sudo bash toolbox.sh update [选项]             更新 Warden Gateway
   sudo bash toolbox.sh status                    查看 Warden Gateway 状态
+  sudo bash toolbox.sh logs                      查看最近日志
+  sudo bash toolbox.sh version                   查看版本
   sudo bash toolbox.sh backup                    立即创建备份
   sudo bash toolbox.sh restore [--id latest|ID]  恢复备份
-  sudo bash toolbox.sh doctor                    一键诊断（项目自身与国内机配置）
-  sudo bash toolbox.sh cn-setup                  对当前机器应用国内机设置
-  sudo bash toolbox.sh cn-restore [--id latest]  恢复国内机设置
+  sudo bash toolbox.sh doctor                    一键诊断（仅网关自身）
   sudo bash toolbox.sh uninstall [选项]          卸载 Warden Gateway
   sudo bash toolbox.sh common [工具] [参数]      常用工具
   sudo bash toolbox.sh bbr [操作]                BBR 配置与测试

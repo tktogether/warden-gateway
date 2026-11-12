@@ -152,7 +152,7 @@
     if (view === 'overview') { loadOverview(); }
     if (view === 'metrics') { loadMetrics(); }
     if (view === 'proxies') { loadProxies(); }
-    if (view === 'effect') { loadEffect(false); }
+    if (view === 'effect') { loadEffect(); }
     if (view === 'diagnostics') { loadDiagnostics(); }
     if (view === 'backups') { loadBackups(); }
     if (view === 'audit') { loadAudit(); }
@@ -507,7 +507,7 @@
     var hit = Number(counters.dns_hit) || 0;
     var miss = Number(counters.dns_miss) || 0;
     var dnsBox = el('div', 'panel');
-    add(dnsBox, el('h3', 'section-title', 'DNS 分流效果'));
+    add(dnsBox, el('h3', 'section-title', 'DNS 分流命中'));
     if (hit + miss > 0) {
       add(dnsBox, el('p', 'muted', '命中分流的查询由网关直接应答，其余查询转发上游。'));
       dnsBox.appendChild(infoList([
@@ -783,20 +783,21 @@
     }
   }
 
-  async function loadEffect(run) {
+  async function loadEffect() {
     var box = qs('#effect-content');
     if (!box) { return; }
-    pageNote('#effect-note', run ? '正在对比直连与代理链路…' : '直连上游与经代理转发的耗时对比');
-    if (!run && state.effect) { renderEffect(state.effect); return; }
-    if (run) { clear(box); box.appendChild(el('div', 'skeleton')); }
+    pageNote('#effect-note', '加载中…');
+    clear(box);
+    box.appendChild(el('div', 'skeleton'));
     try {
-      var data = await api('/api/effect', { method: 'POST', body: {} });
+      var data = await api('/api/effect');
       state.effect = data;
       renderEffect(data);
-      pageNote('#effect-note', '更新于 ' + fmtTime(data.as_of));
+      pageNote('#effect-note', '最近 ' + data.window_minutes + ' 分钟 · 更新于 ' + fmtTime(data.as_of));
     } catch (err) {
       clear(box);
       box.appendChild(el('div', 'empty', err.message));
+      pageNote('#effect-note', '加载失败');
       showToast(err.message, true);
     }
   }
@@ -804,39 +805,63 @@
   function renderEffect(data) {
     var box = qs('#effect-content');
     clear(box);
-    var rows = data.rows || [];
-    var okRows = rows.filter(function (r) { return r.ok; });
-    var faster = okRows.filter(function (r) { return Number(r.delta_ms) < 0; }).length;
+    var totals = data.totals || {};
+    var overhead = data.overhead || {};
+    var dns = data.dns || {};
+    var channels = data.channels || [];
+    var requests = Number(totals.requests) || 0;
+    var success = Number(totals.success_rate) || 0;
+    var latency = Number(totals.avg_latency_ms) || 0;
+    var upstream = Number(overhead.avg_upstream_ms) || 0;
+    var gateway = Number(overhead.gateway_ms) || 0;
+    var bytes = (Number(totals.bytes_in) || 0) + (Number(totals.bytes_out) || 0);
 
     var stats = el('div', 'stat-grid');
-    stats.appendChild(statCard('对比通道', String(rows.length), '每项同时测直连与代理', ''));
-    stats.appendChild(statCard('代理更快', faster + ' / ' + okRows.length, faster ? '代理链路耗时低于直连' : '代理链路耗时高于直连', ''));
-    var best = null;
-    okRows.forEach(function (r) { if (!best || Number(r.delta_ms) < Number(best.delta_ms)) { best = r; } });
-    stats.appendChild(statCard('差值最大收益', best ? (best.label + ' ' + Number(best.delta_ms) + ' ms') : '—', best ? '负值表示经代理更快' : '缺少可用数据', ''));
-    stats.appendChild(statCard('测量口径', '响应头耗时', '直连为网关主机直连上游', ''));
+    stats.appendChild(statCard('请求总数', String(requests), '最近 ' + (data.window_minutes || 60) + ' 分钟 · 并发 ' + (totals.in_flight || 0), '', undefined));
+    stats.appendChild(statCard('成功率', pct(success), (totals.failures || 0) + ' 次失败', success < 95 ? 'warn' : '', success));
+    stats.appendChild(statCard('平均耗时', latency ? latency + ' ms' : '—', 'P90 ' + (totals.p90_ms || 0) + ' ms · 最大 ' + (totals.max_latency_ms || 0) + ' ms', '', undefined));
+    stats.appendChild(statCard('承载流量', fmtBytes(bytes), '入 ' + fmtRate(totals.in_per_sec) + ' · 出 ' + fmtRate(totals.out_per_sec), '', undefined));
     box.appendChild(stats);
+
+    var stats2 = el('div', 'stat-grid');
+    stats2.appendChild(statCard('上游等待', upstream ? upstream + ' ms' : '—', '上游样本 ' + (overhead.upstream_samples || 0), '', undefined));
+    stats2.appendChild(statCard('网关转发', gateway ? gateway + ' ms' : '—', '总耗时减去上游等待', '', undefined));
+    stats2.appendChild(statCard('DNS 命中率', dns.total ? pct(Number(dns.hit_rate) || 0) : '—', '命中 ' + (dns.hit || 0) + ' · 转发 ' + (dns.miss || 0), '', dns.total ? Number(dns.hit_rate) : undefined));
+    stats2.appendChild(statCard('延迟样本', String(totals.latency_samples || 0), '已完成请求的耗时样本', '', undefined));
+    box.appendChild(stats2);
 
     if (data.explain) { add(box, el('p', 'muted', data.explain)); }
 
-    var tableRows = rows.map(function (r) {
-      var delta = '—';
-      var verdict = r.ok ? '可对比' : '不可对比';
-      if (r.ok) {
-        var d = Number(r.delta_ms) || 0;
-        delta = (d > 0 ? '+' : '') + d + ' ms';
-        verdict = d < 0 ? '经代理更快' : d > 0 ? '直连更快' : '持平';
-      }
+    var grid = el('div', 'chart-grid');
+    grid.appendChild(chartCard('请求趋势', '每分钟请求与失败', 'chart-effect-req', [{ label: '请求', color: '#52d3c5' }, { label: '失败', color: '#f472b6' }]));
+    grid.appendChild(chartCard('流量趋势', '每分钟入站与出站字节', 'chart-effect-bytes', [{ label: '入站', color: '#7cc4ff' }, { label: '出站', color: '#fbbf24' }]));
+    box.appendChild(grid);
+
+    var rows = channels.map(function (c) {
       return [
-        r.label || r.name,
-        r.direct_ms ? r.direct_ms + ' ms' : (r.direct_error || '—'),
-        r.proxied_ms ? r.proxied_ms + ' ms' : (r.proxied_error || '—'),
-        delta,
-        verdict,
-        r.detail || ''
+        c.label || c.name, String(c.requests || 0), pct(Number(c.success_rate) || 0),
+        (c.avg_latency_ms || 0) + ' ms', (c.p90_ms || 0) + ' ms',
+        (c.upstream_ms || 0) + ' ms', (c.gateway_ms || 0) + ' ms',
+        fmtBytes(c.bytes_in), fmtBytes(c.bytes_out),
+        fmtRate(c.in_per_sec) + ' / ' + fmtRate(c.out_per_sec)
       ];
     });
-    box.appendChild(tablePanel('直连与代理对比', ['通道', '直连', '经代理', '差值', '结论', '说明'], tableRows));
+    box.appendChild(tablePanel('通道承载', ['通道', '请求', '成功率', '平均耗时', 'P90', '上游等待', '网关转发', '入站', '出站', '速率（入/出）'], rows));
+
+    var targetRows = [];
+    channels.forEach(function (c) {
+      (c.targets || []).forEach(function (t) {
+        targetRows.push([c.label || c.name, t.target || '', String(t.requests || 0), String(t.failures || 0), fmtBytes(t.bytes), t.last_at ? fmtTime(t.last_at) : '—']);
+      });
+    });
+    targetRows.sort(function (a, b) { return Number(b[2]) - Number(a[2]); });
+    if (targetRows.length) {
+      box.appendChild(tablePanel('热门目标', ['通道', '目标', '请求', '失败', '字节', '最近'], targetRows.slice(0, 20)));
+    }
+
+    var series = data.series || [];
+    drawSeries('chart-effect-req', series, [function (p) { return p.requests; }, function (p) { return p.failures; }], ['#52d3c5', '#f472b6']);
+    drawSeries('chart-effect-bytes', series, [function (p) { return p.bytes_in; }, function (p) { return p.bytes_out; }], ['#7cc4ff', '#fbbf24']);
   }
 
   function tablePanel(title, headers, rows) {
@@ -871,10 +896,11 @@
     box.appendChild(el('div', 'skeleton'));
     try {
       var results = await Promise.all([api('/api/diagnostics'), api('/api/cn')]);
-      state.diagnostics = results[0];
+      var report = results[0];
+      state.diagnostics = report;
       state.cn = results[1];
-      renderDiagnostics(results[0], results[1]);
-      pageNote('#diagnostics-note', '检查于 ' + fmtTime(results[0].as_of));
+      renderDiagnostics(report, results[1]);
+      pageNote('#diagnostics-note', '检查于 ' + fmtTime(report.as_of));
     } catch (err) {
       clear(box);
       box.appendChild(el('div', 'empty', err.message));
@@ -887,16 +913,13 @@
     var box = qs('#diagnostics-content');
     clear(box);
     var warns = 0;
-    [report.project, report.cn].forEach(function (section) {
-      ((section && section.items) || []).forEach(function (item) { if (item.status === 'warn') { warns++; } });
-    });
+    ((report.project && report.project.items) || []).forEach(function (item) { if (item.status === 'warn') { warns++; } });
     var level = report.ok ? (warns > 0 ? 'warn' : 'good') : 'bad';
     var banner = el('div', 'alert ' + level);
     add(banner, el('span', '', report.ok ? (warns > 0 ? '检查完成，有 ' + warns + ' 项需要注意' : '全部检查通过') : '存在异常项，请按提示处理'));
-    add(banner, el('span', '', '项目自身与国内机配置分别列出'));
+    add(banner, el('span', '', '仅检查网关自身的配置、监听与证书'));
     box.appendChild(banner);
     box.appendChild(diagSection(report.project));
-    box.appendChild(diagSection(report.cn));
     if (cn) { box.appendChild(cnCommandPanel(cn)); }
   }
 
@@ -934,16 +957,20 @@
 
   function cnCommandPanel(cn) {
     var p = el('div', 'panel');
-    add(p, el('h3', '', '国内机一键设置'));
-    add(p, el('p', 'muted', '在其他服务器上执行命令，自动配置 hosts、Docker 镜像与 Git 镜像。修改前自动备份，可用恢复命令还原。'));
-    p.appendChild(commandRow('安装脚本', cn.command || ''));
-    p.appendChild(commandRow('工具箱', cn.toolbox_command || ''));
+    add(p, el('h3', '', '给国内机使用的命令'));
+    add(p, el('p', 'muted', '这些命令由其他服务器（国内机）执行，网关本身不执行国内机设置。命令会写入 hosts 或 DNS、配置 Docker 与 Git 镜像，修改前自动备份。'));
+    var commands = cn.commands || {};
+    p.appendChild(commandRow('hosts 分流', commands.hosts || cn.command || ''));
+    p.appendChild(commandRow('DNS 分流', commands.dns || ''));
+    p.appendChild(commandRow('hosts + DNS', commands.both || ''));
     p.appendChild(commandRow('恢复命令', cn.restore_command || ''));
+    var dns = cn.dns || {};
     add(p, infoList([
       ['网关地址', cn.gateway_ip || '—'],
       ['面板域名', cn.panel_host || '—'],
-      ['备份目录', cn.backup_root || '—'],
-      ['最新备份', cn.latest_backup || '—']
+      ['网关 DNS 服务', dns.running ? ('运行中 · ' + (dns.active_listen || dns.listen || '')) : (dns.enabled ? '已启用但未监听' : '未启用')],
+      ['DNS 分流可用', cn.dns_ready ? '是' : '否（需要 53 端口）'],
+      ['分流域名', ((cn.domains || []).join(', ') || '—')]
     ]));
     return p;
   }
@@ -987,52 +1014,6 @@
     try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
     document.body.removeChild(ta);
     if (ok) { done(); } else { showToast('复制失败，请手动选择文本', true); }
-  }
-
-  async function applyCN(btn, mode) {
-    var cn = state.cn;
-    if (!cn) { showToast('无法读取国内机设置信息', true); return; }
-    mode = mode || 'hosts';
-    var yes = await confirmDialog('在本机应用国内机设置', '将以「' + cnModeLabel(mode) + '」修改本机 DNS 分流、Docker 镜像、Git 镜像、APT 源与 BBR 配置，修改前自动备份。确认继续？');
-    if (!yes) { return; }
-    setBusy(btn, true);
-    try {
-      var report = await api('/api/cn/apply', { method: 'POST', body: {
-        gateway_ip: cn.gateway_ip || '',
-        apt_mirror: 'https://mirrors.aliyun.com',
-        docker_mirror: cn.origin || '',
-        git_mirror: cn.origin || '',
-        domains: cn.domains || [],
-        mode: mode,
-        hosts: mode === 'hosts' || mode === 'both',
-        dns: mode === 'dns' || mode === 'both',
-        apt: true, bbr: true, docker: true, git: true, apt_update: false
-      } });
-      var failed = (report.steps || []).filter(function (st) { return st.ok === false; });
-      showToast(failed.length ? ('已应用，' + failed.length + ' 项失败') : '已应用国内机设置', failed.length > 0);
-      await loadSettings();
-    } catch (err) {
-      showToast(err.message, true);
-    } finally {
-      setBusy(btn, false);
-    }
-  }
-
-  async function restoreCN(btn) {
-    var cn = state.cn;
-    if (!cn || !cn.latest_backup) { showToast('没有可用的国内机设置备份', true); return; }
-    var yes = await confirmDialog('恢复国内机设置', '将从备份 ' + cn.latest_backup + ' 恢复 hosts、Docker、Git、APT 与 BBR 配置。确认继续？');
-    if (!yes) { return; }
-    setBusy(btn, true);
-    try {
-      await api('/api/cn/restore', { method: 'POST', body: { id: cn.latest_backup } });
-      showToast('已恢复 ' + cn.latest_backup);
-      await loadSettings();
-    } catch (err) {
-      showToast(err.message, true);
-    } finally {
-      setBusy(btn, false);
-    }
   }
 
   async function loadBackups() {
@@ -1160,12 +1141,6 @@
 
   var cnModes = ['hosts', 'dns', 'both'];
 
-  function cnModeLabel(mode) {
-    if (mode === 'dns') { return 'DNS 分流'; }
-    if (mode === 'both') { return 'hosts + DNS 分流'; }
-    return 'hosts 分流';
-  }
-
   function cnModeHint(mode) {
     if (mode === 'dns') {
       return '目标机把 /etc/resolv.conf 或 systemd-resolved 指向网关，需要目标机能访问网关 53 端口（UDP/TCP）。';
@@ -1192,13 +1167,8 @@
 
   function cnSettingsBody() {
     var wrap = el('div', 'stack');
-    var cn = state.cn;
-    if (!cn) {
-      add(wrap, el('div', 'empty', '正在读取国内机设置信息…'));
-      return wrap;
-    }
-    var current = cn.local_mode || 'none';
-    var mode = cnModes.indexOf(current) >= 0 ? current : (cn.cn_mode || 'hosts');
+    var cn = state.cn || {};
+    var mode = cnModes.indexOf(cn.cn_mode) >= 0 ? cn.cn_mode : 'hosts';
     var form = el('form', 'form-grid');
     var picker = selectField('分发方式', [
       { value: 'hosts', label: 'hosts 分流（修改 hosts）' },
@@ -1212,12 +1182,8 @@
     var commandBox = el('div', 'stack');
     function renderCommands() {
       clear(commandBox);
-      var commands = cn.commands || null;
-      var toolboxCommands = cn.toolbox_commands || null;
-      var script = commands && commands[mode] ? commands[mode] : (cn.command || '');
-      var toolbox = toolboxCommands && toolboxCommands[mode] ? toolboxCommands[mode] : (cn.toolbox_command || '');
-      commandBox.appendChild(commandRow('安装脚本命令', script));
-      commandBox.appendChild(commandRow('工具箱命令', toolbox));
+      var commands = cn.commands || {};
+      commandBox.appendChild(commandRow('在国内机上执行', commands[mode] || cn.command || ''));
       commandBox.appendChild(commandRow('恢复命令', cn.restore_command || ''));
     }
     renderCommands();
@@ -1231,51 +1197,51 @@
     wrap.appendChild(infoList([
       ['网关地址', cn.gateway_ip || '—'],
       ['面板域名', cn.panel_host || '—'],
-      ['本机分流状态', current === 'none' ? '未配置' : cnModeLabel(current)],
-      ['网关 DNS 服务', dns.enabled ? ('已启用 ' + (dns.listen || '')) : '未启用'],
-      ['分流域名', ((cn.domains || []).join(', ') || '—')],
-      ['备份目录', cn.backup_root || '—'],
-      ['最新备份', cn.latest_backup || '—']
+      ['网关 DNS 服务', dns.running ? ('运行中 · ' + (dns.active_listen || dns.listen || '')) : (dns.enabled ? '已启用但未监听' : '未启用')],
+      ['DNS 分流可用', cn.dns_ready ? '是' : '否（需要 53 端口）'],
+      ['分流域名', ((cn.domains || []).join(', ') || '—')]
     ]));
-    var actions = el('div', 'form-actions');
-    var apply = el('button', 'btn primary', '在本机应用设置');
-    apply.type = 'button';
-    apply.addEventListener('click', function () { applyCN(apply, mode); });
-    actions.appendChild(apply);
-    var restore = el('button', 'btn', '恢复最近备份');
-    restore.type = 'button';
-    restore.addEventListener('click', function () { restoreCN(restore); });
-    actions.appendChild(restore);
-    wrap.appendChild(actions);
     return wrap;
   }
 
   function dnsPanel() {
     var cn = state.cn || {};
     var dns = cn.dns || {};
+    var running = !!dns.running;
+    var enabled = !!dns.enabled;
+    var activePort = dns.active_port || '';
     var panel = el('div', 'panel');
     add(panel, el('h3', '', '网关 DNS 分流服务'));
-    add(panel, el('p', 'muted', '启用后网关在 53 端口应答分流域名的 A 记录，其余查询转发上游。目标机选择 DNS 分流时需要启用；修改后网关自动重启。'));
-    panel.appendChild(infoList([
-      ['状态', dns.enabled ? '已启用' : '未启用'],
-      ['监听', dns.listen || '0.0.0.0:53'],
+    add(panel, el('p', 'muted', '启用后优先监听 53 端口应答分流域名并转发其余查询；53 被占用时自动回退到其他端口，不会影响面板与其他代理。修改后网关自动重启。'));
+    var items = [
+      ['状态', running ? '运行中' : (enabled ? '已启用但未监听' : '未启用')],
+      ['配置监听', dns.listen || '0.0.0.0:53'],
+      ['实际监听', dns.active_listen || '—'],
       ['返回地址', dns.gateway_ip || cn.gateway_ip || '—'],
       ['上游', dns.upstream || '1.1.1.1:53'],
-      ['域名数', String((dns.domains || cn.domains || []).length)]
-    ]));
+      ['分流域名', String((dns.domains || cn.domains || []).length) + ' 个']
+    ];
+    if (dns.error) { items.push(['错误', dns.error]); }
+    panel.appendChild(infoList(items));
+    if (running && activePort && activePort !== '53') {
+      var warnBox = el('div', 'alert warn');
+      add(warnBox, el('span', '', '53 端口被占用，已回退到 ' + activePort + '。'));
+      add(warnBox, el('span', '', '国内机 resolver 无法指定端口，DNS 分流此时不可用；建议关闭 systemd-resolved 的 53 监听后重新启用。'));
+      panel.appendChild(warnBox);
+    }
     var actions = el('div', 'form-actions');
-    var toggle = el('button', 'btn', dns.enabled ? '停用 DNS 服务' : '启用 DNS 服务');
+    var toggle = el('button', 'btn', enabled ? '停用 DNS 服务' : '启用 DNS 服务');
     toggle.type = 'button';
     toggle.addEventListener('click', async function () {
-      var next = !dns.enabled;
+      var next = !enabled;
       var yes = await confirmDialog(next ? '启用网关 DNS 服务' : '停用网关 DNS 服务', next
-        ? '将在 ' + (dns.listen || '0.0.0.0:53') + ' 应答分流域名并把其余查询转发上游，网关服务会自动重启。确认继续？'
+        ? '将自动选择可用的监听地址（优先 53 端口），应答分流域名并把其余查询转发上游，网关服务会自动重启。确认继续？'
         : '停用后使用 DNS 分流的机器将无法解析分流域名，网关服务会自动重启。确认继续？');
       if (!yes) { return; }
       setBusy(toggle, true);
       try {
-        await api('/api/dns/config', { method: 'POST', body: { enabled: next } });
-        showToast(next ? 'DNS 服务已启用，网关正在重启' : 'DNS 服务已停用，网关正在重启');
+        var out = await api('/api/dns/config', { method: 'POST', body: { enabled: next } });
+        showToast(out.note || (next ? 'DNS 服务已启用，网关正在重启' : 'DNS 服务已停用，网关正在重启'), !!out.note);
         setTimeout(function () { window.location.reload(); }, 3500);
       } catch (err) {
         showToast(err.message, true);
@@ -1360,8 +1326,8 @@
     grid.appendChild(certPanel);
 
     var cnPanel = el('div', 'panel span-2');
-    add(cnPanel, el('h3', '', '国内机一键设置'));
-    add(cnPanel, el('p', 'muted', '把本机作为代理机时，其他国内服务器可用下面的命令配置 hosts 或 DNS 分流、Docker 镜像与 Git 镜像；修改前自动备份，可随时恢复。'));
+    add(cnPanel, el('h3', '', '国内机设置命令'));
+    add(cnPanel, el('p', 'muted', '网关本身不执行国内机设置。选择分发方式后，把生成的命令复制到需要走网关的服务器上执行；命令会配置 hosts 或 DNS、Docker 与 Git 镜像，修改前自动备份。'));
     cnPanel.appendChild(cnSettingsBody());
     grid.appendChild(cnPanel);
 
@@ -1438,7 +1404,7 @@
     });
     qs('#refresh-overview').addEventListener('click', loadOverview);
     qs('#refresh-proxies').addEventListener('click', loadProxies);
-    qs('#run-effect').addEventListener('click', function () { loadEffect(true); });
+    qs('#refresh-effect').addEventListener('click', loadEffect);
     qs('#refresh-diagnostics').addEventListener('click', loadDiagnostics);
     qs('#create-backup').addEventListener('click', function () { createBackup(this); });
     qs('#metrics-range').addEventListener('click', function (ev) {

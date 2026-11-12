@@ -135,6 +135,7 @@ func Default() Config {
 		DNS: DNSConfig{
 			Enabled:  false,
 			Listen:   "0.0.0.0:53",
+			Domains:  DefaultSplitDomains(),
 			Upstream: "1.1.1.1:53",
 		},
 		Backup: BackupConfig{
@@ -159,6 +160,23 @@ func DefaultGitHubHosts() []string {
 		"release-assets.githubusercontent.com",
 		"*.github.com",
 		"*.githubusercontent.com",
+	}
+}
+
+// DefaultSplitDomains lists the hosts and DNS names that the CN split routes
+// through the gateway.
+func DefaultSplitDomains() []string {
+	return []string{
+		"github.com",
+		"api.github.com",
+		"codeload.github.com",
+		"raw.githubusercontent.com",
+		"objects.githubusercontent.com",
+		"gist.githubusercontent.com",
+		"ghcr.io",
+		"registry-1.docker.io",
+		"auth.docker.io",
+		"production.cloudfront.docker.com",
 	}
 }
 

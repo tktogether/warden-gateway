@@ -240,15 +240,40 @@ func TestProxiesExposeLatencyAndRates(t *testing.T) {
 	}
 }
 
-func TestEffectRejectsGet(t *testing.T) {
+func TestEffectReturnsSingleNodeMetrics(t *testing.T) {
 	srv, key := newPanel(t)
-	cookie, _ := login(t, srv, key)
-	if rec := do(t, srv, "GET", "/warden/api/effect", nil, cookie, ""); rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("GET /api/effect status %d", rec.Code)
+	cookie, csrf := login(t, srv, key)
+	if rec := do(t, srv, "POST", "/warden/api/effect", []byte("{}"), cookie, csrf); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /api/effect status %d", rec.Code)
+	}
+	rec := do(t, srv, "GET", "/warden/api/effect?minutes=5", nil, cookie, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/effect status %d: %s", rec.Code, rec.Body)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"as_of", "window_minutes", "totals", "overhead", "dns", "channels", "series"} {
+		if _, ok := payload[field]; !ok {
+			t.Fatalf("effect payload missing %q", field)
+		}
+	}
+	var channels []map[string]json.RawMessage
+	if err := json.Unmarshal(payload["channels"], &channels); err != nil {
+		t.Fatal(err)
+	}
+	if len(channels) != 4 {
+		t.Fatalf("effect channels %d, want 4", len(channels))
+	}
+	for _, field := range []string{"name", "requests", "success_rate", "avg_latency_ms", "gateway_ms", "upstream_ms", "in_per_sec", "targets"} {
+		if _, ok := channels[0][field]; !ok {
+			t.Fatalf("effect channel missing %q", field)
+		}
 	}
 }
 
-func TestDNSEndpointsExposeMode(t *testing.T) {
+func TestDNSEndpointsExposeStatus(t *testing.T) {
 	srv, key := newPanel(t)
 	cookie, _ := login(t, srv, key)
 	rec := do(t, srv, "GET", "/warden/api/dns", nil, cookie, "")
@@ -259,9 +284,58 @@ func TestDNSEndpointsExposeMode(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"as_of", "dns", "domains", "suggested_gateway_ip", "local_resolver_mode"} {
-		if _, ok := payload[key]; !ok {
-			t.Fatalf("dns payload missing %q", key)
+	for _, field := range []string{"as_of", "dns", "domains", "suggested_gateway_ip"} {
+		if _, ok := payload[field]; !ok {
+			t.Fatalf("dns payload missing %q", field)
+		}
+	}
+	if _, ok := payload["local_resolver_mode"]; ok {
+		t.Fatal("dns payload should not expose local_resolver_mode")
+	}
+	var dns map[string]json.RawMessage
+	if err := json.Unmarshal(payload["dns"], &dns); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"enabled", "listen", "gateway_ip", "domains", "running", "active_listen", "fallback", "port53"} {
+		if _, ok := dns[field]; !ok {
+			t.Fatalf("dns status missing %q", field)
+		}
+	}
+}
+
+func TestCNEndpointExposesCommandsOnly(t *testing.T) {
+	srv, key := newPanel(t)
+	cookie, _ := login(t, srv, key)
+	rec := do(t, srv, "GET", "/warden/api/cn", nil, cookie, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cn status %d: %s", rec.Code, rec.Body)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"as_of", "gateway_ip", "domains", "script_url", "command", "commands", "restore_command", "cn_mode", "dns", "dns_ready"} {
+		if _, ok := payload[field]; !ok {
+			t.Fatalf("cn payload missing %q", field)
+		}
+	}
+	for _, field := range []string{"local_mode", "resolver_mode", "backup_root", "status"} {
+		if _, ok := payload[field]; ok {
+			t.Fatalf("cn payload should not expose %q", field)
+		}
+	}
+	var commands map[string]string
+	if err := json.Unmarshal(payload["commands"], &commands); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"hosts", "dns", "both"} {
+		if commands[mode] == "" {
+			t.Fatalf("cn commands missing mode %q", mode)
+		}
+	}
+	for _, path := range []string{"/api/cn/apply", "/api/cn/restore"} {
+		if rec := do(t, srv, "POST", "/warden"+path, []byte("{}"), cookie, "x"); rec.Code != http.StatusNotFound {
+			t.Fatalf("%s status %d, want 404", path, rec.Code)
 		}
 	}
 }

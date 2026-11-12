@@ -20,14 +20,14 @@
 | GET | `/api/metrics?range=1h\|6h\|24h` | 主机指标序列与代理流量序列，见下 |
 | GET | `/api/proxies` | 代理统计，含速率、延迟分布、状态码、热点目标与近六十分钟序列 |
 | POST | `/api/proxies/test` | 测试代理，body `{"name":"docker\|github\|panel\|sni\|dns"}` |
-| POST | `/api/effect` | 直连上游与经代理转发的耗时对比 |
+| GET | `/api/effect?minutes=60` | 最近承载统计：总量、上游等待、DNS 命中与四通道明细 |
 | GET | `/api/services` | 服务列表 |
 | POST | `/api/services/{id}/action` | 服务操作，body `{"action":"start\|stop\|restart"}` |
 | GET | `/api/cert` | 证书状态 |
 | POST | `/api/cert/renew` | 触发证书续期检查 |
 | GET | `/api/config` | 配置和设置 |
 | GET | `/api/audit?limit=100&q=` | 审计记录 |
-| GET | `/api/diagnostics` | 一键诊断：项目自身与国内机配置 |
+| GET | `/api/diagnostics` | 一键诊断（仅网关自身） |
 
 ### /api/metrics
 
@@ -68,57 +68,42 @@
 
 ### /api/effect
 
-POST 请求，四路并发测量同一上游的直连耗时与经代理耗时：
+GET 请求，返回最近 `minutes`（5 到 60，默认 60）的承载统计。数据来自真实请求，不主动探测上游：
 
 | 字段 | 说明 |
 | --- | --- |
-| `rows[].name` | `docker`、`github`、`dns`、`sni` |
-| `rows[].direct_ms`、`proxied_ms` | 直连与经代理耗时，单位毫秒 |
-| `rows[].delta_ms` | `proxied_ms - direct_ms`，正值表示代理更慢 |
-| `rows[].direct_error`、`proxied_error` | 失败原因，成功时为空 |
-| `rows[].ok` | 两侧均成功时为 true |
-| `explain` | 测量口径说明 |
+| `window_minutes` | 统计窗口，单位分钟 |
+| `totals` | 请求数、失败数、成功率、进行中请求、出入字节、出入速率、平均/P90/最大耗时、延迟样本数 |
+| `overhead` | 平均总耗时、上游等待、网关转发耗时（总耗时减上游等待）、上游样本数与占比 |
+| `dns` | `dns_hit`、`dns_miss`、命中率与总查询数 |
+| `channels[]` | 四个通道：`name`、`label`、`path`、`enabled`、请求与失败、`success_rate`、`avg_latency_ms`、`p90_ms`、`max_latency_ms`、`upstream_ms`、`gateway_ms`、`in_flight`、`bytes_in`、`bytes_out`、`in_per_sec`、`out_per_sec`、`requests_per_min`、`status_classes`、`targets` |
+| `series[]` | 每分钟的请求、失败、入站与出站序列 |
+| `explain` | 统计口径说明 |
 
-HTTP 通道测到响应头为止；DNS 通道测单次解析；SNI 通道测 TLS 握手。
+4xx 不计为失败；失败指 5xx、无状态码或传输错误。
 
 ### /api/dns
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/dns` | DNS 分流状态、域名列表、建议网关地址与本机分流方式 |
-| POST | `/api/dns/config` | 启用或停用网关 DNS 服务，body `{"enabled":true}`，可带 `gateway_ip`、`listen`、`upstream`、`domains`；保存后服务自动重启 |
+| GET | `/api/dns` | DNS 分流配置、运行状态、域名列表与建议网关地址 |
+| POST | `/api/dns/config` | 启用或停用网关 DNS 服务，body 至少 `{"enabled":true}`，可带 `gateway_ip`、`listen`、`upstream`、`domains`；保存后服务自动重启 |
+
+`dns` 对象字段：`enabled`、`listen`（配置值）、`gateway_ip`、`domains`、`upstream`、`running`、`active_listen`、`active_port`、`fallback`、`port53`、`error`。
+
+启用时自动选择监听地址：优先配置值（默认 `0.0.0.0:53`），被占用时依次尝试 `5353`、`5300`、`9053`，成功后退回响应 `note` 说明原因，并把实际地址写入配置。没有可用地址时返回 400。
 
 ## 国内机设置
 
+`/api/cn` 只生成给国内机使用的命令，网关本身不执行国内机设置。
+
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/cn` | 国内机设置状态、命令与备份列表 |
-| POST | `/api/cn/apply` | 在本机应用国内机设置，body 见下 |
-| POST | `/api/cn/restore` | 恢复国内机设置，body `{"id":"latest"}` |
+| GET | `/api/cn` | 返回分流命令（hosts/dns/both）、恢复命令、网关地址、分流域名与 DNS 服务状态 |
 
-`/api/cn/apply` 的 body：
+响应字段：`as_of`、`origin`、`gateway_ip`、`panel_host`、`domains`、`script_url`、`command`、`commands`（`hosts`、`dns`、`both`）、`restore_command`、`cn_mode`、`dns`、`dns_ready`。
 
-```json
-{
-  "gateway_ip": "192.0.2.10",
-  "apt_mirror": "https://mirrors.aliyun.com",
-  "docker_mirror": "https://panel.example.com",
-  "git_mirror": "https://panel.example.com",
-  "domains": ["github.com", "registry-1.docker.io"],
-  "mode": "hosts",
-  "hosts": true,
-  "dns": false,
-  "apt": true,
-  "bbr": true,
-  "docker": true,
-  "git": true,
-  "apt_update": false
-}
-```
-
-`mode` 取 `hosts`、`dns`、`both` 或 `none`，一旦指定就覆盖 `hosts` 与 `dns` 两个布尔值；留空时按布尔值执行。`steps` 中 `detail` 可能缺省。
-
-返回 `{"as_of":"...","backup_id":"...","steps":[{"name":"hosts","ok":true,"detail":"..."}],"warnings":[]}`。每次应用前自动备份，最多保留 10 个。
+`dns_ready` 为 true 表示网关 DNS 服务正在 53 端口运行，此时默认给出 `both` 模式命令；否则给出 `hosts` 模式命令。
 
 ## 脚本下载
 

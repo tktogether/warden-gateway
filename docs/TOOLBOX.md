@@ -8,11 +8,11 @@
 sudo bash toolbox.sh install
 sudo bash toolbox.sh update
 sudo bash toolbox.sh status
+sudo bash toolbox.sh logs
+sudo bash toolbox.sh version
 sudo bash toolbox.sh backup
 sudo bash toolbox.sh restore --id latest
 sudo bash toolbox.sh doctor
-sudo bash toolbox.sh cn-setup
-sudo bash toolbox.sh cn-restore --id latest
 sudo bash toolbox.sh uninstall
 ```
 
@@ -52,22 +52,24 @@ sudo bash /tmp/warden-toolbox.sh
 
 不要使用 `bash <(curl ...)` 形式：进程替换依赖 `/dev/fd`，部分系统不可用。
 
-## 诊断与国内机设置
+## 诊断
 
 ```bash
-sudo bash toolbox.sh doctor        # 项目自身与国内机配置两段诊断
-sudo bash toolbox.sh cn-setup      # 应用分流、APT、Docker、Git 镜像和 BBR
-sudo bash toolbox.sh cn-restore    # 恢复最近一次国内机设置备份
+sudo bash toolbox.sh doctor      # 仅网关自身：配置、服务、监听、证书与上游连通性
+sudo bash toolbox.sh gateway status
+sudo bash toolbox.sh gateway logs
 ```
 
-`cn-setup` 和 `cn-restore` 都是 `bootstrap.sh` 的子命令，工具箱直接透传参数。分流方式由 `--cn-mode` 选择：
+## 国内机设置
+
+国内机设置不在工具箱和维护命令中执行。网关只生成命令，需在国内机上运行 `bootstrap.sh cn-setup`：
 
 ```bash
-sudo bash toolbox.sh cn-setup --gateway-ip 192.0.2.10 --cn-mode both --yes
-sudo bash toolbox.sh cn-setup --gateway-ip 192.0.2.10 --cn-mode none --yes
+curl -fsSL https://panel.example.com/bootstrap.sh -o /tmp/wg-bootstrap.sh
+sudo bash /tmp/wg-bootstrap.sh cn-setup --gateway-ip 192.0.2.10 --cn-mode both --yes
 ```
 
-`hosts` 只改 hosts，`dns` 只改 resolver，`both` 两者互为兜底，`none` 都不改。不带 `--cn-mode` 时按 hosts 处理。
+`--cn-mode` 选择 `hosts`（只改 hosts）、`dns`（只改 resolver）、`both`（两者互为兜底）或 `none`（都不改），默认 `hosts`。
 
 可用环境变量：
 

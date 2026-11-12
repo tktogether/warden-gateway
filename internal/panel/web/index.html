@@ -61,7 +61,7 @@
         <button class="nav-item active" data-view="overview" type="button">总览</button>
         <button class="nav-item" data-view="metrics" type="button">指标</button>
         <button class="nav-item" data-view="proxies" type="button">代理</button>
-        <button class="nav-item" data-view="effect" type="button">效果</button>
+        <button class="nav-item" data-view="effect" type="button">承载</button>
         <button class="nav-item" data-view="diagnostics" type="button">诊断</button>
         <button class="nav-item" data-view="backups" type="button">备份</button>
         <button class="nav-item" data-view="audit" type="button">审计</button>
@@ -104,15 +104,15 @@
 
       <section id="view-effect" class="view" hidden>
         <div class="page-head">
-          <div><h2>代理效果</h2><p id="effect-note" class="muted">直连上游与经代理转发的耗时对比</p></div>
-          <button id="run-effect" class="btn primary" type="button">开始对比</button>
+          <div><h2>承载</h2><p id="effect-note" class="muted">网关最近实际承载的流量、成功率与耗时</p></div>
+          <button id="refresh-effect" class="btn" type="button">刷新</button>
         </div>
         <div id="effect-content"></div>
       </section>
 
       <section id="view-diagnostics" class="view" hidden>
         <div class="page-head">
-          <div><h2>诊断</h2><p id="diagnostics-note" class="muted">项目自身与国内机配置</p></div>
+          <div><h2>诊断</h2><p id="diagnostics-note" class="muted">网关自身的配置、监听与证书</p></div>
           <button id="refresh-diagnostics" class="btn" type="button">重新检查</button>
         </div>
         <div id="diagnostics-content"></div>

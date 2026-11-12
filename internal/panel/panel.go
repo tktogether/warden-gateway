@@ -23,6 +23,7 @@ import (
 	"github.com/tktogether/warden-gateway/internal/auth"
 	"github.com/tktogether/warden-gateway/internal/backup"
 	"github.com/tktogether/warden-gateway/internal/config"
+	"github.com/tktogether/warden-gateway/internal/dnsproxy"
 	"github.com/tktogether/warden-gateway/internal/gateway"
 	"github.com/tktogether/warden-gateway/internal/logging"
 	"github.com/tktogether/warden-gateway/internal/telemetry"
@@ -50,6 +51,7 @@ type Options struct {
 	Stats       *telemetry.Store
 	Log         *logging.Logger
 	Started     time.Time
+	DNS         *dnsproxy.Proxy
 }
 
 type Server struct {
@@ -64,6 +66,7 @@ type Server struct {
 	log         *logging.Logger
 	started     time.Time
 	host        *hostMetrics
+	dns         *dnsproxy.Proxy
 	auditPath   string
 	sampleMu    sync.Mutex
 	restartMu   sync.Mutex
@@ -101,7 +104,8 @@ func New(opts Options) (*Server, error) {
 		cfg: opts.Config, cfgPath: opts.ConfigPath, dataDir: opts.DataDir, scriptDir: opts.ScriptDir,
 		serviceName: opts.ServiceName, auth: opts.Auth, backups: opts.Backups,
 		stats: opts.Stats, log: opts.Log, started: opts.Started,
-		host: newHostMetrics(5760), auditPath: filepath.Join(opts.DataDir, "audit.log"),
+		host: newHostMetrics(5760), dns: opts.DNS,
+		auditPath: filepath.Join(opts.DataDir, "audit.log"),
 	}
 	s.host.Sample()
 	return s, nil
@@ -224,13 +228,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, p string) {
 		s.handleDiagnostics(w, r)
 		return
 	case "/api/cn":
-		s.handleCNStatus(w, r)
-		return
-	case "/api/cn/apply":
-		s.handleCNApply(w, r)
-		return
-	case "/api/cn/restore":
-		s.handleCNRestore(w, r)
+		s.handleCNCommands(w, r)
 		return
 	case "/api/dns":
 		s.handleDNSStatus(w, r)
@@ -493,11 +491,30 @@ func (s *Server) panelInfo() map[string]interface{} {
 }
 
 func (s *Server) dnsInfo() map[string]interface{} {
-	return map[string]interface{}{
+	info := map[string]interface{}{
 		"enabled": s.cfg.DNS.Enabled, "listen": s.cfg.DNS.Listen,
 		"gateway_ip": s.cfg.DNS.GatewayIP, "domains": s.cfg.DNS.Domains,
 		"upstream": s.cfg.DNS.Upstream,
 	}
+	if s.dns != nil {
+		st := s.dns.Status()
+		info["enabled"] = st.Enabled
+		info["running"] = st.Running
+		info["active_listen"] = st.Listen
+		info["active_port"] = st.Port
+		info["fallback"] = st.Fallback
+		info["port53"] = st.Port == "53"
+		if st.Error != "" {
+			info["error"] = st.Error
+		}
+	} else {
+		info["running"] = false
+		info["active_listen"] = ""
+		info["active_port"] = ""
+		info["fallback"] = false
+		info["port53"] = false
+	}
+	return info
 }
 
 func (s *Server) sniInfo() map[string]interface{} {
