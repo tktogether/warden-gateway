@@ -58,9 +58,11 @@
 | `success_rate` | 成功率百分比 |
 | `in_flight` | 进行中的请求数 |
 | `status_classes` | `2xx`、`3xx`、`4xx`、`5xx` 计数 |
-| `latency` | `count`、`avg_millis`、`p50`、`p90`、`p99`、`max`、`histogram`（12 档） |
-| `rates` | `requests_per_min`、`failures_per_min`、`bytes_in_per_sec`、`bytes_out_per_sec`、`requests_per_sec` |
+| `latency` | `count`、`avg_millis`、`p50`、`p90`、`p99`、`max`、`histogram`（12 档）；分位取自直方图档位且不超过 `max` |
+| `rates` | 近六十分钟的 `requests_per_min`、`failures_per_min`、`bytes_in_per_sec`、`bytes_out_per_sec`、`requests_per_sec`，保留三位小数 |
+| `last_minute` | 最近一分钟的 `requests`、`failures`、`bytes_in`、`bytes_out`、`in_per_sec`、`out_per_sec`、`requests_per_min`、`failures_per_min` |
 | `window` | 近六十分钟的请求、失败、出入流量与延迟汇总 |
+| `series` | 近六十分钟、步长 10 秒的序列；无流量通道返回零值时间轴 |
 | `targets` | 热点目标，最多 8 个，按流量排序 |
 | `upstream` | 上游响应耗时，`count` 与 `avg_millis` |
 

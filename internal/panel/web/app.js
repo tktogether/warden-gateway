@@ -673,12 +673,13 @@
 
     var rates = p.rates || {};
     var win = p.window || {};
+    var minute = p.last_minute || {};
     var stats = el('div', 'proxy-stats');
     [
       ['请求总数', String(p.requests || 0)],
       ['成功率', p.requests ? pct(p.success_rate || 0) : '—'],
-      ['近一分钟', (rates.requests_per_min || 0) + ' 次 / ' + (rates.failures_per_min || 0) + ' 失败'],
-      ['近一分钟流量', fmtRate(rates.bytes_in_per_sec) + ' ↓ / ' + fmtRate(rates.bytes_out_per_sec) + ' ↑']
+      ['近一分钟', (minute.requests || 0) + ' 次 / ' + (minute.failures || 0) + ' 失败'],
+      ['近一分钟流量', fmtRate(minute.in_per_sec || 0) + ' ↓ / ' + fmtRate(minute.out_per_sec || 0) + ' ↑']
     ].forEach(function (pair) {
       var item = el('div');
       add(item, el('span', '', pair[0]));
@@ -692,7 +693,11 @@
     var up = p.upstream || {};
     var sum = el('div', 'proxy-summary');
     add(sum, el('span', 'muted', '2xx ' + (classes['2xx'] || 0) + ' · 3xx ' + (classes['3xx'] || 0) + ' · 4xx ' + (classes['4xx'] || 0) + ' · 5xx ' + (classes['5xx'] || 0)));
-    add(sum, el('span', 'muted', '延迟 平均 ' + msText(lat.avg_millis) + ' · P50 ' + msText(lat.p50) + ' · P90 ' + msText(lat.p90) + ' · P99 ' + msText(lat.p99) + ' · 最大 ' + msText(lat.max)));
+    if (Number(lat.count) > 0) {
+      add(sum, el('span', 'muted', '延迟 平均 ' + msText(lat.avg_millis) + ' · P50 ' + msText(lat.p50) + ' · P90 ' + msText(lat.p90) + ' · P99 ' + msText(lat.p99) + ' · 最大 ' + msText(lat.max) + '（' + lat.count + ' 次采样）'));
+    } else {
+      add(sum, el('span', 'muted', '延迟 近一小时没有样本'));
+    }
     if (up.count) { add(sum, el('span', 'muted', '上游响应 平均 ' + msText(up.avg_millis) + '（' + up.count + ' 次采样）')); }
     add(sum, el('span', 'muted', '近一小时 请求 ' + (win.requests || 0) + ' · 失败 ' + (win.failures || 0) + ' · 入 ' + fmtBytes(win.bytes_in) + ' · 出 ' + fmtBytes(win.bytes_out)));
     card.appendChild(sum);

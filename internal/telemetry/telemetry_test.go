@@ -120,3 +120,44 @@ func TestDetailJSONShape(t *testing.T) {
 		}
 	}
 }
+
+func TestLatencyPercentilesNeverExceedMax(t *testing.T) {
+	s := NewStore()
+	call := s.Begin("sni")
+	time.Sleep(12 * time.Millisecond)
+	call.Done(200, 100, 200, "", "127.0.0.1:6000", "TLS", "github.com")
+	d := s.Detail(60, false)[0]
+	lat := d.Latency
+	if lat.Count != 1 {
+		t.Fatalf("latency count %d", lat.Count)
+	}
+	if lat.Max <= 0 {
+		t.Fatalf("max should be sampled, got %d", lat.Max)
+	}
+	for name, v := range map[string]int64{"p50": lat.P50, "p90": lat.P90, "p99": lat.P99} {
+		if v > lat.Max {
+			t.Fatalf("%s=%d exceeds max=%d", name, v, lat.Max)
+		}
+		if v <= 0 {
+			t.Fatalf("%s should be positive, got %d", name, v)
+		}
+	}
+}
+
+func TestRatesAreRounded(t *testing.T) {
+	s := NewStore()
+	s.Begin("dns").Done(200, 30, 60, "", "127.0.0.1:5300", "DNS", "github.com.")
+	rates := s.Detail(60, false)[0].Rates
+	if rates.RequestsPerMin != 0.017 {
+		t.Fatalf("requests per minute = %v, want 0.017", rates.RequestsPerMin)
+	}
+	if rates.FailuresPerMin != 0 {
+		t.Fatalf("failures per minute = %v, want 0", rates.FailuresPerMin)
+	}
+	if rates.BytesInPerSec != 0.008 || rates.BytesOutPerSec != 0.017 {
+		t.Fatalf("byte rates = %v/%v", rates.BytesInPerSec, rates.BytesOutPerSec)
+	}
+	if rates.RequestsPerSec != 0.000 {
+		t.Fatalf("requests per second = %v", rates.RequestsPerSec)
+	}
+}

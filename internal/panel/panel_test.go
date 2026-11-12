@@ -274,10 +274,17 @@ func TestProxiesExposeLatencyAndRates(t *testing.T) {
 			t.Fatal(err)
 		}
 		names[name] = true
-		for _, key := range []string{"name", "label", "path", "enabled", "requests", "failures", "bytes_in", "bytes_out", "success_rate", "in_flight", "status_classes", "latency", "rates", "window"} {
+		for _, key := range []string{"name", "label", "path", "enabled", "requests", "failures", "bytes_in", "bytes_out", "success_rate", "in_flight", "status_classes", "latency", "rates", "window", "last_minute", "series"} {
 			if _, ok := row[key]; !ok {
 				t.Fatalf("proxy row %q missing %q", name, key)
 			}
+		}
+		var series []map[string]json.RawMessage
+		if err := json.Unmarshal(row["series"], &series); err != nil {
+			t.Fatal(err)
+		}
+		if len(series) < 2 {
+			t.Fatalf("proxy %q series too short: %d", name, len(series))
 		}
 	}
 	for _, want := range []string{"docker", "github", "dns", "sni"} {

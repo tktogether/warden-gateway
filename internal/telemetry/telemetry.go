@@ -504,6 +504,29 @@ func (e *entry) window(cutoff int64) (WindowPoint, []int64) {
 	return out, hist
 }
 
+// EmptySeries returns a zero-filled timeline with the same shape the store
+// produces, so a channel without traffic still gets a correctly aligned axis.
+func EmptySeries(minutes, stepSeconds int) []WindowPoint {
+	if minutes <= 0 {
+		minutes = 60
+	}
+	if stepSeconds < BucketSeconds {
+		stepSeconds = BucketSeconds
+	}
+	stepSeconds = stepSeconds / BucketSeconds * BucketSeconds
+	cutoff := time.Now().Unix() - int64(minutes*60)
+	start := cutoff / int64(stepSeconds) * int64(stepSeconds)
+	count := int((time.Now().Unix()-start)/int64(stepSeconds)) + 1
+	if count <= 0 {
+		count = 1
+	}
+	out := make([]WindowPoint, count)
+	for i := range out {
+		out[i].At = start + int64(i)*int64(stepSeconds)
+	}
+	return out
+}
+
 // series builds a gap-filled timeline with the given step.
 func (e *entry) series(cutoff int64, step int64) []WindowPoint {
 	if step <= 0 {
@@ -548,6 +571,14 @@ func latencySummary(hist []int64, count, sum, max int64) Latency {
 	out.P50 = histogramPercentile(hist, count, 50)
 	out.P90 = histogramPercentile(hist, count, 90)
 	out.P99 = histogramPercentile(hist, count, 99)
+	// Bucket percentiles report the bucket's upper bound, which can sit above
+	// the slowest real sample; clamp them so a card never shows a larger P90
+	// than Max.
+	if out.Max > 0 {
+		out.P50 = clampMillis(out.P50, out.Max)
+		out.P90 = clampMillis(out.P90, out.Max)
+		out.P99 = clampMillis(out.P99, out.Max)
+	}
 	out.Histogram = make([]HistBin, latencyBucketCount)
 	for i := range out.Histogram {
 		var c int64
@@ -557,6 +588,14 @@ func latencySummary(hist []int64, count, sum, max int64) Latency {
 		out.Histogram[i] = HistBin{Label: latencyLabels[i], Count: c}
 	}
 	return out
+}
+
+// clampMillis caps a percentile at the largest observed sample.
+func clampMillis(v, max int64) int64 {
+	if v > max {
+		return max
+	}
+	return v
 }
 
 func histogramPercentile(hist []int64, count int64, p float64) int64 {
@@ -591,12 +630,18 @@ func ratesOf(w WindowPoint, minutes int) Rates {
 		return Rates{}
 	}
 	return Rates{
-		RequestsPerMin: float64(w.Requests) / seconds * 60,
-		FailuresPerMin: float64(w.Failures) / seconds * 60,
-		RequestsPerSec: float64(w.Requests) / seconds,
-		BytesInPerSec:  float64(w.BytesIn) / seconds,
-		BytesOutPerSec: float64(w.BytesOut) / seconds,
+		RequestsPerMin: round3(float64(w.Requests) / seconds * 60),
+		FailuresPerMin: round3(float64(w.Failures) / seconds * 60),
+		RequestsPerSec: round3(float64(w.Requests) / seconds),
+		BytesInPerSec:  round3(float64(w.BytesIn) / seconds),
+		BytesOutPerSec: round3(float64(w.BytesOut) / seconds),
 	}
+}
+
+// round3 keeps three decimals: enough for the smallest averages the panel
+// shows, while dropping float noise such as 0.33333333333333337.
+func round3(v float64) float64 {
+	return float64(int64(v*1000+0.5)) / 1000
 }
 
 func (s *Store) Recent(limit int) []LogEntry {

@@ -469,7 +469,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		"host":        host,
 		"certificate": s.certificateSummary(),
 		"services":    s.serviceRows(),
-		"proxies":     s.proxyOverview(false),
+		"proxies":     s.proxyOverview(false), // overview keeps the payload small
 		"backups":     map[string]interface{}{"count": len(backups), "latest": latestBackup},
 		"panel":       s.panelInfo(),
 		"dns":         s.dnsInfo(),
@@ -590,16 +590,32 @@ func metricsStep(minutes int) int {
 	return step / telemetry.BucketSeconds * telemetry.BucketSeconds
 }
 
-func (s *Server) proxyOverview(withTest bool) []map[string]interface{} {
-	details := s.stats.Detail(60, false)
+func (s *Server) proxyOverview(withSeries bool) []map[string]interface{} {
+	details := s.stats.Detail(60, withSeries)
 	byName := map[string]telemetry.ProxyDetail{}
 	for _, d := range details {
 		byName[d.Name] = d
 	}
+	minute := map[string]telemetry.ProxyDetail{}
+	for _, d := range s.stats.Detail(1, false) {
+		minute[d.Name] = d
+	}
 	rows := []map[string]interface{}{}
 	add := func(name, label, path string, enabled bool) {
 		d := byName[name]
+		m := minute[name]
+		series := d.Series
+		if withSeries && len(series) == 0 {
+			// Channels that saw no traffic yet still need an aligned axis.
+			series = telemetry.EmptySeries(60, telemetry.BucketSeconds)
+		}
 		rows = append(rows, map[string]interface{}{
+			"last_minute": map[string]interface{}{
+				"requests": m.Requests, "failures": m.Failures,
+				"bytes_in": m.BytesIn, "bytes_out": m.BytesOut,
+				"in_per_sec": round1(float64(m.BytesIn) / 60), "out_per_sec": round1(float64(m.BytesOut) / 60),
+				"requests_per_min": m.Requests, "failures_per_min": m.Failures,
+			},
 			"name": name, "label": label, "path": path, "enabled": enabled,
 			"requests": d.Requests, "failures": d.Failures,
 			"bytes_in": d.BytesIn, "bytes_out": d.BytesOut,
@@ -607,6 +623,7 @@ func (s *Server) proxyOverview(withTest bool) []map[string]interface{} {
 			"success_rate": round1(d.SuccessRate), "in_flight": d.InFlight,
 			"status_classes": d.StatusClasses, "window": d.Window,
 			"rates": d.Rates, "latency": d.Latency, "targets": d.Targets,
+			"series": series,
 		})
 	}
 	add("docker", "Docker 镜像代理", "/v2/", s.cfg.Docker.Enabled)
@@ -630,7 +647,7 @@ func (s *Server) handleProxies(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"as_of": config.NowUTC(), "proxies": s.proxyOverview(false),
+		"as_of": config.NowUTC(), "proxies": s.proxyOverview(true),
 		"recent": s.stats.Recent(100),
 	})
 }
