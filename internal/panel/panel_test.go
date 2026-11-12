@@ -148,6 +148,53 @@ func TestKeyRotationInvalidatesSession(t *testing.T) {
 	}
 }
 
+func TestEffectOverheadUsesOnlyUpstreamSamples(t *testing.T) {
+	srv, key := newPanel(t)
+	cookie, _ := login(t, srv, key)
+	// An SNI request records latency but never an upstream wait.
+	sni := srv.stats.Begin("sni")
+	time.Sleep(12 * time.Millisecond)
+	sni.Done(200, 10, 10, "", "127.0.0.1", "CONNECT", "github.com:443")
+	// A Docker request records both latency and its upstream wait.
+	docker := srv.stats.Begin("docker")
+	time.Sleep(12 * time.Millisecond)
+	docker.DoneUpstream("/v2/library/alpine/manifests/latest", 4, 200, 100, 200, "", "127.0.0.1", "GET", "/v2/library/alpine/manifests/latest")
+	rec := do(t, srv, "GET", "/warden/api/effect", nil, cookie, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("effect status %d: %s", rec.Code, rec.Body)
+	}
+	var body struct {
+		Overhead struct {
+			AvgLatencyMs    int64 `json:"avg_latency_ms"`
+			AvgUpstreamMs   int64 `json:"avg_upstream_ms"`
+			GatewayMs       int64 `json:"gateway_ms"`
+			UpstreamSamples int64 `json:"upstream_samples"`
+		} `json:"overhead"`
+		Channels []struct {
+			Name          string `json:"name"`
+			UpstreamCount int64  `json:"upstream_count"`
+			GatewayMs     int64  `json:"gateway_ms"`
+		} `json:"channels"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Overhead.UpstreamSamples != 1 {
+		t.Fatalf("upstream samples = %d, want 1", body.Overhead.UpstreamSamples)
+	}
+	if body.Overhead.AvgLatencyMs <= 0 || body.Overhead.AvgUpstreamMs != 4 {
+		t.Fatalf("overhead latency/upstream = %d/%d", body.Overhead.AvgLatencyMs, body.Overhead.AvgUpstreamMs)
+	}
+	if body.Overhead.GatewayMs < 0 || body.Overhead.GatewayMs >= body.Overhead.AvgLatencyMs {
+		t.Fatalf("gateway ms = %d, avg latency = %d", body.Overhead.GatewayMs, body.Overhead.AvgLatencyMs)
+	}
+	for _, ch := range body.Channels {
+		if ch.Name == "sni" && (ch.UpstreamCount != 0 || ch.GatewayMs != 0) {
+			t.Fatalf("sni channel upstream/gateway = %d/%d, want 0/0", ch.UpstreamCount, ch.GatewayMs)
+		}
+	}
+}
+
 // login performs a login and returns the session cookie plus CSRF token.
 func login(t *testing.T, srv *Server, key string) (*http.Cookie, string) {
 	t.Helper()

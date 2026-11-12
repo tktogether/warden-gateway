@@ -116,7 +116,7 @@
   function applySession(s) {
     state.session = s || { authenticated: false };
     state.csrf = (s && s.csrf) || '';
-    qs('#panel-version').textContent = s.version ? ('v' + s.version) : '';
+    qs('#panel-version').textContent = s.version ? ('v' + String(s.version).replace(/^v/, '')) : '';
     qs('#panel-key').textContent = s.key_fingerprint ? ('密钥 ' + s.key_fingerprint) : '';
   }
 
@@ -841,7 +841,8 @@
       return [
         c.label || c.name, String(c.requests || 0), pct(Number(c.success_rate) || 0),
         (c.avg_latency_ms || 0) + ' ms', (c.p90_ms || 0) + ' ms',
-        (c.upstream_ms || 0) + ' ms', (c.gateway_ms || 0) + ' ms',
+        (c.upstream_count ? (c.upstream_ms || 0) + ' ms' : '—'),
+        (c.upstream_count ? (c.gateway_ms || 0) + ' ms' : '—'),
         fmtBytes(c.bytes_in), fmtBytes(c.bytes_out),
         fmtRate(c.in_per_sec) + ' / ' + fmtRate(c.out_per_sec)
       ];

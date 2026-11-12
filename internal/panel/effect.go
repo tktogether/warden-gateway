@@ -35,6 +35,7 @@ func (s *Server) handleEffect(w http.ResponseWriter, r *http.Request) {
 		totalRequests, totalFailures, totalIn, totalOut, totalInFlight int64
 		latCount, latSum, latMax, p90Max                               int64
 		upCount, upSum                                                 int64
+		upLatCount, upLatSum                                           int64
 	)
 	channels := []map[string]interface{}{}
 	specs := []struct {
@@ -70,6 +71,10 @@ func (s *Server) handleEffect(w http.ResponseWriter, r *http.Request) {
 		}
 		upCount += d.Upstream.Count
 		upSum += d.Upstream.AvgMillis * d.Upstream.Count
+		if d.Upstream.Count > 0 {
+			upLatCount += d.Latency.Count
+			upLatSum += d.Latency.AvgMillis * d.Latency.Count
+		}
 		channels = append(channels, map[string]interface{}{
 			"name": spec.name, "label": spec.label, "path": spec.path, "enabled": spec.enabled,
 			"requests": d.Requests, "failures": d.Failures, "success_rate": round1(d.SuccessRate),
@@ -82,16 +87,23 @@ func (s *Server) handleEffect(w http.ResponseWriter, r *http.Request) {
 			"status_classes":   d.StatusClasses, "targets": d.Targets,
 		})
 	}
-	avgLatency, avgUpstream := int64(0), int64(0)
+	avgLatency := int64(0)
 	if latCount > 0 {
 		avgLatency = latSum / latCount
 	}
+	// Upstream wait is only recorded on channels that proxy to an origin
+	// (Docker, GitHub). Channels such as the SNI relay and DNS never sample
+	// it, so the overhead split must cover only requests with a sample.
+	avgUpstream, overheadLatency, gatewayAvg := int64(0), int64(0), int64(0)
 	if upCount > 0 {
 		avgUpstream = upSum / upCount
-	}
-	gatewayAvg := avgLatency - avgUpstream
-	if gatewayAvg < 0 {
-		gatewayAvg = 0
+		if upLatCount > 0 {
+			overheadLatency = upLatSum / upLatCount
+		}
+		gatewayAvg = overheadLatency - avgUpstream
+		if gatewayAvg < 0 {
+			gatewayAvg = 0
+		}
 	}
 	successRate := 100.0
 	if totalRequests > 0 {
@@ -126,9 +138,9 @@ func (s *Server) handleEffect(w http.ResponseWriter, r *http.Request) {
 			"latency_samples": latCount,
 		},
 		"overhead": map[string]interface{}{
-			"avg_latency_ms": avgLatency, "avg_upstream_ms": avgUpstream,
+			"avg_latency_ms": overheadLatency, "avg_upstream_ms": avgUpstream,
 			"gateway_ms": gatewayAvg, "upstream_samples": upCount,
-			"upstream_pct": round1(percentOf(avgUpstream, avgLatency)),
+			"upstream_pct": round1(percentOf(avgUpstream, overheadLatency)),
 		},
 		"dns": map[string]interface{}{
 			"hit": hit, "miss": miss, "hit_rate": round1(hitRate), "total": hit + miss,
