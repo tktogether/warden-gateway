@@ -299,24 +299,18 @@ DNS 模式让客户端把 DNS 指向网关，由网关把指定域名解析到�
 
 ## 工具箱
 
-仓库根目录的 `toolbox.sh` 集成安装、升级、维护命令、常用网络工具和 BBR 配置：
+工具箱已独立为 [warden-toolbox](https://github.com/tktogether/warden-toolbox)，集成安装、升级、维护命令、常用网络工具和 BBR 配置：
 
 ```bash
-sudo bash toolbox.sh
-```
-
-远程运行：
-
-```bash
-curl -fL https://raw.githubusercontent.com/tktogether/warden-gateway/main/toolbox.sh -o /tmp/warden-toolbox.sh
+curl -fsSL https://raw.githubusercontent.com/tktogether/warden-toolbox/main/toolbox.sh -o /tmp/warden-toolbox.sh
 sudo bash /tmp/warden-toolbox.sh
 ```
 
+仓库根目录的 `toolbox.sh` 是转发脚本，保留 `sudo bash toolbox.sh` 的旧用法，执行时自动获取并转发到独立工具箱。工具箱识别已安装的 `/opt/warden-gateway/bootstrap.sh`，也可用 `WARDEN_GATEWAY_BOOTSTRAP` 指定。
+
 工具箱菜单包含安装、升级、状态、日志、版本、备份、恢复、一键诊断、卸载和远程命令。国内机设置不在工具箱中：按面板生成的命令到国内机执行 `bootstrap.sh cn-setup`。
 
-安装完成后，`bootstrap.sh` 与 `toolbox.sh` 会复制到 `/opt/warden-gateway`，同时复制工具箱源码目录，因此本机可直接运行 `sudo bash /opt/warden-gateway/toolbox.sh`，不需要联网下载。
-
-工具箱也可以直接调用网关命令：
+安装完成后 `bootstrap.sh` 与 `toolbox.sh` 复制到 `/opt/warden-gateway`。工具箱也可以直接调用网关命令：
 
 ```bash
 sudo bash toolbox.sh gateway status
@@ -341,7 +335,7 @@ go build ./...
 go test ./...
 go vet ./...
 bash -n bootstrap.sh
-bash toolbox.sh self-test
+bash toolbox.sh version
 ```
 
 ## 目录
@@ -353,12 +347,13 @@ internal/auth/           访问密钥、会话与限流
 internal/gateway/        SNI 路由、TLS、Docker 代理
 internal/githubproxy/    GitHub 代理
 internal/dnsproxy/       可选 DNS 分流
+internal/singbox/        sing-box 节点与内核管理
 internal/panel/          管理面板与指标
 internal/backup/         备份与恢复
 internal/app/            组件装配
 deploy/                  systemd 与辅助脚本
 examples/                配置示例
-toolbox/                 运维工具箱
+toolbox.sh               工具箱转发脚本
 ```
 
 ## 常见问题

@@ -651,11 +651,10 @@ install_scripts() {
     fi
     [ -f "$SCRIPT_DIR/toolbox.sh" ] && chmod 0755 "$SCRIPT_DIR/toolbox.sh"
   fi
-  # 仓库内安装时一并复制工具箱源码，安装后的 toolbox.sh 可直接运行，不再联网下载。
-  if [ -d "$dir/toolbox" ] && [ "$dir/toolbox" != "$dest_dir/toolbox" ]; then
+  # 1.4.0 起工具箱独立为 warden-toolbox，toolbox.sh 只是转发脚本；
+  # 清理旧版本安装在本地的工具箱源码目录，避免残留过期模块。
+  if [ -d "$SCRIPT_DIR/toolbox" ]; then
     rm -rf "$SCRIPT_DIR/toolbox"
-    cp -R "$dir/toolbox" "$SCRIPT_DIR/toolbox"
-    chmod -R 0755 "$SCRIPT_DIR/toolbox"
   fi
   if [ -f "$dir/VERSION" ] && [ "$dir/VERSION" != "$dest_dir/VERSION" ]; then
     install -m 0644 "$dir/VERSION" "$dest_dir/VERSION"
