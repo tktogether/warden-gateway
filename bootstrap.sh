@@ -599,6 +599,23 @@ fetch_repo_file() {
   return 1
 }
 
+# fetch_repo_raw 下载仓库内的任意文本文件（不校验 shebang，用于 VERSION）。
+fetch_repo_raw() {
+  local path="$1" dest="$2" url tmp
+  tmp="$dest.part.$$"
+  while IFS= read -r url; do
+    [ -z "$url" ] && continue
+    if curl -fL --connect-timeout 10 --max-time 60 --retry 1 -o "$tmp" "$url" 2>/dev/null; then
+      if [ -s "$tmp" ]; then
+        mv -f "$tmp" "$dest"
+        return 0
+      fi
+    fi
+    rm -f "$tmp"
+  done <<< "$(repo_raw_urls "$path")"
+  return 1
+}
+
 install_scripts() {
   step "脚本" "安装到 $SCRIPT_DIR"
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -659,6 +676,41 @@ fi
 exec bash "\$BOOTSTRAP" "\$@"
 CLIEOF
   chmod 0755 "$CLI_PATH"
+}
+
+# prepare_update_scripts 从仓库下载最新 bootstrap.sh/toolbox.sh/VERSION 到临时目录。
+# 直接执行已安装脚本时，源目录与安装目录相同，install 无法覆盖自身；改为在新脚本
+# 中带 NW_UPDATE_REEXEC=1 重新执行，由新脚本完成脚本与版本文件的更新。
+prepare_update_scripts() {
+  local self dir path
+  self="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+  [ "$self" = "$SCRIPT_DIR/bootstrap.sh" ] || return 1
+  dir="$(mktemp -d)" || return 1
+  for path in bootstrap.sh toolbox.sh; do
+    if ! fetch_repo_raw "$path" "$dir/$path"; then
+      warn "未能获取最新 $path，继续使用当前脚本"
+      rm -rf "$dir"
+      return 1
+    fi
+    chmod 0755 "$dir/$path"
+  done
+  fetch_repo_raw VERSION "$dir/VERSION" >/dev/null 2>&1 || true
+  UPDATE_SCRIPT_DIR="$dir"
+  return 0
+}
+
+# write_version_from_binary 用实际安装的二进制版本刷新脚本版本文件。
+write_version_from_binary() {
+  [ "$DRY_RUN" -eq 0 ] || return 0
+  [ -x "$BIN_PATH" ] || return 0
+  local out v
+  out="$("$BIN_PATH" version 2>/dev/null | head -n 1)"
+  v="$(printf '%s' "$out" | sed -e 's/^v//' -e 's/ .*//')"
+  case "$v" in ""|*[!0-9.]*) return 0;; esac
+  if [ -f "$SCRIPT_DIR/VERSION" ] && [ "$(cat "$SCRIPT_DIR/VERSION")" = "$v" ]; then
+    return 0
+  fi
+  printf '%s\n' "$v" > "$SCRIPT_DIR/VERSION"
 }
 
 install_unit() {
@@ -1489,6 +1541,7 @@ cmd_install() {
     init_config
     install_scripts
     install_cli
+    write_version_from_binary
     install_unit
     install_logrotate
     install_service
@@ -1520,6 +1573,10 @@ cmd_update() {
   need_root
   [ -f "$CONFIG_FILE" ] || die "未安装，请先执行 install"
   detect_installed_mode
+  if [ "${NW_UPDATE_REEXEC:-0}" != "1" ] && prepare_update_scripts; then
+    info "脚本" "使用仓库最新脚本执行升级"
+    NW_UPDATE_REEXEC=1 exec bash "$UPDATE_SCRIPT_DIR/bootstrap.sh" "$@"
+  fi
   title "Warden Gateway 升级"
   if [ -z "$PUBLIC_URL" ]; then PUBLIC_URL="$(config_public_url)"; fi
   if [ "$MODE" = "docker" ]; then
@@ -1532,6 +1589,7 @@ cmd_update() {
     install_binary
     install_scripts
     install_cli
+    write_version_from_binary
     install_unit
     install_logrotate
     systemctl daemon-reload
