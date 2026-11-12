@@ -11,6 +11,7 @@ import (
 
 	"github.com/tktogether/warden-gateway/internal/config"
 	"github.com/tktogether/warden-gateway/internal/logging"
+	"github.com/tktogether/warden-gateway/internal/telemetry"
 )
 
 type HostMatcher struct {
@@ -78,17 +79,22 @@ type SNIProxy struct {
 	entryAddr string
 	panelAddr string
 	matcher   *HostMatcher
+	stats     *telemetry.Store
 	log       *logging.Logger
 	listener  net.Listener
 	wg        sync.WaitGroup
 }
 
-func NewSNIProxy(cfg config.SNIConfig, entryAddr, panelAddr string, log *logging.Logger) *SNIProxy {
+func NewSNIProxy(cfg config.SNIConfig, entryAddr, panelAddr string, stats *telemetry.Store, log *logging.Logger) *SNIProxy {
+	if stats == nil {
+		stats = telemetry.NewStore()
+	}
 	return &SNIProxy{
 		cfg:       cfg,
 		entryAddr: entryAddr,
 		panelAddr: panelAddr,
 		matcher:   NewHostMatcher(cfg.Passthrough),
+		stats:     stats,
 		log:       log,
 	}
 }
@@ -141,15 +147,22 @@ func (s *SNIProxy) Close() error {
 
 func (s *SNIProxy) handle(client net.Conn) {
 	defer client.Close()
+	call := s.stats.Begin("sni")
+	remote := ""
+	if addr := client.RemoteAddr(); addr != nil {
+		remote = addr.String()
+	}
 	_ = client.SetDeadline(time.Now().Add(15 * time.Second))
 	hello, serverName, err := readClientHello(client)
 	if err != nil {
 		s.log.Debugf("sni: read client hello: %v", err)
+		call.Done(0, 0, 0, "client hello: "+err.Error(), remote, "TLS", "")
 		return
 	}
 	_ = client.SetDeadline(time.Time{})
 	name := normalizeHost(serverName)
 	if name == "" {
+		call.Done(0, 0, 0, "client hello has no server name", remote, "TLS", "")
 		return
 	}
 	var target string
@@ -160,38 +173,47 @@ func (s *SNIProxy) handle(client net.Conn) {
 		target = net.JoinHostPort(name, "443")
 	default:
 		s.log.Debugf("sni: rejected host %q", name)
+		call.Done(0, 0, 0, "host not allowed: "+name, remote, "TLS", name)
 		return
 	}
 	upstream, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
 		s.log.Warnf("sni: dial %s: %v", target, err)
+		call.Done(0, 0, 0, "dial "+target+": "+err.Error(), remote, "TLS", name)
 		return
 	}
 	defer upstream.Close()
 	_ = upstream.SetDeadline(time.Now().Add(10 * time.Second))
 	if _, err := upstream.Write(hello); err != nil {
 		s.log.Debugf("sni: write hello to %s: %v", target, err)
+		call.Done(0, 0, 0, "write hello: "+err.Error(), remote, "TLS", name)
 		return
 	}
 	_ = upstream.SetDeadline(time.Time{})
-	relay(client, upstream)
+	in, out := relay(client, upstream)
+	call.Done(200, in, out, "", remote, "TLS", name)
 }
 
-func relay(a, b net.Conn) {
+// relay copies traffic in both directions and returns the byte counts sent to
+// the upstream (in) and returned to the client (out).
+func relay(a, b net.Conn) (int64, int64) {
 	var wg sync.WaitGroup
 	wg.Add(2)
-	cp := func(dst, src net.Conn) {
+	var toUpstream, toClient int64
+	cp := func(dst, src net.Conn, counter *int64) {
 		defer wg.Done()
-		_, _ = io.Copy(dst, src)
+		n, _ := io.Copy(dst, src)
+		*counter = n
 		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		} else {
 			_ = dst.Close()
 		}
 	}
-	go cp(a, b)
-	go cp(b, a)
+	go cp(b, a, &toUpstream)
+	go cp(a, b, &toClient)
 	wg.Wait()
+	return toUpstream, toClient
 }
 
 func readClientHello(conn net.Conn) ([]byte, string, error) {

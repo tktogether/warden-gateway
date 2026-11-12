@@ -147,3 +147,121 @@ func TestKeyRotationInvalidatesSession(t *testing.T) {
 		t.Fatalf("old key login status %d", rec.Code)
 	}
 }
+
+// login performs a login and returns the session cookie plus CSRF token.
+func login(t *testing.T, srv *Server, key string) (*http.Cookie, string) {
+	t.Helper()
+	rec := do(t, srv, "POST", "/warden/api/login", map[string]string{"key": key}, nil, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login status %d: %s", rec.Code, rec.Body)
+	}
+	var login struct {
+		CSRF string `json:"csrf"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &login); err != nil {
+		t.Fatal(err)
+	}
+	var cookie *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == "wg_session" {
+			cookie = c
+		}
+	}
+	if cookie == nil {
+		t.Fatal("session cookie missing")
+	}
+	return cookie, login.CSRF
+}
+
+func TestMetricsExposeExtendedHostFields(t *testing.T) {
+	srv, key := newPanel(t)
+	cookie, _ := login(t, srv, key)
+	rec := do(t, srv, "GET", "/warden/api/metrics?range=1h", nil, cookie, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics status %d: %s", rec.Code, rec.Body)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"range", "as_of", "points", "latest", "host", "ifaces", "counters", "traffic", "traffic_total", "proxy_series", "step_seconds"} {
+		if _, ok := payload[key]; !ok {
+			t.Fatalf("metrics payload missing %q", key)
+		}
+	}
+	var latest map[string]json.RawMessage
+	if err := json.Unmarshal(payload["latest"], &latest); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"cpu_percent", "load1", "load5", "load15", "mem_total", "mem_used", "mem_available", "swap_total", "swap_used", "net_rx_rate", "net_tx_rate", "disk_read_rate", "disk_write_rate", "tcp_connections", "established", "time_wait", "listen", "processes", "conntrack"} {
+		if _, ok := latest[key]; !ok {
+			t.Fatalf("latest sample missing %q", key)
+		}
+	}
+	if rec := do(t, srv, "GET", "/warden/api/metrics?range=2h", nil, cookie, ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad range status %d", rec.Code)
+	}
+}
+
+func TestProxiesExposeLatencyAndRates(t *testing.T) {
+	srv, key := newPanel(t)
+	cookie, _ := login(t, srv, key)
+	rec := do(t, srv, "GET", "/warden/api/proxies", nil, cookie, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("proxies status %d: %s", rec.Code, rec.Body)
+	}
+	var payload struct {
+		Proxies []map[string]json.RawMessage `json:"proxies"`
+		Recent  []map[string]json.RawMessage `json:"recent"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Proxies) != 4 {
+		t.Fatalf("want four proxy rows, got %d", len(payload.Proxies))
+	}
+	names := map[string]bool{}
+	for _, row := range payload.Proxies {
+		var name string
+		if err := json.Unmarshal(row["name"], &name); err != nil {
+			t.Fatal(err)
+		}
+		names[name] = true
+		for _, key := range []string{"name", "label", "path", "enabled", "requests", "failures", "bytes_in", "bytes_out", "success_rate", "in_flight", "status_classes", "latency", "rates", "window"} {
+			if _, ok := row[key]; !ok {
+				t.Fatalf("proxy row %q missing %q", name, key)
+			}
+		}
+	}
+	for _, want := range []string{"docker", "github", "dns", "sni"} {
+		if !names[want] {
+			t.Fatalf("missing proxy %q in %v", want, names)
+		}
+	}
+}
+
+func TestEffectRejectsGet(t *testing.T) {
+	srv, key := newPanel(t)
+	cookie, _ := login(t, srv, key)
+	if rec := do(t, srv, "GET", "/warden/api/effect", nil, cookie, ""); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /api/effect status %d", rec.Code)
+	}
+}
+
+func TestDNSEndpointsExposeMode(t *testing.T) {
+	srv, key := newPanel(t)
+	cookie, _ := login(t, srv, key)
+	rec := do(t, srv, "GET", "/warden/api/dns", nil, cookie, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dns status %d: %s", rec.Code, rec.Body)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"as_of", "dns", "domains", "suggested_gateway_ip", "local_resolver_mode"} {
+		if _, ok := payload[key]; !ok {
+			t.Fatalf("dns payload missing %q", key)
+		}
+	}
+}

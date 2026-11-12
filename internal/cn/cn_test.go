@@ -139,3 +139,81 @@ func TestStatusReportsDockerFromSocket(t *testing.T) {
 		t.Fatal("docker socket should mark docker installed")
 	}
 }
+
+func TestApplyModeSelectsRedirect(t *testing.T) {
+	for _, tc := range []struct {
+		mode  string
+		hosts bool
+		dns   bool
+	}{
+		{"hosts", true, false},
+		{"dns", false, true},
+		{"both", true, true},
+		{"none", false, false},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			m := testManager(t)
+			before := readFile(t, filepath.Join(m.Root, "/etc/hosts"))
+			report, err := m.Apply(Options{GatewayIP: "203.0.113.10", Mode: tc.mode})
+			if err != nil {
+				t.Fatalf("apply %s: %v", tc.mode, err)
+			}
+			for _, step := range report.Steps {
+				if !step.OK {
+					t.Fatalf("step %s failed: %s", step.Name, step.Detail)
+				}
+			}
+			hosts := readFile(t, filepath.Join(m.Root, "/etc/hosts"))
+			if got := strings.Contains(hosts, hostsBegin); got != tc.hosts {
+				t.Fatalf("hosts managed = %v, want %v: %s", got, tc.hosts, hosts)
+			}
+			if !tc.hosts && hosts != before {
+				t.Fatalf("hosts changed unexpectedly: %s", hosts)
+			}
+			resolv := readFile(t, filepath.Join(m.Root, "/etc/resolv.conf"))
+			if got := strings.HasPrefix(resolv, hostsBegin); got != tc.dns {
+				t.Fatalf("dns managed = %v, want %v: %s", got, tc.dns, resolv)
+			}
+			status, err := m.Status()
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := tc.mode
+			if tc.mode == "none" {
+				want = "none"
+			}
+			if status.Mode() != want {
+				t.Fatalf("status mode = %q, want %q", status.Mode(), want)
+			}
+		})
+	}
+}
+
+func TestApplyRejectsBadMode(t *testing.T) {
+	m := testManager(t)
+	if _, err := m.Apply(Options{GatewayIP: "203.0.113.10", Mode: "bogus"}); err == nil {
+		t.Fatal("expected error for invalid mode")
+	}
+}
+
+func TestStatusModeDetectsSystemdResolved(t *testing.T) {
+	m := testManager(t)
+	dir := filepath.Join(m.Root, "/etc/systemd/resolved.conf.d")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	conf := "[Resolve]\nDNS=203.0.113.10\nFallbackDNS=\n"
+	if err := os.WriteFile(filepath.Join(dir, "warden-cn.conf"), []byte(conf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	status, err := m.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.DNS.SystemdResolved || status.DNS.ResolvedDNS != "203.0.113.10" {
+		t.Fatalf("drop-in not detected: %+v", status.DNS)
+	}
+	if status.Mode() != "dns" {
+		t.Fatalf("mode = %q, want dns", status.Mode())
+	}
+}

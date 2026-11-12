@@ -57,6 +57,7 @@ func (h *DockerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "docker proxy is disabled", http.StatusServiceUnavailable)
 		return
 	}
+	target := dockerTarget(r.URL.Path)
 	if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/referrers/") && h.cfg.ReferrersStub {
 		call := h.stats.Begin("docker")
 		w.Header().Set("Content-Type", "application/vnd.oci.image.index.v1+json")
@@ -66,13 +67,33 @@ func (h *DockerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodHead {
 			_, _ = w.Write([]byte(emptyOCIIndex))
 		}
-		call.Done(http.StatusOK, 0, int64(len(emptyOCIIndex)), "", r.RemoteAddr, r.Method, r.URL.Path)
+		call.DoneTarget(target, http.StatusOK, 0, int64(len(emptyOCIIndex)), "", r.RemoteAddr, r.Method, r.URL.Path)
 		return
 	}
 	call := h.stats.Begin("docker")
 	rec := &recordingWriter{ResponseWriter: w}
 	h.proxy.ServeHTTP(rec, r)
-	call.Done(rec.statusCode(), r.ContentLength, rec.bytes, rec.errText(), r.RemoteAddr, r.Method, r.URL.Path)
+	call.DoneTarget(target, rec.statusCode(), r.ContentLength, rec.bytes, rec.errText(), r.RemoteAddr, r.Method, r.URL.Path)
+}
+
+// dockerTarget reduces a registry path to the image reference it addresses so
+// the panel can show which images actually use the mirror.
+func dockerTarget(path string) string {
+	p := strings.TrimPrefix(path, "/v2/")
+	if p == path || p == "" {
+		return ""
+	}
+	for _, marker := range []string{"/manifests/", "/blobs/", "/referrers/", "/tags/"} {
+		if i := strings.Index(p, marker); i > 0 {
+			p = p[:i]
+			break
+		}
+	}
+	p = strings.TrimSuffix(strings.Trim(p, "/"), "/")
+	if p == "" || len(p) > 90 {
+		return ""
+	}
+	return p
 }
 
 type recordingWriter struct {

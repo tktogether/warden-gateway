@@ -21,7 +21,7 @@ module_list() {
   printf '  %-14s %s\n' "backup" "立即创建备份"
   printf '  %-14s %s\n' "restore" "恢复最新或指定备份"
   printf '  %-14s %s\n' "doctor" "一键诊断：项目自身与国内机配置"
-  printf '  %-14s %s\n' "cn-setup" "应用国内机设置（APT、Docker、Git、hosts、BBR）"
+  printf '  %-14s %s\n' "cn-setup" "应用国内机设置（分流、APT、Docker、Git、BBR）"
   printf '  %-14s %s\n' "cn-restore" "恢复国内机设置备份"
   printf '  %-14s %s\n' "uninstall" "卸载程序"
   printf '  %-14s %s\n' "remote" "显示远程运行命令"

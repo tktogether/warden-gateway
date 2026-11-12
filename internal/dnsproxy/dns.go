@@ -91,18 +91,25 @@ func (p *Proxy) serveDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 	q := req.Question[0]
 	qname := strings.ToLower(strings.TrimSuffix(q.Name, "."))
+	in := int64(req.Len())
+	remote := ""
+	if addr := w.RemoteAddr(); addr != nil {
+		remote = addr.String()
+	}
+	// hit/miss counters drive the split ratio shown by the panel.
+	call := p.stats.Begin("dns")
 	if p.matches(qname) {
-		call := p.stats.Begin("dns")
+		p.stats.Increment("dns_hit")
 		resp := p.localAnswer(req, q, qname)
 		_ = w.WriteMsg(resp)
-		call.Done(dns.RcodeSuccess, 0, 0, "", w.RemoteAddr().String(), "DNS", qname)
+		call.Done(dns.RcodeSuccess, in, int64(resp.Len()), "", remote, "DNS", qname)
 		return
 	}
-	call := p.stats.Begin("dns")
+	p.stats.Increment("dns_miss")
 	client := &dns.Client{Net: "udp", Timeout: 5 * time.Second}
 	resp, _, err := client.Exchange(req, p.upstream)
 	if err != nil || resp == nil {
-		call.Done(dns.RcodeServerFailure, 0, 0, errString(err), w.RemoteAddr().String(), "DNS", qname)
+		call.Done(dns.RcodeServerFailure, in, 0, errString(err), remote, "DNS", qname)
 		m := new(dns.Msg)
 		m.SetRcode(req, dns.RcodeServerFailure)
 		_ = w.WriteMsg(m)
@@ -115,7 +122,7 @@ func (p *Proxy) serveDNS(w dns.ResponseWriter, req *dns.Msg) {
 		}
 	}
 	_ = w.WriteMsg(resp)
-	call.Done(resp.Rcode, 0, 0, "", w.RemoteAddr().String(), "DNS", qname)
+	call.Done(resp.Rcode, in, int64(resp.Len()), "", remote, "DNS", qname)
 }
 
 func (p *Proxy) localAnswer(req *dns.Msg, q dns.Question, qname string) *dns.Msg {

@@ -196,6 +196,9 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, p string) {
 	case "/api/proxies/test":
 		s.handleProbe(w, r)
 		return
+	case "/api/effect":
+		s.handleEffect(w, r)
+		return
 	case "/api/services":
 		s.handleServices(w, r)
 		return
@@ -228,6 +231,12 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, p string) {
 		return
 	case "/api/cn/restore":
 		s.handleCNRestore(w, r)
+		return
+	case "/api/dns":
+		s.handleDNSStatus(w, r)
+		return
+	case "/api/dns/config":
+		s.handleDNSConfig(w, r)
 		return
 	}
 	if strings.HasPrefix(p, "/api/services/") {
@@ -436,13 +445,22 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	host["mem_total"] = latest.MemTotal
 	host["mem_used"] = latest.MemUsed
 	host["mem_available"] = latest.MemAvailable
+	host["swap_total"] = latest.SwapTotal
+	host["swap_used"] = latest.SwapUsed
 	host["net_rx_rate"] = latest.NetRxRate
 	host["net_tx_rate"] = latest.NetTxRate
 	host["disk_read_rate"] = latest.DiskReadRate
 	host["disk_write_rate"] = latest.DiskWriteRate
 	host["tcp_connections"] = latest.TCPConnections
+	host["established"] = latest.Established
+	host["time_wait"] = latest.TimeWait
+	host["listen"] = latest.Listen
+	host["conntrack"] = latest.Conntrack
 	host["processes"] = latest.Processes
 	host["load1"] = latest.Load1
+	host["load5"] = latest.Load5
+	host["load15"] = latest.Load15
+	host["ifaces"] = s.host.Ifaces()
 	backups, _ := s.backups.List()
 	latestBackup := ""
 	if len(backups) > 0 {
@@ -505,6 +523,9 @@ func (s *Server) certificateSummary() map[string]interface{} {
 	return sum
 }
 
+// metricsRanges maps the accepted range names to their duration in minutes.
+var metricsRanges = map[string]int{"1h": 60, "6h": 360, "24h": 1440}
+
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.guard(w, r); !ok {
 		return
@@ -517,13 +538,12 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if rangeName == "" {
 		rangeName = "1h"
 	}
-	durations := map[string]time.Duration{"1h": time.Hour, "6h": 6 * time.Hour, "24h": 24 * time.Hour}
-	d, ok := durations[rangeName]
+	minutes, ok := metricsRanges[rangeName]
 	if !ok {
 		writeError(w, http.StatusBadRequest, "range must be 1h, 6h or 24h")
 		return
 	}
-	since := time.Now().Add(-d).Unix()
+	since := time.Now().Add(-time.Duration(minutes) * time.Minute).Unix()
 	series := s.host.Series(since)
 	if len(series) > 360 {
 		step := (len(series) + 359) / 360
@@ -534,25 +554,42 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		series = reduced
 	}
 	latest, _ := s.host.Latest()
+	step := metricsStep(minutes)
+	total, per := s.stats.Series(minutes, step)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"range": rangeName, "as_of": config.NowUTC(), "points": series, "latest": latest,
+		"range": rangeName, "as_of": config.NowUTC(), "points": series,
+		"latest": latest, "host": hostInfo(), "ifaces": s.host.Ifaces(),
+		"counters": s.stats.Counters(), "traffic": total,
+		"traffic_total": total, "proxy_series": per, "step_seconds": step,
 	})
 }
 
+// metricsStep picks an aggregation step that keeps the chart series readable.
+func metricsStep(minutes int) int {
+	step := minutes * 60 / 120
+	if step < telemetry.BucketSeconds {
+		step = telemetry.BucketSeconds
+	}
+	return step / telemetry.BucketSeconds * telemetry.BucketSeconds
+}
+
 func (s *Server) proxyOverview(withTest bool) []map[string]interface{} {
-	stats := s.stats.Snapshot()
-	byName := map[string]telemetry.ProxyStats{}
-	for _, st := range stats {
-		byName[st.Name] = st
+	details := s.stats.Detail(60, false)
+	byName := map[string]telemetry.ProxyDetail{}
+	for _, d := range details {
+		byName[d.Name] = d
 	}
 	rows := []map[string]interface{}{}
 	add := func(name, label, path string, enabled bool) {
-		st := byName[name]
+		d := byName[name]
 		rows = append(rows, map[string]interface{}{
 			"name": name, "label": label, "path": path, "enabled": enabled,
-			"requests": st.Requests, "failures": st.Failures,
-			"bytes_in": st.BytesIn, "bytes_out": st.BytesOut,
-			"last_status": st.LastStatus, "last_at": st.LastAt, "last_error": st.LastError,
+			"requests": d.Requests, "failures": d.Failures,
+			"bytes_in": d.BytesIn, "bytes_out": d.BytesOut,
+			"last_status": d.LastStatus, "last_at": d.LastAt, "last_error": d.LastError,
+			"success_rate": round1(d.SuccessRate), "in_flight": d.InFlight,
+			"status_classes": d.StatusClasses, "window": d.Window,
+			"rates": d.Rates, "latency": d.Latency, "targets": d.Targets,
 		})
 	}
 	add("docker", "Docker 镜像代理", "/v2/", s.cfg.Docker.Enabled)
@@ -560,6 +597,11 @@ func (s *Server) proxyOverview(withTest bool) []map[string]interface{} {
 	add("dns", "DNS 分流", s.cfg.DNS.Listen, s.cfg.DNS.Enabled)
 	add("sni", "SNI 入口", s.cfg.Listen.Entry, s.cfg.SNI.Enabled)
 	return rows
+}
+
+// round1 keeps one decimal place for ratios rendered by the panel.
+func round1(v float64) float64 {
+	return float64(int64(v*10+0.5)) / 10
 }
 
 func (s *Server) handleProxies(w http.ResponseWriter, r *http.Request) {

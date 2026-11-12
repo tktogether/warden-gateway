@@ -109,6 +109,10 @@ sudo bash bootstrap.sh install --docker --domain panel.example.com
 | `--dns-upstream ADDR` | DNS 上游，默认 `1.1.1.1:53` |
 | `--cn-setup` | 安装后执行国内机设置 |
 | `--no-cn` | 不询问国内机设置 |
+| `--cn-mode hosts\|dns\|both\|none` | 国内机分流方式 |
+| `--cn-domains LIST` | 国内机参与分流的域名，逗号分隔 |
+| `--docker-mirror URL` | 国内机 Docker 镜像地址，默认网关地址 |
+| `--git-mirror URL` | 国内机 Git 镜像地址，默认网关地址 |
 | `--yes` | 自动确认 |
 | `--non-interactive` | 不进行交互 |
 | `--dry-run` | 只打印安装计划 |
@@ -161,9 +165,10 @@ curl -fL https://panel.example.com/https://github.com/owner/repo/releases/downlo
 
 面板提供：
 
-- 总览：主机负载、内存、磁盘、证书、服务与代理状态。
-- 指标：CPU、内存、网络、磁盘 IO 和连接数趋势。
-- 代理：Docker 镜像代理与 GitHub 代理的请求数、失败数、流量和连通性测试。
+- 总览：主机负载、内存、磁盘、证书、服务与代理状态，代理卡片带成功率和请求速率。
+- 指标：CPU、负载 1/5/15、内存与交换分区、网络吞吐（含分网卡明细）、磁盘 IO、TCP 连接状态分布、连接跟踪、DNS 分流命中率，以及全部代理通道的请求量与流量曲线。
+- 代理：每个通道的请求总数、成功率、进行中请求、近一分钟请求与流量、状态码分布、延迟平均/P50/P90/P99/最大与直方图、热点目标、上游响应耗时、近六十分钟曲线和连通性测试。
+- 效果：直连上游与经代理转发的耗时对比，按 Docker、GitHub、DNS、SNI 四个通道给出差值和结论。
 - 服务：Warden Gateway 的启动、停止和重启。
 - 备份：创建、下载、恢复和删除备份。恢复后自动重启服务。
 - 审计：登录、配置修改和操作记录。
@@ -215,11 +220,13 @@ sudo bash /tmp/wg-bootstrap.sh cn-setup --gateway-ip 192.0.2.10 \
 | 项目 | 说明 |
 | --- | --- |
 | hosts 分流 | 把 GitHub、Docker 相关域名指向网关，使用 443 入口转发 |
-| DNS 分流 | 可选，把 `/etc/resolv.conf` 或 systemd-resolved 指向网关；需要目标机器能访问网关 53 端口 |
+| DNS 分流 | 把 `/etc/resolv.conf` 或 systemd-resolved 指向网关；需要目标机器能访问网关 53 端口 |
 | APT 镜像 | 把 `/etc/apt/sources.list` 和 `sources.list.d` 中的源地址替换为指定镜像 |
 | BBR | 写入 `/etc/sysctl.d/99-warden-cn-bbr.conf`，使用 `fq` 与 `bbr` |
 | Docker 镜像 | 写入 `/etc/docker/daemon.json` 的 `registry-mirrors`，并 reload Docker |
 | Git 镜像 | 写入 `/etc/gitconfig`，改写 `https`、`http`、`git`、`git@github.com:` 和 `ssh://git@github.com/` 地址 |
+
+分流方式由 `--cn-mode` 选择：`hosts`（默认，只改 hosts）、`dns`（只改 resolver）、`both`（两者互为兜底）、`none`（都不改）。参与分流的域名用 `--cn-domains` 指定。面板「设置」页同样提供四项选择，并按选择给出对应命令。
 
 每次修改前自动备份到 `/var/backups/warden-gateway-cn`，最多保留 10 个。恢复：
 

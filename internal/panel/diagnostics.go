@@ -75,44 +75,62 @@ func (s *Server) handleCNStatus(w http.ResponseWriter, r *http.Request) {
 	origin := s.publicOrigin()
 	scriptURL := origin + "/bootstrap.sh"
 	toolboxURL := origin + "/toolbox.sh"
-	mode := "hosts"
-	if s.cfg.DNS.Enabled {
-		mode = "dns"
+	localMode := status.Mode()
+	mode := localMode
+	if mode == "none" {
+		if s.cfg.DNS.Enabled {
+			mode = "dns"
+		} else {
+			mode = "hosts"
+		}
 	}
-	cnArgs := []string{"cn-setup"}
+	baseArgs := []string{"cn-setup"}
 	if gateway != "" {
-		cnArgs = append(cnArgs, "--gateway-ip", gateway)
+		baseArgs = append(baseArgs, "--gateway-ip", gateway)
 	}
 	if origin != "" {
-		cnArgs = append(cnArgs, "--docker-mirror", origin, "--git-mirror", origin)
+		baseArgs = append(baseArgs, "--docker-mirror", origin, "--git-mirror", origin)
 	}
-	cnArgs = append(cnArgs, "--cn-mode", mode, "--yes")
-	command := "sudo bash bootstrap.sh " + strings.Join(cnArgs, " ")
-	toolboxCommand := "sudo bash toolbox.sh " + strings.Join(cnArgs, " ")
-	if origin != "" {
-		command = "curl -fsSL " + scriptURL + " -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh " + strings.Join(cnArgs, " ")
-		toolboxCommand = "curl -fsSL " + toolboxURL + " -o /tmp/wg-toolbox.sh && sudo bash /tmp/wg-toolbox.sh " + strings.Join(cnArgs, " ")
+	cnCommand := func(script, localName, tmpName, splitMode string) string {
+		args := append(append([]string{}, baseArgs...), "--cn-mode", splitMode, "--yes")
+		if origin == "" {
+			return "sudo bash " + localName + " " + strings.Join(args, " ")
+		}
+		return "curl -fsSL " + script + " -o " + tmpName + " && sudo bash " + tmpName + " " + strings.Join(args, " ")
 	}
+	commands := map[string]interface{}{}
+	toolboxCommands := map[string]interface{}{}
+	for _, splitMode := range []string{"hosts", "dns", "both"} {
+		commands[splitMode] = cnCommand(scriptURL, "bootstrap.sh", "/tmp/wg-bootstrap.sh", splitMode)
+		toolboxCommands[splitMode] = cnCommand(toolboxURL, "toolbox.sh", "/tmp/wg-toolbox.sh", splitMode)
+	}
+	command := commands[mode].(string)
+	toolboxCommand := toolboxCommands[mode].(string)
 	restoreCommand := "sudo bash bootstrap.sh cn-restore"
 	if origin != "" {
 		restoreCommand = "curl -fsSL " + scriptURL + " -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh cn-restore"
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"as_of":           config.NowUTC(),
-		"origin":          origin,
-		"gateway_ip":      gateway,
-		"panel_host":      host,
-		"domains":         cn.DefaultDomains(),
-		"script_url":      scriptURL,
-		"toolbox_url":     toolboxURL,
-		"command":         command,
-		"toolbox_command": toolboxCommand,
-		"restore_command": restoreCommand,
-		"cn_mode":         mode,
-		"backup_root":     status.BackupRoot,
-		"latest_backup":   status.LatestBackup,
-		"backups":         status.Backups,
-		"status":          status,
+		"as_of":            config.NowUTC(),
+		"origin":           origin,
+		"gateway_ip":       gateway,
+		"panel_host":       host,
+		"domains":          cn.DefaultDomains(),
+		"script_url":       scriptURL,
+		"toolbox_url":      toolboxURL,
+		"command":          command,
+		"commands":         commands,
+		"toolbox_command":  toolboxCommand,
+		"toolbox_commands": toolboxCommands,
+		"restore_command":  restoreCommand,
+		"cn_mode":          mode,
+		"local_mode":       localMode,
+		"dns":              s.dnsInfo(),
+		"resolver_mode":    localMode,
+		"backup_root":      status.BackupRoot,
+		"latest_backup":    status.LatestBackup,
+		"backups":          status.Backups,
+		"status":           status,
 	})
 }
 
@@ -158,6 +176,7 @@ func (s *Server) handleCNApply(w http.ResponseWriter, r *http.Request) {
 		GitMirror    string   `json:"git_mirror"`
 		GatewayIP    string   `json:"gateway_ip"`
 		Domains      []string `json:"domains"`
+		Mode         string   `json:"mode"`
 		Hosts        bool     `json:"hosts"`
 		DNS          bool     `json:"dns"`
 		APT          bool     `json:"apt"`
@@ -177,7 +196,7 @@ func (s *Server) handleCNApply(w http.ResponseWriter, r *http.Request) {
 	}
 	opts := cn.Options{
 		APTMirror: body.APTMirror, DockerMirror: body.DockerMirror, GitMirror: body.GitMirror,
-		GatewayIP: gateway, Domains: body.Domains,
+		GatewayIP: gateway, Domains: body.Domains, Mode: body.Mode,
 		Hosts: body.Hosts, DNS: body.DNS, APT: body.APT, BBR: body.BBR, Docker: body.Docker, Git: body.Git,
 		APTUpdate: body.APTUpdate,
 	}

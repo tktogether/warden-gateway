@@ -44,6 +44,10 @@ type Options struct {
 	GatewayIP    string   `json:"gateway_ip"`
 	Domains      []string `json:"domains"`
 
+	// Mode selects the redirect method: hosts, dns, both or none. When set
+	// it overrides Hosts and DNS; empty keeps the flags as given.
+	Mode string `json:"mode,omitempty"`
+
 	Hosts     bool `json:"hosts"`
 	DNS       bool `json:"dns"`
 	APT       bool `json:"apt"`
@@ -137,6 +141,9 @@ type DNSStatus struct {
 	Nameservers []string `json:"nameservers"`
 	Managed     string   `json:"managed,omitempty"`
 	GatewayOnly bool     `json:"gateway_only"`
+	// SystemdResolved reports a drop-in written for systemd-resolved.
+	SystemdResolved bool   `json:"systemd_resolved"`
+	ResolvedDNS     string `json:"resolved_dns,omitempty"`
 }
 
 // Status is the read-only view used by the panel and by diagnostics.
@@ -151,6 +158,22 @@ type Status struct {
 	Git          GitStatus    `json:"git"`
 	Hosts        HostsStatus  `json:"hosts"`
 	DNS          DNSStatus    `json:"dns"`
+}
+
+// Mode reports which redirect method is configured on this machine.
+func (st Status) Mode() string {
+	hosts := st.Hosts.Managed
+	dns := st.DNS.Managed != "" || (st.DNS.SystemdResolved && st.DNS.ResolvedDNS != "")
+	switch {
+	case hosts && dns:
+		return "both"
+	case hosts:
+		return "hosts"
+	case dns:
+		return "dns"
+	default:
+		return "none"
+	}
 }
 
 // New returns a Manager bound to the local filesystem.
@@ -364,8 +387,23 @@ func (m *Manager) hostsStatus() HostsStatus {
 
 func (m *Manager) dnsStatus() DNSStatus {
 	st := DNSStatus{Nameservers: []string{}}
+	if dropIn, ok := m.readFile(pathResolvedConf); ok {
+		st.SystemdResolved = true
+		for _, raw := range strings.Split(dropIn, "\n") {
+			line := strings.TrimSpace(raw)
+			if !strings.HasPrefix(line, "DNS=") {
+				continue
+			}
+			if fields := strings.Fields(strings.TrimPrefix(line, "DNS=")); len(fields) > 0 {
+				st.ResolvedDNS = strings.TrimSuffix(fields[0], ",")
+			}
+		}
+	}
 	data, ok := m.readFile(pathResolv)
 	if !ok {
+		if st.Managed == "" {
+			st.Managed = st.ResolvedDNS
+		}
 		return st
 	}
 	managed := false
@@ -384,6 +422,9 @@ func (m *Manager) dnsStatus() DNSStatus {
 		}
 	}
 	st.GatewayOnly = len(st.Nameservers) == 1
+	if st.Managed == "" {
+		st.Managed = st.ResolvedDNS
+	}
 	return st
 }
 

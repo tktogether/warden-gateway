@@ -48,6 +48,27 @@ func DefaultDomains() []string {
 	}
 }
 
+// splitTarget is the resolved pair of redirect flags.
+type splitTarget struct{ hosts, dns bool }
+
+// splitMode resolves Options.Mode into the hosts and DNS flags.
+func (opts Options) splitMode() (splitTarget, error) {
+	switch strings.ToLower(strings.TrimSpace(opts.Mode)) {
+	case "":
+		return splitTarget{hosts: opts.Hosts, dns: opts.DNS}, nil
+	case "hosts":
+		return splitTarget{hosts: true}, nil
+	case "dns":
+		return splitTarget{dns: true}, nil
+	case "both", "all":
+		return splitTarget{hosts: true, dns: true}, nil
+	case "none", "off":
+		return splitTarget{}, nil
+	default:
+		return splitTarget{}, fmt.Errorf("分流方式只能是 hosts、dns、both 或 none：%s", opts.Mode)
+	}
+}
+
 // Apply writes the selected settings and reports every step.
 func (m *Manager) Apply(opts Options) (Report, error) {
 	report := Report{AsOf: time.Now().UTC().Format(time.RFC3339)}
@@ -58,6 +79,11 @@ func (m *Manager) Apply(opts Options) (Report, error) {
 	if len(domains) == 0 {
 		domains = DefaultDomains()
 	}
+	split, err := opts.splitMode()
+	if err != nil {
+		return report, err
+	}
+	opts.Hosts, opts.DNS = split.hosts, split.dns
 	if (opts.Hosts || opts.DNS) && opts.GatewayIP == "" {
 		return report, fmt.Errorf("未指定网关地址，无法写入 hosts 或 DNS 设置")
 	}

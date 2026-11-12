@@ -129,7 +129,7 @@ func New(opts Options) (*App, error) {
 		a.dns = dns
 	}
 	if cfg.SNI.Enabled {
-		a.sni = gateway.NewSNIProxy(cfg.SNI, cfg.Listen.Entry, cfg.Listen.HTTPS, logger)
+		a.sni = gateway.NewSNIProxy(cfg.SNI, cfg.Listen.Entry, cfg.Listen.HTTPS, stats, logger)
 	}
 	return a, nil
 }

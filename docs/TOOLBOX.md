@@ -56,11 +56,18 @@ sudo bash /tmp/warden-toolbox.sh
 
 ```bash
 sudo bash toolbox.sh doctor        # 项目自身与国内机配置两段诊断
-sudo bash toolbox.sh cn-setup      # 应用 hosts/DNS 分流、APT、Docker、Git 镜像和 BBR
+sudo bash toolbox.sh cn-setup      # 应用分流、APT、Docker、Git 镜像和 BBR
 sudo bash toolbox.sh cn-restore    # 恢复最近一次国内机设置备份
 ```
 
-`cn-setup` 和 `cn-restore` 都是 `bootstrap.sh` 的子命令，工具箱直接透传参数。
+`cn-setup` 和 `cn-restore` 都是 `bootstrap.sh` 的子命令，工具箱直接透传参数。分流方式由 `--cn-mode` 选择：
+
+```bash
+sudo bash toolbox.sh cn-setup --gateway-ip 192.0.2.10 --cn-mode both --yes
+sudo bash toolbox.sh cn-setup --gateway-ip 192.0.2.10 --cn-mode none --yes
+```
+
+`hosts` 只改 hosts，`dns` 只改 resolver，`both` 两者互为兜底，`none` 都不改。不带 `--cn-mode` 时按 hosts 处理。
 
 可用环境变量：
 

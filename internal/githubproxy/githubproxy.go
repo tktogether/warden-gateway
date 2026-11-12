@@ -118,17 +118,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	req.Header.Set("X-Forwarded-Host", r.Host)
 	req.Header.Set("X-Forwarded-For", clientIP(r))
 	call := h.stats.Begin("github")
+	targetHost := target.Hostname()
 	started := time.Now()
+	upstreamMs := int64(0)
+	stopUpstream := func() {
+		if upstreamMs == 0 {
+			upstreamMs = time.Since(started).Milliseconds()
+		}
+	}
 	resp, err := h.client.Do(req)
+	if err == nil {
+		stopUpstream()
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			http.Error(w, "upstream request timed out", http.StatusGatewayTimeout)
-			call.Done(http.StatusGatewayTimeout, r.ContentLength, 0, err.Error(), r.RemoteAddr, r.Method, r.URL.Path)
+			call.DoneTarget(targetHost, http.StatusGatewayTimeout, r.ContentLength, 0, err.Error(), r.RemoteAddr, r.Method, r.URL.Path)
 			return
 		}
 		h.log.Debugf("github proxy: %s %s: %v", r.Method, target.Redacted(), err)
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
-		call.Done(http.StatusBadGateway, r.ContentLength, 0, err.Error(), r.RemoteAddr, r.Method, r.URL.Path)
+		call.DoneTarget(targetHost, http.StatusBadGateway, r.ContentLength, 0, err.Error(), r.RemoteAddr, r.Method, r.URL.Path)
 		return
 	}
 	defer resp.Body.Close()
@@ -139,7 +149,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if copyErr != nil {
 		errText = copyErr.Error()
 	}
-	call.Done(resp.StatusCode, r.ContentLength, n, errText, r.RemoteAddr, r.Method, r.URL.Path)
+	call.DoneUpstream(targetHost, upstreamMs, resp.StatusCode, r.ContentLength, n, errText, r.RemoteAddr, r.Method, r.URL.Path)
 	h.log.Debugf("github proxy: %s %s -> %d %dB in %dms", r.Method, target.Redacted(), resp.StatusCode, n, time.Since(started).Milliseconds())
 }
 

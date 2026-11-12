@@ -223,6 +223,10 @@ Warden Gateway 一键安装脚本
   --no-git               国内机设置不修改 Git 镜像
   --no-apt-update        国内机设置不执行 apt-get update
   --apt-mirror URL       APT 镜像地址，默认 https://mirrors.aliyun.com
+  --docker-mirror URL    国内机 Docker 镜像地址，默认使用网关地址
+  --git-mirror URL       国内机 Git 镜像地址，默认使用网关地址
+  --cn-domains LIST      国内机参与分流的域名，逗号分隔
+  --cn-mode MODE         国内机分流方式：hosts、dns、both、none，默认 hosts
   --cn-id ID             恢复的国内机设置备份
   --yes                  自动确认
   --non-interactive      不进行交互
@@ -424,8 +428,8 @@ validate_options() {
     die "网关地址不是 IPv4：$CN_GATEWAY"
   fi
   case "$CN_SPLIT_MODE" in
-    hosts|dns) ;;
-    *) die "分流方式只能是 hosts 或 dns：$CN_SPLIT_MODE";;
+    hosts|dns|both|none) ;;
+    *) die "分流方式只能是 hosts、dns、both 或 none：$CN_SPLIT_MODE";;
   esac
   if [ -n "$CN_APT_MIRROR" ]; then
     case "$CN_APT_MIRROR" in
@@ -1023,16 +1027,36 @@ EOF
   ok "Git 镜像已设置为 $mirror"
 }
 
+cn_mode_label() {
+  case "$1" in
+    hosts) printf '仅 hosts';;
+    dns) printf '仅 DNS';;
+    both) printf 'hosts 与 DNS';;
+    none) printf '不启用分流';;
+    *) printf '%s' "$1";;
+  esac
+}
+
+cn_mode_wants_hosts() {
+  case "$CN_SPLIT_MODE" in hosts|both) return 0;; esac
+  return 1
+}
+
+cn_mode_wants_dns() {
+  case "$CN_SPLIT_MODE" in dns|both) return 0;; esac
+  return 1
+}
+
 cn_option_summary() {
   local hosts_state dns_state apt_state bbr_state docker_state git_state
-  if [ "$CN_DO_HOSTS" -eq 1 ]; then hosts_state="启用"; else hosts_state="跳过"; fi
-  if [ "$CN_SPLIT_MODE" = "dns" ]; then dns_state="启用"; else dns_state="跳过"; fi
+  if [ "$CN_DO_HOSTS" -eq 1 ] && cn_mode_wants_hosts; then hosts_state="启用"; else hosts_state="跳过"; fi
+  if cn_mode_wants_dns; then dns_state="启用"; else dns_state="跳过"; fi
   if [ "$CN_DO_APT" -eq 1 ]; then apt_state="$CN_APT_MIRROR"; else apt_state="跳过"; fi
   if [ "$CN_DO_BBR" -eq 1 ]; then bbr_state="启用"; else bbr_state="跳过"; fi
   if [ "$CN_DO_DOCKER" -eq 1 ]; then docker_state="${CN_DOCKER_MIRROR:-$CN_GATEWAY}"; else docker_state="跳过"; fi
   if [ "$CN_DO_GIT" -eq 1 ]; then git_state="${CN_GIT_MIRROR:-$CN_GATEWAY}"; else git_state="跳过"; fi
   kv "网关地址" "$CN_GATEWAY"
-  kv "分流方式" "$CN_SPLIT_MODE"
+  kv "分流方式" "$(cn_mode_label "$CN_SPLIT_MODE")"
   kv "hosts" "$hosts_state"
   kv "DNS" "$dns_state"
   kv "APT 镜像" "$apt_state"
@@ -1053,10 +1077,21 @@ interactive_cn_options() {
   CN_GATEWAY="$(ask "网关地址（代理机 IP）" "$CN_GATEWAY")"
   CN_DOMAINS="${CN_DOMAINS:-$CN_DEFAULT_DOMAINS}"
   CN_DOMAINS="$(ask "参与分流的域名" "$CN_DOMAINS")"
-  if ask_yes "写入 hosts 条目？" 1; then CN_DO_HOSTS=1; else CN_DO_HOSTS=0; fi
-  if ask_yes "把 DNS 指向网关？" 0; then CN_SPLIT_MODE="dns"; else CN_SPLIT_MODE="hosts"; fi
-  if [ "$CN_DO_HOSTS" -eq 0 ] && [ "$CN_SPLIT_MODE" != "dns" ]; then
-    warn "hosts 与 DNS 都未启用，国内分流不会生效"
+  local mode_answer
+  say "分流方式：1 仅 hosts（不改 resolver）；2 仅 DNS（resolver 指向网关）；3 hosts 与 DNS；4 不启用分流"
+  mode_answer="$(ask "分流方式" "$CN_SPLIT_MODE")"
+  case "$mode_answer" in
+    1|hosts|仅\ hosts) CN_SPLIT_MODE="hosts";;
+    2|dns|仅\ DNS) CN_SPLIT_MODE="dns";;
+    3|both|两者) CN_SPLIT_MODE="both";;
+    4|none|不分流) CN_SPLIT_MODE="none";;
+    *) warn "未识别的分流方式，保持 $CN_SPLIT_MODE";;
+  esac
+  if cn_mode_wants_dns; then
+    say "DNS 模式需要目标机把 resolver 指向网关，并允许访问网关 53 端口（UDP/TCP）。"
+  fi
+  if [ "$CN_SPLIT_MODE" = "none" ]; then
+    warn "未启用 hosts 与 DNS，国内分流不会生效"
   fi
   if ask_yes "修改 APT 镜像？" 1; then
     CN_DO_APT=1
@@ -1099,10 +1134,10 @@ cn_setup() {
   CN_CHANGED=0
   cn_begin_backup
   local failed=0
-  if [ "$CN_DO_HOSTS" -eq 1 ]; then
+  if [ "$CN_DO_HOSTS" -eq 1 ] && cn_mode_wants_hosts; then
     cn_apply_hosts "$CN_GATEWAY" "$CN_DOMAINS" || failed=1
   fi
-  if [ "$CN_SPLIT_MODE" = "dns" ]; then
+  if cn_mode_wants_dns; then
     cn_apply_dns "$CN_GATEWAY" || failed=1
   fi
   if [ "$CN_DO_APT" -eq 1 ]; then
@@ -1406,7 +1441,16 @@ doctor_cn() {
     doctor_skip "hosts 条目" "未写入"
   fi
   dns_server=""
-  if [ -f /etc/resolv.conf ]; then
+  local resolved_file resolved_dns
+  for resolved_file in /etc/systemd/resolved.conf.d/warden-cn.conf /usr/lib/systemd/resolved.conf.d/warden-cn.conf /run/systemd/resolved.conf.d/warden-cn.conf; do
+    [ -f "$resolved_file" ] || continue
+    resolved_dns="$(awk -F= '/^DNS=/{print $2}' "$resolved_file" | head -n 1 | tr -d ' ' | cut -d, -f1)"
+    [ -n "$resolved_dns" ] || continue
+    dns_server="$resolved_dns"
+    doctor_ok "resolver" "systemd-resolved 指向 $dns_server"
+    break
+  done
+  if [ -z "$dns_server" ] && [ -f /etc/resolv.conf ]; then
     dns_server="$(awk '$1=="nameserver"{print $2}' /etc/resolv.conf | head -n 1)"
   fi
   if [ -n "$gateway" ] && [ "$dns_server" = "$gateway" ]; then
