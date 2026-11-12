@@ -685,7 +685,8 @@ prepare_update_scripts() {
   local self dir path
   self="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
   [ "$self" = "$SCRIPT_DIR/bootstrap.sh" ] || return 1
-  dir="$(mktemp -d)" || return 1
+  find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'warden-update.*' -mmin +180 -exec rm -rf {} + 2>/dev/null || true
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/warden-update.XXXXXX")" || return 1
   for path in bootstrap.sh toolbox.sh; do
     if ! fetch_repo_raw "$path" "$dir/$path"; then
       warn "未能获取最新 $path，继续使用当前脚本"
@@ -789,14 +790,19 @@ install_service() {
 }
 
 wait_health() {
-  local url="$1" host i
+  local url="$1" allow_local="${2:-0}" host i local_url
   host="$(printf '%s' "$url" | sed 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##' | cut -d/ -f1 | cut -d: -f1)"
-  for i in $(seq 1 20); do
+  local_url="http://127.0.0.1:8080$PANEL_BASE_PATH/api/health"
+  for i in $(seq 1 30); do
     if curl -kfsS --connect-timeout 2 --max-time 3 "$url/api/health" >/dev/null 2>&1; then return 0; fi
     case "$url" in
       https://*)
         if curl -kfsS --connect-timeout 2 --max-time 3 --resolve "$host:443:127.0.0.1" "$url/api/health" >/dev/null 2>&1; then return 0; fi;;
     esac
+    if [ "$allow_local" -eq 1 ] && curl -fsS --connect-timeout 2 --max-time 3 "$local_url" >/dev/null 2>&1; then
+      warn "公网地址健康检查未通过，本机接口正常"
+      return 0
+    fi
     sleep 1
   done
   return 1
@@ -1575,7 +1581,10 @@ cmd_update() {
   detect_installed_mode
   if [ "${NW_UPDATE_REEXEC:-0}" != "1" ] && prepare_update_scripts; then
     info "脚本" "使用仓库最新脚本执行升级"
-    NW_UPDATE_REEXEC=1 exec bash "$UPDATE_SCRIPT_DIR/bootstrap.sh" "$@"
+    NW_UPDATE_REEXEC=1 UPDATE_SCRIPT_DIR="$UPDATE_SCRIPT_DIR" exec bash "$UPDATE_SCRIPT_DIR/bootstrap.sh" "${ORIG_ARGS[@]}"
+  fi
+  if [ "${NW_UPDATE_REEXEC:-0}" = "1" ] && [ -n "${UPDATE_SCRIPT_DIR:-}" ]; then
+    trap 'rm -rf "$UPDATE_SCRIPT_DIR"' EXIT
   fi
   title "Warden Gateway 升级"
   if [ -z "$PUBLIC_URL" ]; then PUBLIC_URL="$(config_public_url)"; fi
@@ -1596,7 +1605,7 @@ cmd_update() {
     systemctl start "$SERVICE"
   fi
   sleep 2
-  if [ -n "$PUBLIC_URL" ] && wait_health "$PUBLIC_URL"; then ok "升级完成"; else warn "升级后健康检查未通过"; fi
+  if [ -n "$PUBLIC_URL" ] && wait_health "$PUBLIC_URL" 1; then ok "升级完成"; else warn "升级后健康检查未通过"; fi
 }
 
 cmd_uninstall() {
@@ -1690,6 +1699,7 @@ cmd_self_test() {
 }
 
 main() {
+  ORIG_ARGS=("$@")
   parse_args "$@"
   case "$COMMAND" in
     install) cmd_install;;
