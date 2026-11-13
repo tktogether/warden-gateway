@@ -215,8 +215,10 @@ func (a *App) Start(ctx context.Context) error {
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	// The SNI entry relays panel traffic to this listener, so accept the PROXY
+	// protocol header it prepends and report the real client address.
 	go func() {
-		if err := a.httpsSrv.ServeTLS(httpsLn, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := a.httpsSrv.ServeTLS(gateway.WithProxyProtocol(httpsLn), "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()

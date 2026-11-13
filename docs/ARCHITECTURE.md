@@ -76,6 +76,8 @@ GET https://panel.example.com/https://github.com/owner/repo/... -> SNI -> 8443 -
 
 审计日志记录登录、修改密钥、服务操作、备份、证书操作与 DNS 配置，单个文件超过 5 MiB 时轮转。
 
+面板流量经 SNI 入口中继进入 HTTPS 监听，未经中继时来源为回环地址。SNI 入口在转交面板连接前写入 PROXY 协议 v1 头，HTTPS 监听解析后以真实客户端地址填充 RemoteAddr，因此审计记录与登录限流使用真实来源 IP；直通连接不写该头。
+
 ## 备份
 
 备份为 tar.gz，包含 `config/config.json`、`data/acme/**` 和 `systemd/warden-gateway.service`。每个归档生成同名 JSON 清单，记录大小、SHA-256 和文件列表。

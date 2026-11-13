@@ -81,6 +81,7 @@ type SNIProxy struct {
 	matcher   *HostMatcher
 	stats     *telemetry.Store
 	log       *logging.Logger
+	dial      func(network, addr string, timeout time.Duration) (net.Conn, error)
 	listener  net.Listener
 	mu        sync.Mutex
 	conns     map[net.Conn]struct{}
@@ -99,6 +100,7 @@ func NewSNIProxy(cfg config.SNIConfig, entryAddr, panelAddr string, stats *telem
 		matcher:   NewHostMatcher(cfg.Passthrough),
 		stats:     stats,
 		log:       log,
+		dial:      net.DialTimeout,
 		conns:     make(map[net.Conn]struct{}),
 	}
 }
@@ -229,7 +231,11 @@ func (s *SNIProxy) handle(client net.Conn) {
 		call.Done(0, 0, 0, "host not allowed: "+name, remote, "TLS", name)
 		return
 	}
-	upstream, err := net.DialTimeout("tcp", target, 10*time.Second)
+	dial := s.dial
+	if dial == nil {
+		dial = net.DialTimeout
+	}
+	upstream, err := dial("tcp", target, 10*time.Second)
 	if err != nil {
 		s.log.Warnf("sni: dial %s: %v", target, err)
 		call.Done(0, 0, 0, "dial "+target+": "+err.Error(), remote, "TLS", name)
@@ -237,6 +243,16 @@ func (s *SNIProxy) handle(client net.Conn) {
 	}
 	defer upstream.Close()
 	_ = upstream.SetDeadline(time.Now().Add(10 * time.Second))
+	// The panel listener sits behind this relay, so it can only learn the client
+	// address from a PROXY protocol header. Passthrough connections go straight
+	// to a third-party server and must stay untouched.
+	if target == s.panelAddr {
+		if err := writeProxyHeader(upstream, client.RemoteAddr(), client.LocalAddr()); err != nil {
+			s.log.Debugf("sni: write proxy header to %s: %v", target, err)
+			call.Done(0, 0, 0, "write proxy header: "+err.Error(), remote, "TLS", name)
+			return
+		}
+	}
 	if _, err := upstream.Write(hello); err != nil {
 		s.log.Debugf("sni: write hello to %s: %v", target, err)
 		call.Done(0, 0, 0, "write hello: "+err.Error(), remote, "TLS", name)
