@@ -23,8 +23,9 @@ const (
 	// proxyHeaderMax is the longest PROXY protocol v1 header, CRLF included.
 	proxyHeaderMax = 107
 	// proxyHeaderTimeout bounds the wait for a header from a peer that stays
-	// silent. The relay writes the header before forwarding anything, so a real
-	// client never waits here; the bound only protects against a stalled peer.
+	// silent. net/http reads RemoteAddr (and therefore this header) before it
+	// installs the TLS handshake deadline, so the bound has to come from here:
+	// without it a silent peer would hold a connection goroutine forever.
 	proxyHeaderTimeout = 5 * time.Second
 )
 
