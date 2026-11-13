@@ -105,6 +105,23 @@ func TestPortDriftExcludesClashController(t *testing.T) {
 	}
 }
 
+// touchFixture stamps both the main configuration and the node file, so a test
+// can place the whole configuration before the fake unit start. The main
+// configuration is written during setup and would otherwise carry the current
+// time and look newer than any past start.
+func touchFixture(root string, at time.Time) error {
+	paths := []string{
+		filepath.Join(root, "config.json"),
+		filepath.Join(root, "conf", "Hysteria2-12538.json"),
+	}
+	for _, path := range paths {
+		if err := os.Chtimes(path, at, at); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func TestPendingRestartDetectsNewerNodeFile(t *testing.T) {
 	m, root := newTestManager(t)
 	writeConf(t, root, "Hysteria2-12538.json", hysteriaBody)
@@ -112,9 +129,8 @@ func TestPendingRestartDetectsNewerNodeFile(t *testing.T) {
 	previousStart := unitStartedAtHook
 	unitStartedAtHook = func(string) (time.Time, error) { return started, nil }
 	t.Cleanup(func() { unitStartedAtHook = previousStart })
-	nodePath := filepath.Join(root, "conf", "Hysteria2-12538.json")
 	old := started.Add(-time.Hour)
-	if err := os.Chtimes(nodePath, old, old); err != nil {
+	if err := touchFixture(root, old); err != nil {
 		t.Skipf("chtimes unsupported: %v", err)
 	}
 	pending, _, _ := m.pendingRestart()
@@ -122,7 +138,7 @@ func TestPendingRestartDetectsNewerNodeFile(t *testing.T) {
 		t.Fatal("an unchanged node file must not look pending")
 	}
 	newer := started.Add(time.Minute)
-	if err := os.Chtimes(nodePath, newer, newer); err != nil {
+	if err := os.Chtimes(filepath.Join(root, "conf", "Hysteria2-12538.json"), newer, newer); err != nil {
 		t.Fatalf("chtimes: %v", err)
 	}
 	pending, changedAt, startedAt := m.pendingRestart()
@@ -141,9 +157,8 @@ func TestPendingRestartIgnoresClockSkew(t *testing.T) {
 	previousStart := unitStartedAtHook
 	unitStartedAtHook = func(string) (time.Time, error) { return started, nil }
 	t.Cleanup(func() { unitStartedAtHook = previousStart })
-	nodePath := filepath.Join(root, "conf", "Hysteria2-12538.json")
 	near := started.Add(time.Second)
-	if err := os.Chtimes(nodePath, near, near); err != nil {
+	if err := touchFixture(root, near); err != nil {
 		t.Skipf("chtimes unsupported: %v", err)
 	}
 	if pending, _, _ := m.pendingRestart(); pending {
