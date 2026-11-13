@@ -82,18 +82,6 @@
     return d.toLocaleTimeString('zh-CN', { hour12: false });
   }
 
-  function flashNote(node) {
-    if (!node) { return; }
-    node.classList.remove('note-fade');
-    void node.offsetWidth;
-    node.classList.add('note-fade');
-  }
-  function flashBody(node) {
-    if (!node) { return; }
-    node.classList.remove('soft-update');
-    void node.offsetWidth;
-    node.classList.add('soft-update');
-  }
   function noteUpdated(selector, at, seconds, extra) {
     var node = qs(selector);
     if (!node) { return; }
@@ -102,7 +90,6 @@
     if (extra) { parts.push(extra); }
     node.textContent = '更新于 ' + fmtClock(at);
     node.title = parts.join(' · ');
-    flashNote(node);
   }
 
   function currentViewFromHash() {
@@ -327,8 +314,9 @@
     var p = el('span', 'status-pill' + (kind ? ' ' + kind : ''), text);
     return p;
   }
-  function infoList(items) {
-    var dl = el('dl', 'dl');
+  function infoList(items, opts) {
+    opts = opts || {};
+    var dl = el('dl', opts.two ? 'dl two' : 'dl');
     items.forEach(function (it) {
       add(dl, el('dt', '', it[0]));
       var dd = el('dd');
@@ -432,7 +420,6 @@
       recent.appendChild(rows);
     }
     box.appendChild(recent);
-    if (silent) { flashBody(box); }
   }
 
   function panel(title, body, cls) {
@@ -731,7 +718,6 @@
     lower.appendChild(rightStack);
     box.appendChild(lower);
 
-    if (silent) { flashBody(box); }
     setTimeout(function () {
       drawSeries('chart-cpu', points, [function (p) { return Number(p.cpu_percent) || 0; }], ['#52d3c5'], 100, { format: 'percent', labels: ['CPU'] });
       drawSeries('chart-mem', points, [function (p) { return p.mem_total ? p.mem_used / p.mem_total * 100 : 0; }, function (p) { return p.swap_total ? p.swap_used / p.swap_total * 100 : 0; }], ['#7cc4ff', '#f472b6'], 100, { format: 'percent', labels: ['内存', '交换'] });
@@ -776,6 +762,23 @@
       return Math.abs(n) < 1 ? n.toFixed(3) : n.toFixed(2);
     }
     return shortNumber(value);
+  }
+
+  function chartStep(raw, format) {
+    raw = Number(raw);
+    if (!(raw > 0) || !isFinite(raw)) { return 1; }
+    var binary = format === 'bytes' || format === 'rate' || ((format === 'count' || !format) && raw >= 1024);
+    if (binary) { return Math.pow(2, Math.ceil(Math.log(raw) / Math.LN2 - 1e-9)); }
+    var exp = Math.floor(Math.log(raw) / Math.LN10);
+    var base = Math.pow(10, exp);
+    var f = raw / base;
+    var mant = format === 'load' || format === 'percent'
+      ? [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]
+      : [1, 2, 3, 4, 5, 6, 8, 10];
+    for (var i = 0; i < mant.length; i++) {
+      if (f <= mant[i] + 1e-9) { return mant[i] * base; }
+    }
+    return 20 * base;
   }
 
   function chartCard(title, sub, id, legend) {
@@ -859,21 +862,21 @@
     roundRect(ctx, 0, 0, geom.width, geom.height, 10);
     ctx.fill();
 
-    var max = Number(reg.fixedMax) || 0;
+    var fixed = Number(reg.fixedMax) || 0;
+    var dataMax = 0;
     getters.forEach(function (g) {
       points.forEach(function (p) {
         var v = Number(g(p)) || 0;
-        if (v < 0) { v = 0; }
-        if (!max && v > max) { max = v; }
+        if (v > dataMax) { dataMax = v; }
       });
     });
+    var divisions = fixed > 0 ? 4 : 3;
+    var max = fixed > 0 ? fixed : chartStep(dataMax / divisions, format) * divisions;
     if (!max || !isFinite(max)) { max = 1; }
-    max = max * 1.15;
 
     ctx.font = '10px system-ui, sans-serif';
-    var topValue = max / 1.15;
     var ticks = [];
-    for (var t = 0; t <= 3; t++) { ticks.push(formatValue(topValue * (3 - t) / 3, format)); }
+    for (var t = 0; t <= divisions; t++) { ticks.push(formatValue(max * (divisions - t) / divisions, format)); }
     var needPad = 0;
     ticks.forEach(function (label) { needPad = Math.max(needPad, ctx.measureText(label).width); });
     needPad = Math.ceil(needPad) + 12;
@@ -891,8 +894,8 @@
 
     ctx.strokeStyle = cssVar('--chart-grid', 'rgba(35, 49, 63, 0.65)');
     ctx.lineWidth = 1;
-    for (var i = 0; i <= 3; i++) {
-      var gy = padT + h * i / 3;
+    for (var i = 0; i <= divisions; i++) {
+      var gy = padT + h * i / divisions;
       ctx.beginPath();
       ctx.moveTo(padL, gy);
       ctx.lineTo(padL + w, gy);
@@ -900,8 +903,8 @@
     }
     ctx.fillStyle = cssVar('--chart-axis', '#64748b');
     ctx.textAlign = 'right';
-    for (var j = 0; j <= 3; j++) {
-      var yy = padT + h * j / 3 + 3;
+    for (var j = 0; j <= divisions; j++) {
+      var yy = padT + h * j / divisions + 3;
       ctx.fillText(ticks[j], padL - 6, yy);
     }
 
@@ -1166,7 +1169,6 @@
     proxies.forEach(function (p) { grid.appendChild(proxyCard(p)); });
     box.appendChild(grid);
 
-    if (silent) { flashBody(box); }
     setTimeout(function () {
       proxies.forEach(function (p) {
         drawSeries('px-' + p.name, p.series || [], [function (pt) { return Number(pt.requests) || 0; }, function (pt) { return Number(pt.failures) || 0; }], ['#52d3c5', '#f87171'], 0, { format: 'count', labels: ['请求', '失败'] });
@@ -1273,20 +1275,20 @@
     }
 
     var series = data.series || [];
-    if (silent) { flashBody(box); }
     setTimeout(function () {
       drawSeries('chart-effect-req', series, [function (p) { return p.requests; }, function (p) { return p.failures; }], ['#52d3c5', '#f472b6'], 0, { format: 'count', labels: ['请求', '失败'] });
       drawSeries('chart-effect-bytes', series, [function (p) { return p.bytes_in; }, function (p) { return p.bytes_out; }], ['#7cc4ff', '#fbbf24'], 0, { format: 'bytes', labels: ['入站', '出站'] });
     }, 30);
   }
 
-  function tablePanel(title, headers, rows) {
+  function tablePanel(title, headers, rows, opts) {
+    opts = opts || {};
     var wrap = el('div', 'panel');
     add(wrap, el('h3', '', title));
     var box = el('div', 'table-wrap');
-    var table = el('table', 'data-table');
+    var table = el('table', 'data-table' + (opts.rightNum ? ' right-num' : ''));
     var thead = el('thead'), trh = el('tr');
-    headers.forEach(function (h) { add(trh, el('th', '', h)); });
+    headers.forEach(function (h, i) { add(trh, el('th', i > 2 ? 'num' : '', h)); });
     thead.appendChild(trh); table.appendChild(thead);
     var tbody = el('tbody');
     rows.forEach(function (row) {
@@ -1350,7 +1352,6 @@
     box.appendChild(banner);
     box.appendChild(diagSection(report.project));
     if (cn) { box.appendChild(cnCommandPanel(cn)); }
-    if (silent) { flashBody(box); }
   }
 
   function diagSection(section) {
@@ -1472,7 +1473,6 @@
   function renderBackups(silent) {
     var box = qs('#backups-content');
     clear(box);
-    if (silent) { flashBody(box); }
     if (!state.backups.length) {
       box.appendChild(el('div', 'empty', '还没有备份。点击“创建备份”生成第一个备份。'));
       return;
@@ -1562,10 +1562,9 @@
       state.audit = data.items || [];
       lastRefresh.audit = Date.now();
       clear(box);
-      if (silent) { flashBody(box); }
       if (!state.audit.length) { box.appendChild(el('div', 'empty', '没有匹配的记录')); return; }
       var rows = state.audit.map(function (it) { return [fmtTime(it.ts), it.action, it.detail, it.result, it.ip]; });
-      box.appendChild(tablePanel('操作记录', ['时间', '操作', '详情', '结果', '来源 IP'], rows));
+      box.appendChild(tablePanel('操作记录', ['时间', '操作', '详情', '结果', '来源 IP'], rows, { rightNum: true }));
       noteUpdated('#audit-note', data.as_of, refreshSeconds.audit, q ? '搜索 “' + q + '”' : state.audit.length + ' 条记录');
     } catch (err) {
       if (!silent) {
@@ -1674,7 +1673,7 @@
     var running = !!dns.running;
     var enabled = !!dns.enabled;
     var activePort = dns.active_port || '';
-    var panel = el('div', 'panel');
+    var panel = el('div', 'panel span-2');
     add(panel, el('h3', '', '网关 DNS 分流服务'));
     add(panel, el('p', 'muted', '启用后优先监听 53 端口应答分流域名并转发其余查询；53 被占用时自动回退到其他端口，不会影响面板与其他代理。修改后网关自动重启。'));
     var items = [
@@ -1686,7 +1685,7 @@
       ['分流域名', String((dns.domains || cn.domains || []).length) + ' 个']
     ];
     if (dns.error) { items.push(['错误', dns.error]); }
-    panel.appendChild(infoList(items));
+    panel.appendChild(infoList(items, { two: true }));
     if (running && activePort && activePort !== '53') {
       var warnBox = el('div', 'alert warn');
       add(warnBox, el('span', '', '53 端口被占用，已回退到 ' + activePort + '。'));
@@ -1807,7 +1806,6 @@
     grid.appendChild(configPanel);
 
     box.appendChild(grid);
-    if (silent) { flashBody(box); }
   }
 
   function field(label, type) {
@@ -1979,7 +1977,6 @@
         return [b.name, fmtBytes(b.size), fmtTime(b.modified)];
       })));
     }
-    if (silent) { flashBody(box); }
   }
 
   function sbDriftNotice(drift) {

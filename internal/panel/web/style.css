@@ -167,6 +167,7 @@ input:focus { border-color: rgba(82, 211, 197, 0.65); box-shadow: 0 0 0 3px rgba
   display: inline-flex; align-items: center; justify-content: center; gap: 8px;
   border: 1px solid var(--line); background: var(--panel-2); color: var(--text);
   border-radius: 10px; padding: 9px 14px; transition: 0.15s; min-height: 38px;
+  text-decoration: none; white-space: nowrap;
 }
 .btn:hover { border-color: var(--btn-hover-line); background: var(--btn-hover-bg); }
 .btn.primary { background: linear-gradient(180deg, #43c6b7, #2fa89b); border-color: #43c6b7; color: #061211; font-weight: 700; }
@@ -286,6 +287,7 @@ html[data-theme="light"] .dot-red { background: #dc2626; }
 .stack { display: grid; gap: 16px; }
 .stack > .panel + .panel { margin-top: 0; }
 .dl { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 8px 12px; font-size: 13px; }
+.dl.two { grid-template-columns: 120px minmax(0, 1fr) 120px minmax(0, 1fr); gap: 10px 16px; }
 .dl dt { color: var(--muted); }
 .dl dd { margin: 0; overflow-wrap: anywhere; }
 
@@ -391,6 +393,7 @@ html[data-theme="light"] .dot-red { background: #dc2626; }
 .data-table th { color: var(--muted); font-weight: 500; font-size: 12px; background: var(--bg-soft); }
 .data-table tr:last-child td { border-bottom: 0; }
 .data-table td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.data-table.right-num th.num, .data-table.right-num td.num { text-align: right; }
 
 .diag-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .diag-head h3 { margin: 0; }
@@ -406,8 +409,9 @@ html[data-theme="light"] .dot-red { background: #dc2626; }
 .command-label { font-size: 12px; color: var(--muted); }
 .copy-sink { position: fixed; left: -9999px; top: 0; opacity: 0; }
 
-.toolbar { display: flex; gap: 8px; align-items: center; }
-.toolbar input { min-width: 220px; }
+.toolbar { display: flex; gap: 8px; align-items: stretch; flex: 0 0 auto; }
+.toolbar input { min-width: 220px; flex: 1 1 auto; height: 44px; }
+.toolbar .btn { flex: 0 0 auto; min-height: 44px; padding: 0 16px; }
 .command-box { display: flex; gap: 8px; align-items: flex-start; }
 .command-box code {
   flex: 1; display: block; background: var(--code-bg); border: 1px solid var(--line);
@@ -417,8 +421,13 @@ html[data-theme="light"] .dot-red { background: #dc2626; }
 .config-view { background: var(--code-bg); border: 1px solid var(--line); border-radius: 11px; padding: 14px; overflow: auto; max-height: 420px; }
 .config-view pre { margin: 0; font: 12px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--pre-text); }
 
-.settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+.settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: stretch; }
 .settings-grid .span-2 { grid-column: 1 / -1; }
+.settings-grid > .panel { display: flex; flex-direction: column; }
+.settings-grid > .panel > form { display: flex; flex-direction: column; flex: 1; }
+.settings-grid > .panel > form .form-actions,
+.settings-grid > .panel > .form-actions,
+.settings-grid > .panel > .btn:last-child { margin-top: auto; }
 .section-title { font-size: 14px; margin-bottom: 12px; }
 .form-grid { display: grid; gap: 12px; }
 .form-grid label { display: grid; gap: 6px; font-size: 12px; color: var(--muted); }
@@ -442,18 +451,14 @@ html[data-theme="light"] .dot-red { background: #dc2626; }
 .empty { padding: 26px; text-align: center; color: var(--muted); border: 1px dashed var(--line); border-radius: 12px; }
 
 @keyframes shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
-@keyframes softFade { from { opacity: 0.45; } to { opacity: 1; } }
-@keyframes noteFade { from { opacity: 0.25; transform: translateY(-1px); } to { opacity: 1; transform: none; } }
-.soft-update { animation: softFade 0.42s ease; }
-.note-fade { animation: noteFade 0.52s ease; }
 @media (prefers-reduced-motion: reduce) {
-  .soft-update, .note-fade { animation: none; }
+  .skeleton { animation: none; }
 }
 
 .sb-toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
 .sb-core { margin-bottom: 16px; }
 .sb-core h3 { margin: 0 0 4px; }
-.sb-core .stat-grid { margin: 12px 0; }
+.sb-core .stat-grid { margin: 12px 0; grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .sb-core-hint { margin: 0 0 12px; font-size: 12px; }
 .sb-nodes { display: grid; gap: 14px; margin-bottom: 16px; }
 .sb-node {
