@@ -112,7 +112,7 @@ GET 请求，返回最近 `minutes`（5 到 60，默认 60）的承载统计。�
 | GET | `/api/singbox/connections` | 活动连接，需要先开启实时统计（主配置含 `experimental.clash_api`） |
 | GET | `/api/singbox/log?lines=120` | 服务日志尾部 |
 | GET | `/api/singbox/core` | 内核状态 |
-| POST | `/api/singbox/core` | 内核操作，body `{"action":"install","version":"1.14.4"}`；动作 `install`、`update`、`rollback-previous`、`rollback-preinstall`、`restart`、`uninstall` |
+| POST | `/api/singbox/core` | 内核操作，body `{"action":"install","version":"1.14.4"}`；动作 `install`、`update`、`rollback-previous`、`rollback-preinstall`、`restart`、`uninstall`。安装或更新会启用开机自启，卸载会停用服务并归档内核与单元 |
 
 `stats` 对象字段：`enabled`、`controller`、`secret`。`stats-enable` 把 `experimental.clash_api` 写入主配置（默认 `127.0.0.1:19090`，自动生成 32 位密钥），`stats-disable` 移除该块；两者都会备份主配置、执行 `sing-box check` 并重启 sing-box，失败时恢复原文件。
 

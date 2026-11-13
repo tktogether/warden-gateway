@@ -472,3 +472,24 @@ func TestMarshalNodeDocRoundsTrips(t *testing.T) {
 		t.Fatalf("output has no trailing newline")
 	}
 }
+
+func TestLooksLikeShellScriptDetectsWrapper(t *testing.T) {
+	dir := t.TempDir()
+	wrapper := filepath.Join(dir, "sing-box")
+	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nexec /etc/sing-box/bin/sing-box \"$@\"\n"), 0o755); err != nil {
+		t.Fatalf("write wrapper: %v", err)
+	}
+	if !looksLikeShellScript(wrapper) {
+		t.Fatalf("shell wrapper not detected")
+	}
+	binary := filepath.Join(dir, "real")
+	if err := os.WriteFile(binary, []byte{0x7f, 'E', 'L', 'F'}, 0o755); err != nil {
+		t.Fatalf("write binary: %v", err)
+	}
+	if looksLikeShellScript(binary) {
+		t.Fatalf("real binary misdetected as shell script")
+	}
+	if looksLikeShellScript(filepath.Join(dir, "missing")) {
+		t.Fatalf("missing file misdetected as shell script")
+	}
+}

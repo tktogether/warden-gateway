@@ -336,9 +336,10 @@ func (m *Manager) InstallCore(ctx context.Context, version string, logf func(for
 			restore()
 			return CoreStatus{}, fmt.Errorf("daemon-reload 失败：%v %s", err, out)
 		}
-		if out, err := runSystemctl(ctx, "enable", m.service); err != nil {
-			logf("启用开机自启失败：%v %s", err, out)
-		}
+	}
+	// 卸载会停用服务；重新安装即使沿用主机已有单元，也要恢复开机自启。
+	if out, err := runSystemctl(ctx, "enable", m.service); err != nil {
+		logf("启用开机自启失败：%v %s", err, out)
 	}
 	if out, err := runSystemctl(ctx, "restart", m.service); err != nil {
 		restore()
@@ -837,7 +838,10 @@ func (m *Manager) UninstallCore(ctx context.Context) (CoreStatus, error) {
 		}
 		archived = append(archived, "sing-box")
 	}
-	unitPath := coreUnitPath(m.service)
+	unitPath := findUnitPath(m.service)
+	if unitPath == "" {
+		unitPath = coreUnitPath(m.service)
+	}
 	unitManaged := false
 	if raw, err := os.ReadFile(unitPath); err == nil && strings.Contains(string(raw), "managed by warden-gateway") {
 		unitManaged = true

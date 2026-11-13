@@ -139,12 +139,9 @@ func (m *Manager) binaryPath() (string, error) {
 		if err != nil || st.IsDir() {
 			continue
 		}
-		if cand == "/usr/local/bin/sing-box" && st.Mode()&0o111 != 0 {
-			// The installer ships a shell wrapper here; skip it when the real
-			// binary exists, which the first candidate already covers.
-			if _, err := os.Stat(filepath.Join(m.root, "bin", "sing-box")); err == nil {
-				continue
-			}
+		if cand == "/usr/local/bin/sing-box" && looksLikeShellScript(cand) {
+			// 一键安装脚本会在这里放一个 shell 包装脚本，跳过它。
+			continue
 		}
 		return cand, nil
 	}
@@ -152,6 +149,19 @@ func (m *Manager) binaryPath() (string, error) {
 		return path, nil
 	}
 	return "", errors.New("未找到 sing-box 二进制")
+}
+
+// looksLikeShellScript reports whether path starts with a shebang, which is how
+// the one-click installer's wrapper is recognised.
+func looksLikeShellScript(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, 2)
+	n, _ := f.Read(buf)
+	return n == 2 && string(buf) == "#!"
 }
 
 // Installed reports whether the sing-box binary is present.
