@@ -88,12 +88,13 @@ func TestSingboxItemsFlagsMissingPortAsFailure(t *testing.T) {
 	}
 }
 
-func TestSingboxItemsWarnsOnLeftoverPort(t *testing.T) {
+func TestSingboxItemsWarnsOnPendingRestart(t *testing.T) {
 	checker := &Checker{SingBox: func() SingBoxState {
 		return SingBoxState{
 			Installed: true, Running: true, State: "active",
 			NodeCount: 1, EnabledNodes: 1,
-			Configured: []int{4430}, Listening: []int{4430, 18444},
+			Configured: []int{4430}, Listening: []int{4430},
+			Pending: true, ChangedAt: "2026-11-13T09:00:00Z", StartedAt: "2026-11-13T08:00:00Z",
 			CheckOK: true, CheckSupported: true,
 		}
 	}}
@@ -102,7 +103,10 @@ func TestSingboxItemsWarnsOnLeftoverPort(t *testing.T) {
 	if drift.Status != StatusWarn {
 		t.Fatalf("drift status = %q, want warn", drift.Status)
 	}
-	if !strings.Contains(drift.Detail, "仍在监听但配置已移除：18444") {
+	if !strings.Contains(drift.Detail, "2026-11-13T09:00:00Z") {
+		t.Fatalf("drift detail = %q", drift.Detail)
+	}
+	if !strings.Contains(drift.Detail, "重启 sing-box 生效") {
 		t.Fatalf("drift detail = %q", drift.Detail)
 	}
 }

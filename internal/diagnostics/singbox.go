@@ -21,6 +21,9 @@ type SingBoxState struct {
 	EnabledNodes   int
 	Configured     []int
 	Listening      []int
+	Pending        bool
+	ChangedAt      string
+	StartedAt      string
 	CheckOK        bool
 	CheckOutput    string
 	CheckSupported bool
@@ -91,8 +94,9 @@ func (c *Checker) singboxItems(cfg *config.Config) []Item {
 	return items
 }
 
-// driftItem compares configured and listening ports so a configuration that the
-// running process has not picked up is visible before it surprises an operator.
+// driftItem reports node ports the host is not listening on and node files the
+// running process has not loaded yet, so a pending restart is visible before it
+// surprises an operator.
 func driftItem(state SingBoxState) Item {
 	item := Item{ID: "singbox-drift", Label: "配置与进程一致性"}
 	configured := uniquePorts(state.Configured)
@@ -102,48 +106,52 @@ func driftItem(state SingBoxState) Item {
 		item.Detail = "没有可比较的端口"
 		return item
 	}
-	missing, extra := missingExtra(configured, listening)
-	if len(missing) == 0 && len(extra) == 0 {
-		item.Status = StatusOK
-		item.Detail = "监听端口与配置一致：" + joinPorts(listening)
-		return item
-	}
+	missing := missingPorts(configured, listening)
 	parts := make([]string, 0, 2)
 	if len(missing) > 0 {
 		parts = append(parts, "配置了但未监听："+joinPorts(missing)+"（重启 sing-box 生效）")
 	}
-	if len(extra) > 0 {
-		parts = append(parts, "仍在监听但配置已移除："+joinPorts(extra))
+	if state.Pending {
+		parts = append(parts, pendingText(state.ChangedAt, state.StartedAt))
 	}
+	if len(parts) == 0 {
+		item.Status = StatusOK
+		item.Detail = "监听端口与配置一致：" + joinPorts(listening)
+		return item
+	}
+	item.Detail = strings.Join(parts, "；")
 	if len(missing) > 0 {
 		item.Status = StatusFail
 	} else {
 		item.Status = StatusWarn
 	}
-	item.Detail = strings.Join(parts, "；")
 	return item
 }
 
-func missingExtra(configured, listening []int) (missing, extra []int) {
-	have := make(map[int]bool, len(listening))
-	for _, port := range listening {
-		have[port] = true
+// pendingText describes node files edited after the unit started.
+func pendingText(changedAt, startedAt string) string {
+	if changedAt == "" {
+		return "节点配置在服务启动后有更新，重启 sing-box 生效"
 	}
-	want := make(map[int]bool, len(configured))
-	for _, port := range configured {
-		want[port] = true
-		if !have[port] {
+	if startedAt == "" {
+		return "节点配置在 " + changedAt + " 有更新，重启 sing-box 生效"
+	}
+	return "节点配置在 " + changedAt + " 有更新（服务启动于 " + startedAt + "），重启 sing-box 生效"
+}
+
+func missingPorts(want, have []int) []int {
+	present := make(map[int]bool, len(have))
+	for _, port := range have {
+		present[port] = true
+	}
+	missing := make([]int, 0, len(want))
+	for _, port := range want {
+		if !present[port] {
 			missing = append(missing, port)
 		}
 	}
-	for _, port := range listening {
-		if !want[port] {
-			extra = append(extra, port)
-		}
-	}
 	sort.Ints(missing)
-	sort.Ints(extra)
-	return missing, extra
+	return missing
 }
 
 func uniquePorts(ports []int) []int {

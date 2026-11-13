@@ -1519,17 +1519,17 @@
   function sbDriftNotice(drift) {
     if (!drift || !drift.supported) { return null; }
     var missing = drift.missing || [];
-    var extra = drift.extra || [];
-    if (!missing.length && !extra.length) { return null; }
+    if (!missing.length && !drift.pending) { return null; }
     var parts = [];
     if (missing.length) {
-      parts.push('配置了但未监听：' + missing.join('、') + '，重启 sing-box 后生效。');
+      parts.push('配置了但未监听：' + missing.join('、') + '。');
     }
-    if (extra.length) {
-      parts.push('仍在监听但配置已移除：' + extra.join('、') + '，重启 sing-box 后释放。');
+    if (drift.pending) {
+      parts.push('节点配置在 ' + (drift.changed_at || '服务启动后') + ' 有更新，进程尚未加载。');
     }
+    parts.push('重启 sing-box 后生效。');
     var row = el('div', 'alert ' + (missing.length ? 'bad' : 'warn'));
-    add(row, el('span', '', parts.join(' ')));
+    add(row, el('span', '', parts.join('')));
     var fix = el('button', 'btn', '重启 sing-box');
     fix.type = 'button';
     fix.addEventListener('click', function () { sbRestartService(fix); });

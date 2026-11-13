@@ -9,208 +9,77 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
-// ListeningPorts returns the ports the running sing-box process listens on.
-// It resolves the unit main PID and maps that process' socket inodes to the
-// listening entries in /proc/net, because `ss -p` needs privileges this
-// service deliberately does not have: the unit keeps CAP_NET_BIND_SERVICE only,
-// so ss can list sockets but cannot attribute them to a process.
+// ListeningPorts returns every TCP and UDP port a listener is bound to on the
+// host. The unit keeps CAP_NET_BIND_SERVICE only, so the process cannot read
+// /proc/<pid>/fd and "ss -p" cannot attribute sockets to a process; the plain
+// listener table is readable without any added privilege.
 func (m *Manager) ListeningPorts() ([]int, error) {
-	pids, err := m.corePids()
-	if err != nil {
-		return nil, err
-	}
-	if len(pids) == 0 {
-		return []int{}, nil
-	}
-	inodes := map[uint64]bool{}
-	for _, pid := range pids {
-		found, err := processSocketInodesHook(pid)
-		if err != nil {
-			return nil, err
-		}
-		for inode := range found {
-			inodes[inode] = true
-		}
-	}
-	ports := make([]int, 0, 8)
-	for _, source := range procNetSources {
-		raw, err := os.ReadFile(filepath.Join(procRoot, source.path))
-		if err != nil {
-			continue
-		}
-		for inode, port := range parseProcNet(string(raw), source.proto) {
-			if inodes[inode] {
-				ports = append(ports, port)
-			}
-		}
-	}
-	return uniquePortList(ports), nil
-}
-
-type procNetSource struct {
-	path  string
-	proto string
-}
-
-var procNetSources = []procNetSource{
-	{"net/tcp", "tcp"},
-	{"net/tcp6", "tcp"},
-	{"net/udp", "udp"},
-	{"net/udp6", "udp"},
-}
-
-// procRoot is the mount point of procfs. Tests point it at a fixture tree.
-var procRoot = "/proc"
-
-// processSocketInodesHook is replaced in tests so a fixture tree can stand in
-// for a live process.
-var processSocketInodesHook = processSocketInodes
-
-// corePids returns the main PID of the unit that runs sing-box. A stopped unit
-// yields no PID, which is not an error: it simply has no listening sockets.
-func (m *Manager) corePids() ([]int, error) {
-	return unitMainPidsHook(m.service)
-}
-
-// unitMainPidsHook resolves the unit main PID; tests replace it.
-var unitMainPidsHook = unitMainPids
-
-func unitMainPids(service string) ([]int, error) {
-	if service == "" {
-		return nil, nil
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=MainPID", "--value", service).Output()
+	out, err := exec.CommandContext(ctx, "ss", "-H", "-lntu").Output()
 	if err != nil {
 		message := strings.TrimSpace(string(out))
 		if message == "" {
 			message = err.Error()
 		}
-		return nil, fmt.Errorf("读取 sing-box 进程失败：%s", message)
+		return nil, fmt.Errorf("读取监听端口失败：%s", message)
 	}
-	pid, convErr := strconv.Atoi(strings.TrimSpace(string(out)))
-	if convErr != nil || pid <= 0 {
-		return nil, nil
-	}
-	return []int{pid}, nil
+	return parseListenerPorts(string(out)), nil
 }
 
-// processSocketInodes lists the socket inodes a process holds open.
-func processSocketInodes(pid int) (map[uint64]bool, error) {
-	dir := fmt.Sprintf("%s/%d/fd", procRoot, pid)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, fmt.Errorf("读取 sing-box 进程端口失败：%v", err)
-	}
-	inodes := make(map[uint64]bool, len(entries))
-	for _, entry := range entries {
-		target, err := os.Readlink(dir + "/" + entry.Name())
-		if err != nil {
-			continue
-		}
-		if !strings.HasPrefix(target, "socket:[") || !strings.HasSuffix(target, "]") {
-			continue
-		}
-		inode, convErr := strconv.ParseUint(target[len("socket:["):len(target)-1], 10, 64)
-		if convErr != nil {
-			continue
-		}
-		inodes[inode] = true
-	}
-	return inodes, nil
-}
-
-// parseProcNet maps socket inode to listening port for one /proc/net table.
-// TCP entries must be in LISTEN state; UDP entries are kept only when they are
-// unconnected, which is how a UDP server socket appears.
-func parseProcNet(raw, proto string) map[uint64]int {
-	out := map[uint64]int{}
+// parseListenerPorts extracts the local port of every listener listed by
+// "ss -H -lntu". Fields are netid, state, queues, local address; the port
+// follows the last colon, so IPv6 and scoped addresses parse the same way.
+func parseListenerPorts(raw string) []int {
+	ports := make([]int, 0, 16)
 	for _, line := range strings.Split(raw, "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 10 {
+		if len(fields) < 5 {
 			continue
 		}
-		if fields[0] == "sl" {
+		if fields[0] != "tcp" && fields[0] != "udp" {
 			continue
 		}
-		local, state, inodeText := fields[1], fields[3], fields[9]
-		switch proto {
-		case "tcp":
-			if state != "0A" {
-				continue
-			}
-		case "udp":
-			if state != "07" {
-				continue
-			}
-		default:
-			continue
-		}
-		inode, err := strconv.ParseUint(inodeText, 10, 64)
-		if err != nil || inode == 0 {
-			continue
-		}
+		local := fields[4]
 		idx := strings.LastIndex(local, ":")
 		if idx < 0 || idx+1 >= len(local) {
 			continue
 		}
-		port, err := strconv.ParseUint(local[idx+1:], 16, 16)
-		if err != nil || port == 0 {
+		port, err := strconv.Atoi(local[idx+1:])
+		if err != nil || port <= 0 || port > 65535 {
 			continue
 		}
-		out[inode] = int(port)
+		ports = append(ports, port)
 	}
-	return out
+	return uniquePortList(ports)
 }
 
-// DriftPorts compares the ports the configuration asks for with the ports the
-// running process actually listens on. A port that is configured but missing
-// means the unit has not been restarted since the file changed; a port that is
-// listening but no longer configured is left over from a removed or parked node.
-func DriftPorts(configured, listening []int) (missing, extra []int) {
-	have := make(map[int]bool, len(listening))
-	for _, port := range listening {
-		have[port] = true
-	}
-	want := make(map[int]bool, len(configured))
-	for _, port := range configured {
-		want[port] = true
-		if !have[port] {
-			missing = append(missing, port)
-		}
-	}
-	for _, port := range listening {
-		if !want[port] {
-			extra = append(extra, port)
-		}
-	}
-	sort.Ints(missing)
-	sort.Ints(extra)
-	return missing, extra
-}
-
-// PortDrift compares the enabled node configuration with the ports the running
-// process actually listens on. Supported is false when the probe itself cannot
-// run, which keeps a missing /proc or a stopped unit from looking like a
-// configuration fault.
+// PortDrift compares the enabled node configuration with what the host listens
+// on, and flags node files the running process has not loaded yet.
+//
+// Listening holds only configured ports that are actually bound, so the report
+// stays free of unrelated host listeners. A port bound by another program reads
+// as listening; that is the price of not being able to attribute sockets to a
+// process without extra privileges.
 type PortDrift struct {
 	Supported  bool   `json:"supported"`
 	Running    bool   `json:"running"`
 	Configured []int  `json:"configured"`
 	Listening  []int  `json:"listening"`
 	Missing    []int  `json:"missing"`
-	Extra      []int  `json:"extra"`
+	Pending    bool   `json:"pending"`
+	ChangedAt  string `json:"changed_at,omitempty"`
+	StartedAt  string `json:"started_at,omitempty"`
 	Error      string `json:"error,omitempty"`
 }
 
-// PortDrift builds the drift report for the current configuration and process.
-// The Clash API port is excluded on both sides: it belongs to the panel switch,
-// not to a node, and would otherwise always look like an unexpected listener.
+// PortDrift builds the report for the current configuration and process. The
+// Clash API port is excluded: it belongs to the panel switch, not to a node.
 func (m *Manager) PortDrift() PortDrift {
-	drift := PortDrift{Supported: true, Configured: []int{}, Listening: []int{}, Missing: []int{}, Extra: []int{}}
+	drift := PortDrift{Supported: true, Configured: []int{}, Listening: []int{}, Missing: []int{}}
 	drift.Running = m.Running()
 	ignore := map[int]bool{}
 	if addr := m.ClashAPIAddr(); addr != "" {
@@ -239,20 +108,126 @@ func (m *Manager) PortDrift() PortDrift {
 	if !drift.Running {
 		return drift
 	}
-	listening, err := m.ListeningPorts()
+	bound, err := m.ListeningPorts()
 	if err != nil {
 		drift.Supported = false
 		drift.Error = err.Error()
 		return drift
 	}
-	for _, port := range listening {
-		if !ignore[port] {
+	for _, port := range drift.Configured {
+		if containsPort(bound, port) && !ignore[port] {
 			drift.Listening = append(drift.Listening, port)
 		}
 	}
 	drift.Listening = uniquePortList(drift.Listening)
-	drift.Missing, drift.Extra = DriftPorts(drift.Configured, drift.Listening)
+	drift.Missing = missingPorts(drift.Configured, drift.Listening)
+	drift.Pending, drift.ChangedAt, drift.StartedAt = m.pendingRestart()
 	return drift
+}
+
+// pendingRestart reports node files modified after the unit last started, which
+// means the running process has not loaded them yet.
+func (m *Manager) pendingRestart() (bool, string, string) {
+	started, err := unitStartedAtHook(m.service)
+	if err != nil || started.IsZero() {
+		return false, "", ""
+	}
+	changed := m.configChangedAt()
+	if changed.IsZero() || !changed.After(started.Add(2*time.Second)) {
+		return false, "", ""
+	}
+	return true, changed.UTC().Format(time.RFC3339), started.UTC().Format(time.RFC3339)
+}
+
+// configChangedAt returns the newest modification time of the node files and the
+// main configuration.
+func (m *Manager) configChangedAt() time.Time {
+	var newest time.Time
+	mark := func(path string) {
+		info, err := os.Stat(path)
+		if err != nil {
+			return
+		}
+		if info.ModTime().After(newest) {
+			newest = info.ModTime()
+		}
+	}
+	mark(m.configPath)
+	entries, err := os.ReadDir(m.confDir)
+	if err != nil {
+		return newest
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, enabledExt) && !strings.HasSuffix(name, disabledExt) {
+			continue
+		}
+		mark(filepath.Join(m.confDir, name))
+	}
+	return newest
+}
+
+// unitStartedAtHook resolves the unit activation time; tests replace it.
+var unitStartedAtHook = unitStartedAt
+
+// unitStartedAt reads the activation timestamp as seconds since the epoch, so no
+// locale or date format parsing is involved.
+func unitStartedAt(service string) (time.Time, error) {
+	if service == "" {
+		return time.Time{}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=ActiveEnterTimestamp", "--value", service).Output()
+	if err != nil {
+		return time.Time{}, fmt.Errorf("读取 sing-box 启动时间失败：%v", err)
+	}
+	seconds, convErr := parseUnitTimestamp(strings.TrimSpace(string(out)))
+	if convErr != nil || seconds <= 0 {
+		return time.Time{}, nil
+	}
+	return time.Unix(seconds, 0), nil
+}
+
+// parseUnitTimestamp accepts a plain epoch value or the human readable form
+// systemd prints when --timestamp is not honored.
+func parseUnitTimestamp(text string) (int64, error) {
+	if text == "" {
+		return 0, nil
+	}
+	if value, err := strconv.ParseInt(text, 10, 64); err == nil {
+		return value, nil
+	}
+	for _, layout := range []string{"Mon 2006-01-02 15:04:05 MST", "2006-01-02 15:04:05 MST"} {
+		if parsed, err := time.Parse(layout, text); err == nil {
+			return parsed.Unix(), nil
+		}
+	}
+	return 0, fmt.Errorf("无法解析服务启动时间：%s", text)
+}
+
+// missingPorts lists the ports in want that are absent from have.
+func missingPorts(want, have []int) []int {
+	missing := make([]int, 0, len(want))
+	for _, port := range want {
+		if !containsPort(have, port) {
+			missing = append(missing, port)
+		}
+	}
+	sort.Ints(missing)
+	return missing
+}
+
+func containsPort(ports []int, port int) bool {
+	for _, candidate := range ports {
+		if candidate == port {
+			return true
+		}
+	}
+	return false
 }
 
 // uniquePortList sorts and de-duplicates a port list.

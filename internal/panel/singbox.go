@@ -445,7 +445,9 @@ func driftJSON(drift singbox.PortDrift) map[string]interface{} {
 		"configured": drift.Configured,
 		"listening":  drift.Listening,
 		"missing":    drift.Missing,
-		"extra":      drift.Extra,
+		"pending":    drift.Pending,
+		"changed_at": drift.ChangedAt,
+		"started_at": drift.StartedAt,
 		"error":      drift.Error,
 	}
 }
@@ -477,6 +479,9 @@ func (s *Server) singboxDiagState() diagnostics.SingBoxState {
 	if drift.Supported {
 		state.Configured = drift.Configured
 		state.Listening = drift.Listening
+		state.Pending = drift.Pending
+		state.ChangedAt = drift.ChangedAt
+		state.StartedAt = drift.StartedAt
 	} else {
 		state.Error = drift.Error
 	}

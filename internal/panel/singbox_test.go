@@ -263,7 +263,7 @@ func TestSingboxPayloadExposesPortDrift(t *testing.T) {
 			Configured []int `json:"configured"`
 			Listening  []int `json:"listening"`
 			Missing    []int `json:"missing"`
-			Extra      []int `json:"extra"`
+			Pending    bool  `json:"pending"`
 		} `json:"drift"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
@@ -272,7 +272,7 @@ func TestSingboxPayloadExposesPortDrift(t *testing.T) {
 	if len(payload.Drift.Configured) != 1 || payload.Drift.Configured[0] != 21621 {
 		t.Fatalf("configured = %v, want [21621]", payload.Drift.Configured)
 	}
-	if len(payload.Drift.Missing) != 0 || len(payload.Drift.Extra) != 0 {
+	if len(payload.Drift.Missing) != 0 {
 		t.Fatalf("drift should be empty: %+v", payload.Drift)
 	}
 }
