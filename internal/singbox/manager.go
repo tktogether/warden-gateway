@@ -26,6 +26,11 @@ const (
 	commandTimeout = 20 * time.Second
 
 	ManagedMarker = "<!-- warden-managed -->"
+
+	// Restart is retried because a stopped process can still hold its sockets.
+	restartAttempts = 3
+	restartBackoff  = 1200 * time.Millisecond
+	restartConfirm  = 6 * time.Second
 )
 
 // Options configures a Manager.
@@ -205,19 +210,130 @@ func (m *Manager) Running() bool {
 
 // Restart restarts the sing-box unit, which is separate from the gateway unit,
 // so this never interrupts the panel itself.
+//
+// The stop/start pair is not atomic: the old process can still hold its sockets
+// when the new one binds the same ports, and a unit left in the failed state is
+// refused by systemd. So the failed state is cleared first, the restart is
+// retried a few times with a short pause, and success means the unit really is
+// active, not merely that systemctl accepted the job.
 func (m *Manager) Restart() error {
-	if _, err := os.Stat(filepath.Join("/etc/systemd/system", m.service)); err != nil {
-		if st, statErr := os.Stat(filepath.Join("/lib/systemd/system", m.service)); statErr != nil || st.IsDir() {
-			return fmt.Errorf("未安装 %s，无法重启", m.service)
-		}
+	if unitPathHook(m.service) == "" {
+		return fmt.Errorf("未安装 %s，无法重启", m.service)
 	}
+	resetFailedHook()
+	var failure error
+	for attempt := 0; attempt < restartAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(restartBackoff)
+		}
+		if err := restartUnitHook(m.service); err != nil {
+			failure = fmt.Errorf("重启 sing-box 失败：%v", err)
+			continue
+		}
+		state, sub := waitActiveHook(m.service, restartConfirm)
+		if state == "active" {
+			return nil
+		}
+		failure = fmt.Errorf("sing-box 重启后未进入运行状态：%s %s", state, sub)
+	}
+	if detail := m.journalTail(); detail != "" {
+		return fmt.Errorf("%w；服务日志：%s", failure, detail)
+	}
+	return failure
+}
+
+// unitPathHook resolves the installed unit file; tests replace it.
+var unitPathHook = findUnitPath
+
+// restartUnitHook runs "systemctl restart"; tests replace it.
+var restartUnitHook = restartUnit
+
+// restartUnit restarts the unit and folds the command output into the error so a
+// rejected job explains itself.
+func restartUnit(service string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "systemctl", "restart", m.service).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("重启 sing-box 失败：%v %s", err, strings.TrimSpace(string(out)))
+	out, err := exec.CommandContext(ctx, "systemctl", "restart", service).CombinedOutput()
+	if err == nil {
+		return nil
 	}
-	return nil
+	if message := strings.TrimSpace(string(out)); message != "" {
+		return fmt.Errorf("%v %s", err, message)
+	}
+	return err
+}
+
+// waitActiveHook polls the unit state; tests replace it.
+var waitActiveHook = waitActive
+
+// waitActive polls systemctl until the unit reports active or failed, or the
+// budget runs out. The final observed state is returned for the error message.
+func waitActive(service string, budget time.Duration) (string, string) {
+	deadline := time.Now().Add(budget)
+	state, sub := "unknown", ""
+	for {
+		next, nextSub := systemdState(service)
+		if next != "" {
+			state, sub = next, nextSub
+		}
+		if state == "active" || state == "failed" || time.Now().After(deadline) {
+			return state, sub
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+}
+
+// systemdState reads ActiveState and SubState of one unit.
+func systemdState(service string) (string, string) {
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "systemctl", "show", service, "--no-page", "--property=ActiveState,SubState").Output()
+	if err != nil {
+		return "", ""
+	}
+	state, sub := "", ""
+	for _, line := range strings.Split(string(out), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "ActiveState":
+			state = strings.TrimSpace(value)
+		case "SubState":
+			sub = strings.TrimSpace(value)
+		}
+	}
+	return state, sub
+}
+
+// resetFailedHook clears the unit failed state; tests replace it.
+var resetFailedHook = resetFailed
+
+// resetFailed clears a latched failure so systemd will start the unit again.
+func resetFailed() {
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	_ = exec.CommandContext(ctx, "systemctl", "reset-failed").Run()
+}
+
+// journalTail returns the last failure line of the unit so a rejected restart
+// explains itself instead of only reporting systemd's exit status.
+func (m *Manager) journalTail() string {
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "journalctl", "-u", m.service, "-n", "30", "--no-pager", "-o", "cat").Output()
+	if err != nil {
+		return ""
+	}
+	detail := ""
+	for _, line := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.Contains(trimmed, "FATAL") || strings.Contains(trimmed, "error") {
+			detail = trimmed
+		}
+	}
+	return detail
 }
 
 // restartHook restarts the unit. Tests replace it so node operations can run on

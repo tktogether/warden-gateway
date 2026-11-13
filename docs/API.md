@@ -105,7 +105,7 @@ GET 请求，返回最近 `minutes`（5 到 60，默认 60）的承载统计。�
 | --- | --- | --- |
 | GET | `/api/singbox` | 内核、节点、校验结果、端口一致性、备份与流量总览 |
 | POST | `/api/singbox` | 新建节点，body `{"type":"hysteria2","name":"手机"}`，可带 `port`、`server`、`method` |
-| POST | `/api/singbox/action` | 节点操作，body `{"action":"reset","id":"Hysteria2-12538"}`；动作 `reset`、`enable`、`disable`、`delete`、`restart`、`check`、`stats-enable`、`stats-disable` |
+| POST | `/api/singbox/action` | 节点操作，body `{"action":"reset","id":"Hysteria2-12538"}`；动作 `reset`、`enable`、`disable`、`delete`、`restart`、`check`、`stats-enable`、`stats-disable`；凡需要重启的动作都会先清除服务的失败状态、重试至多三次并确认服务进入运行状态，仍失败时返回 400 并附服务日志最后一条错误 |
 | GET | `/api/singbox/config?id=ID` | 读取节点配置文本 |
 | POST | `/api/singbox/config` | 保存节点配置，body `{"id":"...","text":"..."}`；校验失败返回 400 并附 `check`，原文件不变 |
 | GET | `/api/singbox/qr?id=ID&user=0&size=320` | 分享链接二维码，返回 PNG |
