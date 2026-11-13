@@ -71,17 +71,32 @@ func New(cfg config.GitHubConfig, stats *telemetry.Store, log *logging.Logger) *
 	return h
 }
 
+// HandlesPath reports whether p addresses an upstream this proxy serves: the
+// explicit /https://host/... form, or the short /host/... form whose first
+// segment is listed in AllowHosts.
+func (h *Handler) HandlesPath(p string) bool {
+	if strings.HasPrefix(p, "/http://") || strings.HasPrefix(p, "/https://") {
+		return true
+	}
+	rest := strings.TrimPrefix(p, "/")
+	host, _, _ := strings.Cut(rest, "/")
+	if host == "" {
+		return false
+	}
+	return h.matcher.Match(host)
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !h.cfg.Enabled {
 		http.Error(w, "GitHub proxy is disabled", http.StatusServiceUnavailable)
 		return
 	}
 	if r.URL.Path == "/" || r.URL.Path == "" {
-		http.Error(w, "usage: /https://github.com/owner/repo", http.StatusNotFound)
+		http.Error(w, "usage: /https://github.com/owner/repo or /github.com/owner/repo", http.StatusNotFound)
 		return
 	}
-	if !strings.HasPrefix(r.URL.Path, "/http://") && !strings.HasPrefix(r.URL.Path, "/https://") {
-		http.Error(w, "target must start with /https:// or /http://", http.StatusBadRequest)
+	if !h.HandlesPath(r.URL.Path) {
+		http.Error(w, "target must be /https://host/... or a host listed in allow_hosts followed by the path", http.StatusBadRequest)
 		return
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodPost && r.Method != http.MethodOptions {
@@ -155,6 +170,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func parseTarget(path, rawQuery string) (*url.URL, error) {
 	raw := strings.TrimPrefix(path, "/")
+	explicit := strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://")
+	if !explicit {
+		host, rest, _ := strings.Cut(raw, "/")
+		if host == "" {
+			return nil, errors.New("target host is required")
+		}
+		if strings.Contains(host, ":") {
+			return nil, errors.New("target host must not contain a port in the short form")
+		}
+		if strings.Contains(host, "@") {
+			return nil, errors.New("target URL must not contain user info")
+		}
+		raw = "https://" + host + "/" + rest
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, errors.New("invalid target URL")

@@ -129,13 +129,17 @@ GET 请求，返回最近 `minutes`（5 到 60，默认 60）的承载统计。�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/cn` | 返回分流命令（hosts/dns/both）、恢复命令、网关地址、分流域名与 DNS 服务状态 |
+| GET | `/api/cn` | 返回国内机命令（auto/none）、自检命令、恢复命令、网关地址、分流域名与 DNS 服务状态 |
 
-响应字段：`as_of`、`origin`、`gateway_ip`、`panel_host`、`domains`、`script_url`、`command`、`commands`（`hosts`、`dns`、`both`）、`restore_command`、`cn_mode`、`dns`、`dns_ready`。
+响应字段：`as_of`、`origin`、`gateway_ip`、`panel_host`、`domains`、`script_url`、`command`、`commands`（`auto`、`none`）、`restore_command`、`health_url`、`check_command`、`cn_mode`、`dns`、`dns_ready`。
+
+`command` 恒等于 `commands.auto`，`cn_mode` 恒为 `auto`：分流方式不再根据网关自身的 DNS 状态推断，国内机侧统一用 `auto`（hosts 托管块 + 本地 dnsmasq）。`commands.none` 是显式关闭分流的降级命令。
+
+`health_url` 指向网关 80 端口的 `/healthz`，`check_command` 在 `origin` 非空时重新下载脚本执行 `cn-check`，`origin` 为空时退化为 `sudo warden-cn cn-check`。
 
 `restore_command` 重新下载脚本；国内机执行过 `cn-setup` 后脚本保存为 `/usr/local/bin/warden-cn`，也可直接运行 `sudo warden-cn cn-restore`。
 
-`dns_ready` 为 true 表示网关 DNS 服务正在 53 端口运行，此时默认给出 `both` 模式命令；否则给出 `hosts` 模式命令。
+`dns_ready` 为 true 表示网关自身的 DNS 服务正在 53 端口运行。它与国内机分流方式无关，只用于面板展示；国内机是否需要 DNS 由 `cn-check` 在本机判断。
 
 ## 脚本下载
 

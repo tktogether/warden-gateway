@@ -65,10 +65,12 @@ sudo bash toolbox.sh bbr benchmark --peer 203.0.113.10 --seconds 10 --schemes bb
 
 ```bash
 curl -fsSL https://panel.example.com/bootstrap.sh -o /tmp/wg-bootstrap.sh
-sudo bash /tmp/wg-bootstrap.sh cn-setup --gateway-ip 192.0.2.10 --cn-mode both --yes
+sudo bash /tmp/wg-bootstrap.sh cn-setup --gateway-ip 192.0.2.10 --cn-mode auto --yes
 ```
 
-`--cn-mode` 选择 `hosts`（只改 hosts）、`dns`（只改 resolver）、`both`（两者互为兜底）或 `none`（都不改），默认 `hosts`。
+`--cn-mode` 只有 `auto`（默认，前置 hosts 托管块 + 本地 dnsmasq + resolver 指向本机 DNS + NetworkManager 守卫）和 `none`（关闭分流，只做 APT/BBR/Docker/Git 镜像）。旧值 `hosts`、`dns`、`both` 会提示弃用并按 `auto` 处理。
+
+`warden-cn` 只提供 `cn-setup`、`cn-check`、`cn-status`、`cn-restore`、`version`、`help`；安装、升级、卸载网关等代理机操作会以退出码 2 拒绝。
 
 ## 环境变量
 

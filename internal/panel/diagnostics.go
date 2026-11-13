@@ -83,10 +83,6 @@ func (s *Server) handleCNCommands(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	mode := "hosts"
-	if dnsReady {
-		mode = "both"
-	}
 	baseArgs := []string{"cn-setup"}
 	if gateway != "" {
 		baseArgs = append(baseArgs, "--gateway-ip", gateway)
@@ -101,16 +97,30 @@ func (s *Server) handleCNCommands(w http.ResponseWriter, r *http.Request) {
 		}
 		return "curl -fsSL " + scriptURL + " -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh " + strings.Join(args, " ")
 	}
+	// v1.5.0: the CN machine no longer picks a split mode. "auto" lets the
+	// bootstrap script write the managed hosts block and run a local dnsmasq
+	// (198.18.0.1:53) fed from that same block; "none" is the explicit
+	// downgrade that leaves splitting off entirely.
 	commands := map[string]interface{}{}
-	for _, splitMode := range []string{"hosts", "dns", "both"} {
+	for _, splitMode := range []string{"auto", "none"} {
 		commands[splitMode] = cnCommand(splitMode)
 	}
+	command := commands["auto"].(string)
 	// Restore must not assume a bootstrap.sh in the current directory: either
 	// download the script again, or reuse the copy that cn-setup registered as
 	// warden-cn on that machine.
 	restoreCommand := "sudo warden-cn cn-restore"
 	if origin != "" {
 		restoreCommand = "curl -fsSL " + scriptURL + " -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh cn-restore"
+	}
+	// health_url points at the gateway's own /healthz on port 80 so the CN
+	// machine can verify the split path end to end; check_command re-runs the
+	// self-check on the CN machine with the same script the setup used.
+	healthURL := ""
+	checkCommand := "sudo warden-cn cn-check"
+	if origin != "" {
+		healthURL = origin + "/healthz"
+		checkCommand = "curl -fsSL " + scriptURL + " -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh cn-check"
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"as_of":           config.NowUTC(),
@@ -119,10 +129,12 @@ func (s *Server) handleCNCommands(w http.ResponseWriter, r *http.Request) {
 		"panel_host":      host,
 		"domains":         config.DefaultSplitDomains(),
 		"script_url":      scriptURL,
-		"command":         commands[mode].(string),
+		"command":         command,
 		"commands":        commands,
 		"restore_command": restoreCommand,
-		"cn_mode":         mode,
+		"health_url":      healthURL,
+		"check_command":   checkCommand,
+		"cn_mode":         "auto",
 		"dns":             info,
 		"dns_ready":       dnsReady,
 	})

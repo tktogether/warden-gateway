@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -21,6 +22,7 @@ import (
 	"github.com/tktogether/warden-gateway/internal/panel"
 	"github.com/tktogether/warden-gateway/internal/singbox"
 	"github.com/tktogether/warden-gateway/internal/telemetry"
+	"github.com/tktogether/warden-gateway/internal/version"
 )
 
 // Paths describes the host layout used by the gateway.
@@ -139,9 +141,10 @@ func New(opts Options) (*App, error) {
 		}
 		a.docker = docker
 	}
-	if cfg.GitHub.Enabled {
-		a.github = githubproxy.New(cfg.GitHub, stats, logger)
-	}
+	// The handler is built even when the proxy is disabled so a short
+	// /host/path URL is claimed by the github branch and answered with 503 by
+	// ServeHTTP instead of falling through to a 404.
+	a.github = githubproxy.New(cfg.GitHub, stats, logger)
 	a.dns = dnsProxy
 	if cfg.SNI.Enabled {
 		a.sni = gateway.NewSNIProxy(cfg.SNI, cfg.Listen.Entry, cfg.Listen.HTTPS, stats, logger)
@@ -157,6 +160,8 @@ func (a *App) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		switch {
+		case p == "/healthz":
+			a.serveHealthz(w, r)
 		case strings.HasPrefix(p, a.cfg.PanelPath):
 			a.panel.ServeHTTP(w, r)
 		case strings.HasPrefix(p, "/v2/"):
@@ -167,7 +172,7 @@ func (a *App) Handler() http.Handler {
 			a.docker.ServeHTTP(w, r)
 		case p == "/bootstrap.sh" || p == "/toolbox.sh":
 			a.serveScript(w, r)
-		case strings.HasPrefix(p, "/http://"), strings.HasPrefix(p, "/https://"):
+		case strings.HasPrefix(p, "/http://"), strings.HasPrefix(p, "/https://"), a.github != nil && a.github.HandlesPath(p):
 			if a.github == nil {
 				http.Error(w, "github proxy is disabled", http.StatusServiceUnavailable)
 				return
@@ -179,6 +184,52 @@ func (a *App) Handler() http.Handler {
 			http.NotFound(w, r)
 		}
 	})
+}
+
+// HTTPHandler returns the plain-HTTP handler: it answers /healthz locally and
+// hands everything else to the configured TLS/ACME handler (which redirects to
+// https or serves ACME challenges).
+func (a *App) HTTPHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			a.serveHealthz(w, r)
+			return
+		}
+		if a.tls == nil || a.tls.HTTPHandler == nil {
+			http.NotFound(w, r)
+			return
+		}
+		a.tls.HTTPHandler.ServeHTTP(w, r)
+	})
+}
+
+// serveHealthz reports liveness over both HTTP and HTTPS without authentication.
+func (a *App) serveHealthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body := struct {
+		OK      bool   `json:"ok"`
+		Version string `json:"version"`
+		Started string `json:"started"`
+	}{
+		OK:      true,
+		Version: version.Version,
+		Started: a.started.UTC().Format(time.RFC3339),
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = w.Write(payload)
 }
 
 // serveScript serves the installer and toolbox scripts from the script directory.
@@ -229,7 +280,7 @@ func (a *App) Start(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("listen http %s: %w", a.cfg.Listen.HTTP, err)
 		}
-		a.httpSrv = &http.Server{Handler: a.Handler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
+		a.httpSrv = &http.Server{Handler: a.HTTPHandler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
 		go func() {
 			if err := a.httpSrv.Serve(httpLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- err
@@ -243,7 +294,7 @@ func (a *App) Start(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("listen acme %s: %w", a.cfg.Listen.ACME, err)
 		}
-		a.acmeSrv = &http.Server{Handler: a.tls.HTTPHandler, ReadHeaderTimeout: 15 * time.Second}
+		a.acmeSrv = &http.Server{Handler: a.HTTPHandler(), ReadHeaderTimeout: 15 * time.Second}
 		go func() {
 			if err := a.acmeSrv.Serve(acmeLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- err

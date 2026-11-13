@@ -7,7 +7,7 @@ Warden Gateway 是面向个人和小团队的自托管入口程序。它在一�
 - 统一入口：443 端口按 SNI 路由。面板域名终止 TLS；GitHub、Docker 等域名原样转发到原站。
 - 管理面板：`/warden/` 提供资源指标、服务状态、代理统计、证书状态和配置管理。
 - Docker 镜像代理：`/v2/` 提供 registry 兼容接口，并修复上游 referrers 接口的兼容问题。
-- GitHub 下载代理：`/https://github.com/...` 支持发布包、raw 文件、codeload 和 git 请求。
+- GitHub 下载代理：`/https://github.com/...` 与短路径 `/github.com/...` 两种形式，支持发布包、raw 文件、codeload 和 git 请求。
 - 证书：使用 ACME 自动申请和续期，也支持自有证书或自签名证书。
 - 备份恢复：配置、证书缓存和 systemd 单元打包为带校验和的归档；恢复后自动重启服务。
 - 一键诊断：检查网关自身的配置校验、服务状态、监听端口、证书与上游连通性。
@@ -22,7 +22,7 @@ Warden Gateway 是面向个人和小团队的自托管入口程序。它在一�
   | 443/TCP (TLS ClientHello)
   v
 SNI 路由
-  |-- 面板域名 ------> 127.0.0.1:8443 -> /warden/、/v2/、/https://...
+  |-- 面板域名 ------> 127.0.0.1:8443 -> /warden/、/v2/、/https://...、/github.com/...
   |-- 其他白名单域名 -> 原站 443/TCP（TLS 透传）
 ```
 
@@ -30,7 +30,7 @@ SNI 路由
 
 | 端口 | 协议 | 用途 |
 | --- | --- | --- |
-| 80 | TCP | ACME HTTP-01 校验 |
+| 80 | TCP | ACME HTTP-01 校验；同时响应 `/healthz`，供国内机与看门狗探测 |
 | 443 | TCP | SNI 统一入口 |
 | 8443 | TCP | 面板与路径代理，默认只监听 127.0.0.1 |
 | 8080 | TCP | 本地 HTTP，默认只监听 127.0.0.1 |
@@ -165,10 +165,19 @@ sudo git config --system --add url."https://panel.example.com/https://github.com
 
 SSH 地址会被改写为 HTTPS。访问私有仓库需要配置 HTTPS 凭据。
 
+也可以直接把仓库地址写成短路径形式，适合不能改写 Git 配置的客户端（例如 Coolify 的构建容器）：
+
+```bash
+git clone https://panel.example.com/github.com/owner/repo
+```
+
+两种形式等价：`/github.com/owner/repo` 会被补全为 `https://github.com/owner/repo`。首段主机名必须在 `github.allow_hosts` 里，端口与 userinfo 不被接受。
+
 ### GitHub 发布包
 
 ```bash
 curl -fL https://panel.example.com/https://github.com/owner/repo/releases/download/v1.0.0/file.tar.gz -o file.tar.gz
+curl -fL https://panel.example.com/github.com/owner/repo/releases/download/v1.0.0/file.tar.gz -o file.tar.gz
 ```
 
 ## 管理面板
@@ -245,7 +254,7 @@ warden-gateway version
 
 ## 国内机设置
 
-国内服务器访问 GitHub 和 Docker Hub 不稳定时，把分流与镜像设置应用到这些机器上。网关本身不执行国内机设置，只在面板「诊断」「设置」页按所选分流方式生成命令；脚本通过面板地址下载，不依赖 GitHub。
+国内服务器访问 GitHub 和 Docker Hub 不稳定时，把分流与镜像设置应用到这些机器上。网关本身不执行国内机设置，只在面板「诊断」「设置」页生成命令；脚本通过面板地址下载，不依赖 GitHub。
 
 ```bash
 curl -fsSL https://panel.example.com/bootstrap.sh -o /tmp/wg-bootstrap.sh
@@ -253,26 +262,54 @@ sudo bash /tmp/wg-bootstrap.sh cn-setup --gateway-ip 192.0.2.10 \
   --docker-mirror https://panel.example.com --git-mirror https://panel.example.com --yes
 ```
 
-设置内容：
+分流方式只有两种，由 `--cn-mode` 选择：`auto`（默认）和 `none`（关闭分流，只做 APT/BBR/Docker/Git 镜像）。旧值 `hosts`、`dns`、`both` 仍被接受，会提示已弃用并按 `auto` 处理。
+
+`auto` 一次写入四件事：
 
 | 项目 | 说明 |
 | --- | --- |
-| hosts 分流 | 把 GitHub、Docker 相关域名指向网关，使用 443 入口转发 |
-| DNS 分流 | 把 `/etc/resolv.conf` 或 systemd-resolved 指向网关；需要目标机器能访问网关 53 端口 |
+| hosts 托管块 | 前置写入 `/etc/hosts` 第 1 行，分流域名指向网关；放在最前是为了压过机器上第三方 hosts 块，且始终可用 `cn-restore` 整块回退 |
+| 本地 DNS | `dnsmasq` 监听 `198.18.0.1:53`，数据源就是上面那份 hosts 块，上游沿用本机原有 DNS 并补 `223.5.5.5` |
+| resolver | `/etc/resolv.conf` 前置 `nameserver 198.18.0.1`，保留原上游兜底，附 `options timeout:1 attempts:1` |
+| NetworkManager | 写 `/etc/NetworkManager/conf.d/90-warden-gateway-cn.conf` 的 `dns=none`，防止 resolver 被重写 |
+
+本地 DNS 不是可选项：容器不读宿主 `/etc/hosts`，只继承 `/etc/resolv.conf`，所以 Coolify 构建容器里的 `git clone`、`docker pull` 只有走本机 DNS 才能解析到网关。监听地址必须是回环地址之外的一个地址（默认 `198.18.0.1`，由 `wg-dns0` dummy 网卡承载），Docker 会剔除回环 nameserver。
+
+其余设置：
+
+| 项目 | 说明 |
+| --- | --- |
 | APT 镜像 | 把 `/etc/apt/sources.list` 和 `sources.list.d` 中的源地址替换为指定镜像 |
 | BBR | 写入 `/etc/sysctl.d/99-warden-cn-bbr.conf`，使用 `fq` 与 `bbr` |
 | Docker 镜像 | 写入 `/etc/docker/daemon.json` 的 `registry-mirrors`，并 reload Docker |
 | Git 镜像 | 写入 `/etc/gitconfig`，改写 `https`、`http`、`git`、`git@github.com:` 和 `ssh://git@github.com/` 地址 |
+| 看门狗 | `warden-gateway-cn-watchdog.timer`，默认每 60 秒探测一次，代理机不可达时自动摘除 hosts 块 |
 
-分流方式由 `--cn-mode` 选择：`hosts`（默认，只改 hosts）、`dns`（只改 resolver）、`both`（两者互为兜底）、`none`（都不改）。参与分流的域名用 `--cn-domains` 指定。面板「设置」页选择分流方式后给出对应命令，「诊断」页同时列出 hosts、DNS、both 三种命令。
+### 看门狗
 
-每次修改前自动备份到 `/var/backups/warden-gateway-cn`，最多保留 10 个。执行 `cn-setup` 时脚本同时保存为 `/usr/local/bin/warden-cn`，恢复时直接调用：
+看门狗先看本机外网对照组，再探测代理机，只有判定为代理机侧故障才动 hosts 块：
+
+| 判定 | 含义 | 动作 |
+| --- | --- | --- |
+| `OK` | 443 通，或 80 的 `/healthz` 返回成功 | 连续 2 次后恢复网关 hosts 块 |
+| `LINK_443_BLOCKED` | 代理机 80 通但 443 被线路拦截 | 计入故障 |
+| `LINK_PORTS_BLOCKED` | ICMP 通但 22/80/443 都不通 | 计入故障 |
+| `C_DOWN` | ICMP 与 22/80/443 全不通 | 计入故障 |
+| `LOCAL_BROKEN` | 本机三个对照组都不通 | 不计入故障，不做任何切换 |
+
+连续 3 次非 `OK` 才降级：摘掉 hosts 托管块，改回直连解析。降级只是止损，不保证直连可用：被劫持的域名往往本身就不可达。状态写在 `/etc/warden-gateway-cn/watchdog.state`，日志在 `/var/log/warden-gateway-cn-watchdog.log`。
+
+### 检查与回退
 
 ```bash
+sudo warden-cn cn-status    # 当前配置快照
+sudo warden-cn cn-check     # 只读体检：探测判定、hosts 块、本地 DNS、resolver、看门狗
 sudo warden-cn cn-restore --id latest
 ```
 
-不带 `--id` 时使用最新备份。`warden-cn` 不可用时，重新下载脚本后执行 `sudo bash /tmp/wg-bootstrap.sh cn-restore`。
+每次修改前自动备份到 `/var/backups/warden-gateway-cn`，最多保留 10 个。回退按 manifest 逐个文件还原，`cn-setup` 期间新建的文件会被删除，同时停用并禁用本地 DNS 与看门狗单元。不带 `--id` 时使用最新备份。
+
+执行 `cn-setup` 时脚本保存为 `/usr/local/bin/warden-cn`。这个副本按调用名自我限制，只提供 `cn-setup`、`cn-check`、`cn-status`、`cn-restore`、`version`、`help`；安装、升级、卸载代理机网关仍然只能用代理机上的 `warden` 命令。`warden-cn` 不可用时，重新下载脚本后执行 `sudo bash /tmp/wg-bootstrap.sh cn-restore`。
 
 ## 一键诊断
 
@@ -326,7 +363,7 @@ sudo bash toolbox.sh gateway doctor
 - 访问密钥只保存 SHA-256 摘要。首次安装会在数据目录写入仅 root 可读的初始密钥副本。
 - 所有写操作需要 CSRF 令牌，并校验 Origin。
 - 登录失败有限流。
-- GitHub 代理只允许配置中的域名，拒绝请求体超过限制的请求。
+- GitHub 代理只允许配置中的域名（`github.allow_hosts`），短路径形式的第一段也按键名比对同一份白名单，拒绝端口、userinfo 和超出体积限制的请求。
 - Docker 代理和 GitHub 代理默认对所有来源开放。可通过防火墙限制来源。
 
 ## 开发

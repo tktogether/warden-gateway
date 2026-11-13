@@ -417,7 +417,7 @@ func TestCNEndpointExposesCommandsOnly(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"as_of", "gateway_ip", "domains", "script_url", "command", "commands", "restore_command", "cn_mode", "dns", "dns_ready"} {
+	for _, field := range []string{"as_of", "gateway_ip", "domains", "script_url", "command", "commands", "restore_command", "cn_mode", "dns", "dns_ready", "health_url", "check_command"} {
 		if _, ok := payload[field]; !ok {
 			t.Fatalf("cn payload missing %q", field)
 		}
@@ -431,10 +431,47 @@ func TestCNEndpointExposesCommandsOnly(t *testing.T) {
 	if err := json.Unmarshal(payload["commands"], &commands); err != nil {
 		t.Fatal(err)
 	}
-	for _, mode := range []string{"hosts", "dns", "both"} {
+	for _, mode := range []string{"auto", "none"} {
 		if commands[mode] == "" {
 			t.Fatalf("cn commands missing mode %q", mode)
 		}
+	}
+	for _, mode := range []string{"hosts", "dns", "both"} {
+		if _, ok := commands[mode]; ok {
+			t.Fatalf("cn commands should not expose the retired mode %q", mode)
+		}
+	}
+	if !strings.Contains(commands["auto"], "--cn-mode auto") {
+		t.Fatalf("auto command %q does not pass --cn-mode auto", commands["auto"])
+	}
+	if !strings.Contains(commands["none"], "--cn-mode none") {
+		t.Fatalf("none command %q does not pass --cn-mode none", commands["none"])
+	}
+	var cnMode, command, healthURL, checkCommand string
+	for field, dst := range map[string]*string{
+		"cn_mode":       &cnMode,
+		"command":       &command,
+		"health_url":    &healthURL,
+		"check_command": &checkCommand,
+	} {
+		if err := json.Unmarshal(payload[field], dst); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if cnMode != "auto" {
+		t.Fatalf("cn_mode = %q, want auto", cnMode)
+	}
+	if command != commands["auto"] {
+		t.Fatalf("command %q must equal commands[auto] %q", command, commands["auto"])
+	}
+	if !strings.HasSuffix(healthURL, "/healthz") {
+		t.Fatalf("health_url %q must end with /healthz", healthURL)
+	}
+	if checkCommand == "" {
+		t.Fatal("check_command must not be empty")
+	}
+	if !strings.Contains(checkCommand, "cn-check") {
+		t.Fatalf("check_command %q must invoke cn-check", checkCommand)
 	}
 	for _, path := range []string{"/api/cn/apply", "/api/cn/restore"} {
 		if rec := do(t, srv, "POST", "/warden"+path, []byte("{}"), cookie, "x"); rec.Code != http.StatusNotFound {

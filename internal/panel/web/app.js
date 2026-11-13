@@ -1391,16 +1391,16 @@
     add(p, el('h3', '', '给国内机使用的命令'));
     add(p, el('p', 'muted', '这些命令由其他服务器（国内机）执行，网关本身不执行国内机设置。命令会写入 hosts 或 DNS、配置 Docker 与 Git 镜像，修改前自动备份。'));
     var commands = cn.commands || {};
-    p.appendChild(commandRow('hosts 分流', commands.hosts || cn.command || ''));
-    p.appendChild(commandRow('DNS 分流', commands.dns || ''));
-    p.appendChild(commandRow('hosts + DNS', commands.both || ''));
+    p.appendChild(commandRow('在国内机上执行', cn.command || commands.auto || ''));
+    p.appendChild(commandRow('自检命令', cn.check_command || ''));
     p.appendChild(commandRow('恢复命令', cn.restore_command || ''));
     var dns = cn.dns || {};
     add(p, infoList([
       ['网关地址', cn.gateway_ip || '—'],
       ['面板域名', cn.panel_host || '—'],
+      ['健康接口', cn.health_url || '—'],
       ['网关 DNS 服务', dns.running ? ('运行中 · ' + (dns.active_listen || dns.listen || '')) : (dns.enabled ? '已启用但未监听' : '未启用')],
-      ['DNS 分流可用', cn.dns_ready ? '是' : '否（需要 53 端口）'],
+      ['网关内置 DNS', cn.dns_ready ? '可用' : '未启用（不影响国内机本地 DNS）'],
       ['分流域名', ((cn.domains || []).join(', ') || '—')]
     ]));
     return p;
@@ -1602,18 +1602,6 @@
     }
   }
 
-  var cnModes = ['hosts', 'dns', 'both'];
-
-  function cnModeHint(mode) {
-    if (mode === 'dns') {
-      return '目标机把 /etc/resolv.conf 或 systemd-resolved 指向网关，需要目标机能访问网关 53 端口（UDP/TCP）。';
-    }
-    if (mode === 'both') {
-      return '同时写入 hosts 托管块并把 DNS 指向网关；hosts 已覆盖的域名不会再走 DNS，两者互为兜底。';
-    }
-    return '目标机写入 hosts 托管块，不修改 resolver 配置；适合不能访问网关 53 端口的机器。';
-  }
-
   function selectField(label, options, value) {
     var wrap = el('label');
     add(wrap, el('span', '', label));
@@ -1631,37 +1619,23 @@
   function cnSettingsBody() {
     var wrap = el('div', 'stack');
     var cn = state.cn || {};
-    var mode = cnModes.indexOf(cn.cn_mode) >= 0 ? cn.cn_mode : 'hosts';
-    var form = el('form', 'form-grid');
-    var picker = selectField('分发方式', [
-      { value: 'hosts', label: 'hosts 分流（修改 hosts）' },
-      { value: 'dns', label: 'DNS 分流（resolver 指向网关）' },
-      { value: 'both', label: '两者同时（hosts + DNS）' }
-    ], mode);
-    form.appendChild(picker.wrap);
-    var hint = el('p', 'muted', cnModeHint(mode));
-    form.appendChild(hint);
-    wrap.appendChild(form);
+    var commands = cn.commands || {};
+    add(wrap, el('p', 'muted', '国内机执行下面这条命令即可：写入 hosts 托管块并启动本机 DNS（198.18.0.1:53）。容器只读 /etc/resolv.conf，所以必须走本机 DNS，单纯改 hosts 对 Coolify 构建容器无效。'));
     var commandBox = el('div', 'stack');
-    function renderCommands() {
-      clear(commandBox);
-      var commands = cn.commands || {};
-      commandBox.appendChild(commandRow('在国内机上执行', commands[mode] || cn.command || ''));
-      commandBox.appendChild(commandRow('恢复命令', cn.restore_command || ''));
+    commandBox.appendChild(commandRow('在国内机上执行', cn.command || ''));
+    commandBox.appendChild(commandRow('自检命令', cn.check_command || ''));
+    commandBox.appendChild(commandRow('恢复命令', cn.restore_command || ''));
+    if (commands.none) {
+      commandBox.appendChild(commandRow('仅关闭分流（降级）', commands.none));
     }
-    renderCommands();
-    picker.select.addEventListener('change', function () {
-      mode = picker.select.value;
-      hint.textContent = cnModeHint(mode);
-      renderCommands();
-    });
     wrap.appendChild(commandBox);
     var dns = cn.dns || {};
     wrap.appendChild(infoList([
       ['网关地址', cn.gateway_ip || '—'],
       ['面板域名', cn.panel_host || '—'],
+      ['健康接口', cn.health_url || '—'],
       ['网关 DNS 服务', dns.running ? ('运行中 · ' + (dns.active_listen || dns.listen || '')) : (dns.enabled ? '已启用但未监听' : '未启用')],
-      ['DNS 分流可用', cn.dns_ready ? '是' : '否（需要 53 端口）'],
+      ['网关内置 DNS', cn.dns_ready ? '可用' : '未启用（不影响国内机本地 DNS）'],
       ['分流域名', ((cn.domains || []).join(', ') || '—')]
     ]));
     return wrap;

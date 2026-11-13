@@ -72,7 +72,26 @@ CN_APT_MIRROR="https://mirrors.aliyun.com"
 CN_DOCKER_MIRROR=""
 CN_GIT_MIRROR=""
 CN_DOMAINS=""
-CN_SPLIT_MODE="hosts"
+CN_SPLIT_MODE="auto"
+CN_LOCAL_DNS=1
+CN_LOCAL_DNS_ADDR="198.18.0.1"
+CN_LOCAL_DNS_UPSTREAM=""
+CN_WATCHDOG=1
+CN_WATCH_INTERVAL=60
+CN_NM_GUARD=1
+CN_SPLIT_DIR="/etc/warden-gateway-cn"
+CN_DNSMASQ_CONF="$CN_SPLIT_DIR/dnsmasq.conf"
+CN_DNS_UNIT="/etc/systemd/system/warden-gateway-cn-dns.service"
+CN_DNS_UNIT_NAME="warden-gateway-cn-dns"
+CN_NM_CONF="/etc/NetworkManager/conf.d/90-warden-gateway-cn.conf"
+CN_WATCH_SCRIPT="/usr/local/lib/warden-gateway-cn/watchdog.sh"
+CN_WATCH_ENV="$CN_SPLIT_DIR/cn.env"
+CN_WATCH_UNIT="/etc/systemd/system/warden-gateway-cn-watchdog.service"
+CN_WATCH_TIMER="/etc/systemd/system/warden-gateway-cn-watchdog.timer"
+CN_WATCH_UNIT_NAME="warden-gateway-cn-watchdog"
+CN_WATCH_LOG="/var/log/warden-gateway-cn-watchdog.log"
+CN_WATCH_STATE="$CN_SPLIT_DIR/watchdog.state"
+CN_ONLY=0
 CN_OPTIONS_CONFIGURED=0
 CN_MANIFEST=""
 CN_RECORDED=""
@@ -176,6 +195,10 @@ run() {
 }
 
 usage() {
+  if [ "${CN_ONLY:-0}" -eq 1 ]; then
+    usage_cn
+    return 0
+  fi
   cat <<'USAGE'
 Warden Gateway 一键安装脚本
 
@@ -192,6 +215,8 @@ Warden Gateway 一键安装脚本
   bootstrap.sh self-test            自检
   bootstrap.sh singbox [命令]       管理 sing-box 内核（status/install/rollback-previous/rollback-preinstall/restart/uninstall）
   bootstrap.sh cn-setup             在需要走网关的国内机上应用设置
+  bootstrap.sh cn-check             在国内机上探测网关连通性并给出判定（不改文件）
+  bootstrap.sh cn-status            在国内机上查看当前分流配置状态
   bootstrap.sh cn-restore [--id ID] 恢复国内机设置（默认最新备份）
 
 安装完成后会注册维护命令 warden，常用操作：
@@ -230,9 +255,15 @@ Warden Gateway 一键安装脚本
   --purge                卸载时同时删除配置、数据和备份
   --id ID                恢复指定备份，默认 latest
 
-国内机设置选项（仅 cn-setup / cn-restore 使用）：
+国内机设置选项（仅 cn-setup / cn-check / cn-status / cn-restore 使用）：
   --gateway-ip IP        国内机指向的网关地址
-  --no-hosts             不修改 /etc/hosts
+  --no-hosts             不写 /etc/hosts 托管块
+  --no-local-dns         不安装本地 dnsmasq（容器将拿不到网关地址，不建议）
+  --local-dns-addr IP    本地 dnsmasq 监听地址，默认 198.18.0.1
+  --local-dns-upstream A 本地 dnsmasq 上游，逗号分隔，默认沿用本机现有 DNS 与 223.5.5.5
+  --no-nm-guard          不写 NetworkManager dns=none（resolv.conf 可能被重写）
+  --no-watchdog          不安装看门狗定时器
+  --watch-interval SEC   看门狗探测周期，默认 60
   --no-apt               不修改 APT 镜像
   --no-bbr               不启用 BBR
   --no-docker-mirror     不修改 Docker 镜像
@@ -242,17 +273,53 @@ Warden Gateway 一键安装脚本
   --docker-mirror URL    Docker 镜像地址，默认使用网关地址
   --git-mirror URL       Git 镜像地址，默认使用网关地址
   --cn-domains LIST      参与分流的域名，逗号分隔
-  --cn-mode MODE         分流方式：hosts、dns、both、none，默认 hosts
+  --cn-mode MODE         auto（默认，本地 DNS + hosts）或 none（不启用分流）
   --cn-id ID             恢复的国内机设置备份
 
 不带参数运行且处于终端时进入交互安装向导。
 USAGE
 }
 
+usage_cn() {
+  cat <<'USAGE_CN'
+warden-cn - Warden Gateway 国内机维护命令
+
+用法：
+  warden-cn cn-setup [选项]      应用国内机分流设置
+  warden-cn cn-check             只读体检：探测代理机并检查本机分流状态
+  warden-cn cn-status            查看当前分流配置快照
+  warden-cn cn-restore [--cn-id ID]  回滚最近一次（或指定）备份
+  warden-cn version              查看版本
+  warden-cn -h | --help          显示本帮助
+
+cn-setup 选项：
+  --gateway-ip IP          代理机地址（必填或自动探测本机出口 IP）
+  --cn-domains LIST        参与分流的域名，逗号分隔
+  --cn-mode MODE           auto（默认）或 none
+  --no-hosts               不写 /etc/hosts 托管块
+  --no-local-dns           不装本地 dnsmasq（容器将无法解析分流域名）
+  --local-dns-addr IP      本地 DNS 监听地址，默认 198.18.0.1
+  --local-dns-upstream LIST 本地 DNS 上游，逗号分隔，默认沿用本机 resolver
+  --no-nm-guard            不写 NetworkManager 的 dns=none 配置
+  --no-watchdog            不安装看门狗
+  --watch-interval SEC     看门狗探测周期，默认 60，最小 15
+  --no-apt / --apt-mirror URL
+  --no-bbr
+  --no-docker-mirror / --docker-mirror URL
+  --no-git / --git-mirror URL
+  --no-apt-update
+  --cn-id ID               cn-restore 指定备份 ID，默认 latest
+  --yes | -y / --non-interactive / --dry-run
+
+本命令不提供 install / update / uninstall / status / logs / doctor 等代理机操作，
+这些请在代理机上使用 warden 命令。执行过的设置可用 cn-restore 一键回滚。
+USAGE_CN
+}
+
 parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      install|update|uninstall|status|logs|version|backup|restore|doctor|self-test|cn-setup|cn-restore)
+      install|update|uninstall|status|logs|version|backup|restore|doctor|self-test|cn-setup|cn-check|cn-status|cn-restore)
         COMMAND="$1"; shift;;
       singbox)
         COMMAND="singbox"; shift; SINGBOX_ARGS=("$@"); return 0;;
@@ -281,6 +348,12 @@ parse_args() {
       --dns-upstream) DNS_UPSTREAM="$2"; shift 2;;
       --gateway-ip) GATEWAY_IP="$2"; shift 2;;
       --no-hosts) CN_DO_HOSTS=0; EXPLICIT_CN=1; shift;;
+      --no-local-dns) CN_LOCAL_DNS=0; EXPLICIT_CN=1; shift;;
+      --local-dns-addr) CN_LOCAL_DNS_ADDR="$2"; EXPLICIT_CN=1; shift 2;;
+      --local-dns-upstream) CN_LOCAL_DNS_UPSTREAM="$2"; EXPLICIT_CN=1; shift 2;;
+      --no-nm-guard) CN_NM_GUARD=0; EXPLICIT_CN=1; shift;;
+      --no-watchdog) CN_WATCHDOG=0; EXPLICIT_CN=1; shift;;
+      --watch-interval) CN_WATCH_INTERVAL="$2"; EXPLICIT_CN=1; shift 2;;
       --no-apt) CN_DO_APT=0; EXPLICIT_CN=1; shift;;
       --no-bbr) CN_DO_BBR=0; EXPLICIT_CN=1; shift;;
       --no-docker-mirror) CN_DO_DOCKER=0; EXPLICIT_CN=1; shift;;
@@ -439,9 +512,24 @@ validate_options() {
     die "网关地址不是 IPv4：$CN_GATEWAY"
   fi
   case "$CN_SPLIT_MODE" in
-    hosts|dns|both|none) ;;
-    *) die "分流方式只能是 hosts、dns、both 或 none：$CN_SPLIT_MODE";;
+    auto|none) ;;
+    hosts|dns|both)
+      warn "分流方式 $CN_SPLIT_MODE 已弃用，按 auto 处理（本地 DNS + hosts 托管块）"
+      CN_SPLIT_MODE="auto";;
+    *) die "分流方式只能是 auto 或 none：$CN_SPLIT_MODE";;
   esac
+  if [ "$CN_LOCAL_DNS" -eq 1 ] && ! is_ipv4 "$CN_LOCAL_DNS_ADDR"; then
+    die "本地 DNS 监听地址不是 IPv4：$CN_LOCAL_DNS_ADDR"
+  fi
+  case "$CN_WATCH_INTERVAL" in
+    ''|*[!0-9]*) die "看门狗周期必须是整数秒：$CN_WATCH_INTERVAL";;
+  esac
+  if [ "$CN_WATCH_INTERVAL" -lt 15 ]; then
+    die "看门狗周期不能小于 15 秒：$CN_WATCH_INTERVAL"
+  fi
+  if [ "$CN_DO_HOSTS" -eq 0 ] && [ "$CN_LOCAL_DNS" -eq 1 ]; then
+    warn "已用 --no-hosts 关闭 hosts 托管块，本地 DNS 将没有分流域名数据，实际不会生效"
+  fi
   if [ -n "$CN_APT_MIRROR" ]; then
     case "$CN_APT_MIRROR" in
       http://*|https://*) ;;
@@ -702,7 +790,7 @@ install_cli() {
 set -euo pipefail
 BOOTSTRAP="$SCRIPT_DIR/bootstrap.sh"
 case "\${1:-}" in
-  cn-setup|cn-restore)
+  cn-setup|cn-check|cn-status|cn-restore)
     printf '该命令用于国内机，请在国内机上执行面板设置页生成的命令。\n' >&2
     printf '国内机已执行过 cn-setup 时，可直接运行：sudo warden-cn %s\n' "\$1" >&2
     exit 2;;
@@ -1013,36 +1101,267 @@ cn_prepend_managed_block() {
   ok "已更新 $path"
 }
 
+# ---------------------------------------------------------------------------
+# 探测（全部在国内机本机执行，不登录代理机）
+# ---------------------------------------------------------------------------
+
+cn_ping_ok() {
+  local ip="$1" secs="${2:-1}"
+  have ping || return 1
+  ping -c 1 -W "$secs" "$ip" >/dev/null 2>&1
+}
+
+cn_tcp_open() {
+  local host="$1" port="$2" secs="${3:-2}"
+  if have timeout; then
+    timeout "$secs" bash -c "exec 3<>/dev/tcp/$host/$port" >/dev/null 2>&1
+  else
+    ( exec 3<>"/dev/tcp/$host/$port" ) >/dev/null 2>&1
+  fi
+}
+
+cn_http_ok() {
+  have curl || return 1
+  curl -fsS -o /dev/null --connect-timeout 2 --max-time 4 "$1" >/dev/null 2>&1
+}
+
+# cn_internet_ok 用三个外部对照点判断本机是否还能正常上网。
+# 对照组不通时任何“代理机故障”的判定都不可信，因此必须先排除本机故障。
+cn_internet_ok() {
+  local url fails=0
+  for url in "https://www.apple.com" "https://mirrors.aliyun.com" "https://pypi.org"; do
+    cn_http_ok "$url" || fails=$((fails + 1))
+  done
+  [ "$fails" -lt 2 ]
+}
+
+# cn_probe_gateway 输出一行判定，并设置 CN_PROBE_RESULT：
+#   OK                 对照组通，443 通或 80/healthz 通
+#   LINK_443_BLOCKED   对照组通，80 通但 443 不通（线路干扰，代理机正常）
+#   LINK_PORTS_BLOCKED 对照组通，ICMP 通但端口全不通（线路拦截）
+#   C_DOWN             对照组通，ICMP 与 22/80/443 全不通（判定代理机不可用）
+#   LOCAL_BROKEN       对照组不通（本机网络故障，不做任何切换）
+# 退出码：0 OK / 1 LINK_443_BLOCKED / 2 C_DOWN / 3 LINK_PORTS_BLOCKED / 4 LOCAL_BROKEN
+cn_probe_gateway() {
+  local ip="$1" icmp=0 p22=0 p80=0 p443=0 health=0
+  CN_PROBE_RESULT="UNKNOWN"
+  if ! cn_internet_ok; then
+    CN_PROBE_RESULT="LOCAL_BROKEN"
+    printf 'LOCAL_BROKEN\n'
+    return 4
+  fi
+  if cn_ping_ok "$ip" 1; then icmp=1; fi
+  if cn_tcp_open "$ip" 22 2; then p22=1; fi
+  if cn_tcp_open "$ip" 80 2; then p80=1; fi
+  if cn_tcp_open "$ip" 443 2; then p443=1; fi
+  if [ "$p80" -eq 1 ] && cn_http_ok "http://$ip/healthz"; then health=1; fi
+  if [ "$health" -eq 1 ] || [ "$p443" -eq 1 ]; then
+    CN_PROBE_RESULT="OK"
+    printf 'OK\n'
+    return 0
+  fi
+  if [ "$p80" -eq 1 ]; then
+    CN_PROBE_RESULT="LINK_443_BLOCKED"
+    printf 'LINK_443_BLOCKED\n'
+    return 1
+  fi
+  if [ "$icmp" -eq 0 ] && [ "$p22" -eq 0 ]; then
+    CN_PROBE_RESULT="C_DOWN"
+    printf 'C_DOWN\n'
+    return 2
+  fi
+  CN_PROBE_RESULT="LINK_PORTS_BLOCKED"
+  printf 'LINK_PORTS_BLOCKED\n'
+  return 3
+}
+
+cn_probe_label() {
+  case "$1" in
+    OK) printf '正常';
+      ;;
+    LINK_443_BLOCKED) printf '代理机正常，443 被线路拦截';;
+    LINK_PORTS_BLOCKED) printf '代理机可达，端口被线路拦截';;
+    C_DOWN) printf '代理机不可达';;
+    LOCAL_BROKEN) printf '本机网络异常（不做切换）';;
+    *) printf '%s' "$1";;
+  esac
+}
+
+# cn_detect_upstreams 选出本地 dnsmasq 的上游：沿用本机现有 DNS，补 223.5.5.5 兜底。
+cn_detect_upstreams() {
+  local out="" ns
+  if [ "$CN_LOCAL_DNS_UPSTREAM" != "" ]; then
+    printf '%s\n' "$(printf '%s' "$CN_LOCAL_DNS_UPSTREAM" | tr ',' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')"
+    return 0
+  fi
+  if [ -f /etc/resolv.conf ]; then
+    while IFS= read -r ns; do
+      [ -n "$ns" ] || continue
+      case "$ns" in 127.*|0.0.0.0) continue;; esac
+      [ "$ns" = "$CN_LOCAL_DNS_ADDR" ] && continue
+      is_ipv4 "$ns" || continue
+      case " $out " in *" $ns "*) continue;; esac
+      out="$out $ns"
+    done <<EOF
+$(awk '$1 == "nameserver" {print $2}' /etc/resolv.conf 2>/dev/null)
+EOF
+  fi
+  case " $out " in
+    *" 223.5.5.5 "*) ;;
+    *) out="$out 223.5.5.5";;
+  esac
+  printf '%s\n' "$(printf '%s' "$out" | sed 's/^ //')"
+}
+
+# cn_put_file 从标准输入写入文件（原地覆写，避免 bind mount 上 rename 报 EBUSY）。
+cn_put_file() {
+  local path="$1" mode="${2:-0644}" tmp
+  tmp="$(mktemp)"
+  cat > "$tmp"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  + write %s\n' "$path"
+    rm -f "$tmp"
+    return 0
+  fi
+  mkdir -p "$(dirname "$path")"
+  cat "$tmp" > "$path"
+  chmod "$mode" "$path"
+  rm -f "$tmp"
+}
+
+# cn_apply_hosts 把托管块写到 /etc/hosts 最前面。
+# 前置的原因：机器上可能还有第三方 hosts 块（例如 GitHub520），
+# 它们常用 sed 截断再追加，块放末尾会被挤掉；放最前则首个匹配生效。
 cn_apply_hosts() {
-  local ip="$1" domains="$2" list
+  local ip="$1" domains="$2" list got
   domains="${domains//,/ }"
   list="$(printf '%s' "$domains" | tr -s ' ' | sed 's/^ //; s/ $//')"
   [ -n "$list" ] || { warn "分流域名为空，跳过 hosts"; return 1; }
   cn_snapshot_file /etc/hosts
-  cn_write_managed_block /etc/hosts "$ip $list"
-}
-
-cn_apply_dns() {
-  local ip="$1" dir
-  if [ -L /etc/resolv.conf ]; then
-    for dir in /etc/systemd/resolved.conf.d /usr/lib/systemd/resolved.conf.d /run/systemd/resolved.conf.d; do
-      [ -d "$dir" ] || continue
-      cn_snapshot_file "$dir/warden-cn.conf"
-      if [ "$DRY_RUN" -eq 1 ]; then
-        printf '  + write %s/warden-cn.conf\n' "$dir"
-      else
-        printf '[Resolve]\nDNS=%s\nFallbackDNS=\n' "$ip" > "$dir/warden-cn.conf"
-        chmod 0644 "$dir/warden-cn.conf"
-        systemctl restart systemd-resolved >/dev/null 2>&1 || warn "重启 systemd-resolved 失败"
-      fi
-      ok "已设置 systemd-resolved 指向 $ip"
-      return 0
-    done
-    warn "未找到 systemd-resolved 配置目录，跳过 DNS 设置"
+  cn_prepend_managed_block /etc/hosts "$ip $list"
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  got="$(getent ahostsv4 github.com 2>/dev/null | awk 'NR == 1 {print $1}')"
+  if [ "$got" != "$ip" ]; then
+    warn "hosts 托管块未生效：github.com 解析到 ${got:-空}，请检查 /etc/nsswitch.conf 的 hosts 顺序"
     return 1
   fi
+  return 0
+}
+
+# cn_remove_hosts 删掉托管块（看门狗降级时使用）。
+cn_remove_hosts() {
+  cn_snapshot_file /etc/hosts
+  cn_strip_block /etc/hosts "$CN_HOSTS_BEGIN" "$CN_HOSTS_END" > /tmp/.wg-hosts.$$
+  if [ "$DRY_RUN" -eq 1 ]; then
+    rm -f /tmp/.wg-hosts.$$
+    return 0
+  fi
+  cat /tmp/.wg-hosts.$$ > /etc/hosts
+  rm -f /tmp/.wg-hosts.$$
+}
+
+# cn_install_dnsmasq 保证 dnsmasq 可用；缺失时用当前 APT 源安装 dnsmasq-base。
+cn_install_dnsmasq() {
+  if [ -x /usr/sbin/dnsmasq ] || have dnsmasq; then return 0; fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  + apt-get install -y dnsmasq-base\n'
+    return 0
+  fi
+  step "本地 DNS" "安装 dnsmasq-base"
+  if apt-get install -y dnsmasq-base >/dev/null 2>&1; then return 0; fi
+  warn "安装 dnsmasq-base 失败：容器内将无法解析分流域名"
+  return 1
+}
+
+# cn_apply_local_dns 装本地 dnsmasq（监听非回环地址），写 unit 并启动。
+# 必须用非回环地址：Docker 会把回环地址从容器 resolv.conf 里剔除。
+# 数据源是 /etc/hosts（dnsmasq 默认读 hosts），命中分流域名即返回网关地址。
+cn_apply_local_dns() {
+  local ip="$1" upstreams="$2" u
+  [ "$CN_LOCAL_DNS" -eq 1 ] || return 0
+  cn_install_dnsmasq || return 1
+  cn_snapshot_file "$CN_DNSMASQ_CONF"
+  cn_snapshot_file "$CN_DNS_UNIT"
+  {
+    printf 'port=53\n'
+    printf 'listen-address=%s\n' "$ip"
+    printf 'bind-interfaces\n'
+    printf 'no-resolv\n'
+    printf 'no-poll\n'
+    printf 'no-dhcp-interface=\n'
+    printf 'cache-size=1000\n'
+    for u in $upstreams; do
+      printf 'server=%s\n' "$u"
+    done
+  } | cn_put_file "$CN_DNSMASQ_CONF" 0644
+  cn_put_file "$CN_DNS_UNIT" 0644 <<UNIT
+[Unit]
+Description=Warden Gateway CN local DNS (dnsmasq)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -c 'ip link show wg-dns0 >/dev/null 2>&1 || ip link add wg-dns0 type dummy; ip addr replace ${ip}/32 dev wg-dns0; ip link set wg-dns0 up'
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=$CN_DNSMASQ_CONF
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  if ! have systemctl; then
+    warn "本机没有 systemd，无法托管本地 DNS"
+    return 1
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if systemctl enable "$CN_DNS_UNIT_NAME" >/dev/null 2>&1 \
+    && systemctl restart "$CN_DNS_UNIT_NAME" >/dev/null 2>&1; then
+    sleep 1
+    if ss -lunH 'sport = :53' 2>/dev/null | grep -q "$ip"; then
+      ok "本地 DNS 已监听 $ip:53（数据源 /etc/hosts，上游：$upstreams）"
+      return 0
+    fi
+    warn "本地 DNS 已启动，但 $ip:53 未监听：journalctl -u $CN_DNS_UNIT_NAME -n 30"
+    return 1
+  fi
+  warn "本地 DNS 服务启动失败：journalctl -u $CN_DNS_UNIT_NAME -n 30"
+  return 1
+}
+
+# cn_apply_resolver 让 resolv.conf 指向本地 dnsmasq，并保留 ISP 上游兜底。
+cn_apply_resolver() {
+  local addr="$1" upstreams="$2" u body target="/etc/resolv.conf"
+  if [ -L "$target" ]; then
+    target="$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")"
+  fi
   cn_snapshot_file /etc/resolv.conf
-  cn_prepend_managed_block /etc/resolv.conf "nameserver $ip"
+  cn_snapshot_file "$target"
+  body=""
+  if [ "$CN_LOCAL_DNS" -eq 1 ]; then body="nameserver $addr"; fi
+  for u in $upstreams; do
+    if [ -n "$body" ]; then body="$body"$'\n'"nameserver $u"; else body="nameserver $u"; fi
+  done
+  body="$body"$'\n'"options timeout:1 attempts:1"
+  cn_prepend_managed_block "$target" "$body"
+}
+
+# cn_apply_nm_guard 阻止 NetworkManager 重写 /etc/resolv.conf。
+cn_apply_nm_guard() {
+  [ "$CN_NM_GUARD" -eq 1 ] || return 0
+  if [ ! -d /etc/NetworkManager ]; then return 0; fi
+  cn_snapshot_file "$CN_NM_CONF"
+  cn_put_file "$CN_NM_CONF" 0644 <<'NMEOF'
+[main]
+dns=none
+NMEOF
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  if have systemctl && systemctl is-active NetworkManager >/dev/null 2>&1; then
+    systemctl reload NetworkManager >/dev/null 2>&1 || warn "重载 NetworkManager 失败，resolv.conf 可能被改写"
+  fi
+  return 0
 }
 
 cn_apply_apt() {
@@ -1160,36 +1479,45 @@ EOF
 
 cn_mode_label() {
   case "$1" in
-    hosts) printf '仅 hosts';;
-    dns) printf '仅 DNS';;
-    both) printf 'hosts 与 DNS';;
+    auto) printf '自动（hosts + 本地 DNS）';;
     none) printf '不启用分流';;
     *) printf '%s' "$1";;
   esac
 }
 
-cn_mode_wants_hosts() {
-  case "$CN_SPLIT_MODE" in hosts|both) return 0;; esac
-  return 1
-}
-
-cn_mode_wants_dns() {
-  case "$CN_SPLIT_MODE" in dns|both) return 0;; esac
-  return 1
+# cn_split_plan 把 --cn-mode 与各开关折算成三个动作位。
+cn_split_plan() {
+  CN_PLAN_HOSTS=0
+  CN_PLAN_LOCAL_DNS=0
+  CN_PLAN_RESOLVER=0
+  if [ "$CN_SPLIT_MODE" = "none" ]; then return 0; fi
+  if [ "$CN_DO_HOSTS" -eq 1 ]; then CN_PLAN_HOSTS=1; fi
+  if [ "$CN_LOCAL_DNS" -eq 1 ]; then
+    CN_PLAN_LOCAL_DNS=1
+    CN_PLAN_RESOLVER=1
+  fi
+  return 0
 }
 
 cn_option_summary() {
-  local hosts_state dns_state apt_state bbr_state docker_state git_state
-  if [ "$CN_DO_HOSTS" -eq 1 ] && cn_mode_wants_hosts; then hosts_state="启用"; else hosts_state="跳过"; fi
-  if cn_mode_wants_dns; then dns_state="启用"; else dns_state="跳过"; fi
+  local hosts_state dns_state apt_state bbr_state docker_state git_state watch_state
+  cn_split_plan
+  if [ "$CN_PLAN_HOSTS" -eq 1 ]; then hosts_state="启用（前置托管块）"; else hosts_state="跳过"; fi
+  if [ "$CN_PLAN_LOCAL_DNS" -eq 1 ]; then
+    dns_state="启用（本地 dnsmasq $CN_LOCAL_DNS_ADDR:53）"
+  else
+    dns_state="跳过"
+  fi
   if [ "$CN_DO_APT" -eq 1 ]; then apt_state="$CN_APT_MIRROR"; else apt_state="跳过"; fi
   if [ "$CN_DO_BBR" -eq 1 ]; then bbr_state="启用"; else bbr_state="跳过"; fi
   if [ "$CN_DO_DOCKER" -eq 1 ]; then docker_state="${CN_DOCKER_MIRROR:-$CN_GATEWAY}"; else docker_state="跳过"; fi
   if [ "$CN_DO_GIT" -eq 1 ]; then git_state="${CN_GIT_MIRROR:-$CN_GATEWAY}"; else git_state="跳过"; fi
+  if [ "$CN_WATCHDOG" -eq 1 ]; then watch_state="启用（每 ${CN_WATCH_INTERVAL}s 探测一次）"; else watch_state="跳过"; fi
   kv "网关地址" "$CN_GATEWAY"
   kv "分流方式" "$(cn_mode_label "$CN_SPLIT_MODE")"
-  kv "hosts" "$hosts_state"
-  kv "DNS" "$dns_state"
+  kv "hosts 分流" "$hosts_state"
+  kv "本地 DNS" "$dns_state"
+  kv "看门狗" "$watch_state"
   kv "APT 镜像" "$apt_state"
   kv "BBR" "$bbr_state"
   kv "Docker 镜像" "$docker_state"
@@ -1203,26 +1531,31 @@ interactive_cn_options() {
     return 0
   fi
   title "国内机设置"
-  say "以下设置会修改本机的 APT、Docker、Git、hosts 或 DNS 配置。"
+  say "以下设置会修改本机的 hosts、本地 DNS、APT、Docker、Git 配置。"
   CN_GATEWAY="${CN_GATEWAY:-${GATEWAY_IP:-$(detect_ip)}}"
-  CN_GATEWAY="$(ask "网关地址（代理机 IP）" "$CN_GATEWAY")"
+  CN_GATEWAY="$(ask "网关地址（代理机 IP，即 C 的地址）" "$CN_GATEWAY")"
   CN_DOMAINS="${CN_DOMAINS:-$CN_DEFAULT_DOMAINS}"
   CN_DOMAINS="$(ask "参与分流的域名" "$CN_DOMAINS")"
   local mode_answer
-  say "分流方式：1 仅 hosts（不改 resolver）；2 仅 DNS（resolver 指向网关）；3 hosts 与 DNS；4 不启用分流"
-  mode_answer="$(ask "分流方式" "$CN_SPLIT_MODE")"
+  say "分流方式：1 自动（hosts 前置块 + 本地 DNS，推荐）；2 不启用分流"
+  mode_answer="$(ask "分流方式" "auto")"
   case "$mode_answer" in
-    1|hosts|仅\ hosts) CN_SPLIT_MODE="hosts";;
-    2|dns|仅\ DNS) CN_SPLIT_MODE="dns";;
-    3|both|两者) CN_SPLIT_MODE="both";;
-    4|none|不分流) CN_SPLIT_MODE="none";;
-    *) warn "未识别的分流方式，保持 $CN_SPLIT_MODE";;
+    1|auto|自动) CN_SPLIT_MODE="auto";;
+    2|none|不分流) CN_SPLIT_MODE="none";;
+    hosts|dns|both) warn "hosts/dns/both 已合并为自动模式，按自动处理"; CN_SPLIT_MODE="auto";;
+    *) warn "未识别的分流方式，按自动处理"; CN_SPLIT_MODE="auto";;
   esac
-  if cn_mode_wants_dns; then
-    say "DNS 模式需要目标机把 resolver 指向网关，并允许访问网关 53 端口（UDP/TCP）。"
+  say "本地 DNS 让容器也能解析到网关（容器不读宿主 /etc/hosts，只认 resolv.conf）。"
+  if ask_yes "启用本地 DNS（dnsmasq，监听 $CN_LOCAL_DNS_ADDR:53）？" 1; then
+    CN_LOCAL_DNS=1
+  else
+    CN_LOCAL_DNS=0
+    warn "关闭本地 DNS 后，容器内的 git clone / docker pull 仍会解析失败"
   fi
-  if [ "$CN_SPLIT_MODE" = "none" ]; then
-    warn "未启用 hosts 与 DNS，国内分流不会生效"
+  if ask_yes "启用看门狗（代理机不可达时自动摘除 hosts 块止损）？" 1; then
+    CN_WATCHDOG=1
+  else
+    CN_WATCHDOG=0
   fi
   if ask_yes "修改 APT 镜像？" 1; then
     CN_DO_APT=1
@@ -1248,6 +1581,187 @@ interactive_cn_options() {
   cn_option_summary
 }
 
+# cn_apply_watchdog 生成看门狗脚本与 systemd timer。
+# 脚本自带探测逻辑（不依赖本文件），状态机：OK 连续 2 次恢复网关路径；
+# 连续 3 次非 OK 则摘除 hosts 托管块止损。
+cn_apply_watchdog() {
+  local ip="$1" domains="$2"
+  [ "$CN_WATCHDOG" -eq 1 ] || return 0
+  if ! have systemctl; then
+    warn "本机没有 systemd，跳过看门狗"
+    return 1
+  fi
+  cn_snapshot_file "$CN_WATCH_SCRIPT"
+  cn_snapshot_file "$CN_WATCH_ENV"
+  cn_snapshot_file "$CN_WATCH_UNIT"
+  cn_snapshot_file "$CN_WATCH_TIMER"
+  cn_put_file "$CN_WATCH_ENV" 0600 <<CNENV
+CN_GW_IP=$ip
+CN_DOMAINS="$domains"
+CN_HOSTS_BEGIN="$CN_HOSTS_BEGIN"
+CN_HOSTS_END="$CN_HOSTS_END"
+CN_WATCH_LOG="$CN_WATCH_LOG"
+CN_WATCH_STATE="$CN_WATCH_STATE"
+CN_WATCH_INTERVAL=$CN_WATCH_INTERVAL
+CNENV
+  cn_put_file "$CN_WATCH_SCRIPT" 0755 <<'WATCHEOF'
+#!/bin/bash
+# 由 warden-gateway bootstrap 生成，请勿手工编辑。
+set -u
+ENV_FILE="${CN_WATCH_ENV_PATH:-/etc/warden-gateway-cn/cn.env}"
+[ -f "$ENV_FILE" ] || exit 0
+. "$ENV_FILE"
+log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$CN_WATCH_LOG"; }
+internet_ok() {
+  local url fails=0
+  for url in https://www.apple.com https://mirrors.aliyun.com https://pypi.org; do
+    curl -fsS -o /dev/null --connect-timeout 2 --max-time 4 "$url" >/dev/null 2>&1 || fails=$((fails + 1))
+  done
+  [ "$fails" -lt 2 ]
+}
+tcp_open() {
+  local port="$1"
+  timeout 2 bash -c "exec 3<>/dev/tcp/$CN_GW_IP/$port" >/dev/null 2>&1
+}
+# hosts 改写后必须让本地 dnsmasq 重读，否则它会继续返回缓存里的旧地址。
+reload_dns() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl is-active warden-gateway-cn-dns >/dev/null 2>&1 || return 0
+  systemctl reload warden-gateway-cn-dns >/dev/null 2>&1 || pkill -HUP dnsmasq >/dev/null 2>&1 || true
+}
+probe() {
+  internet_ok || { printf 'LOCAL_BROKEN'; return 4; }
+  local icmp=0 p22=0 p80=0 p443=0 health=0
+  ping -c 1 -W 1 "$CN_GW_IP" >/dev/null 2>&1 && icmp=1
+  tcp_open 22 && p22=1
+  tcp_open 80 && p80=1
+  tcp_open 443 && p443=1
+  if [ "$p80" -eq 1 ] && curl -fsS -o /dev/null --connect-timeout 2 --max-time 4 "http://$CN_GW_IP/healthz" >/dev/null 2>&1; then health=1; fi
+  if [ "$health" -eq 1 ] || [ "$p443" -eq 1 ]; then printf 'OK'; return 0; fi
+  if [ "$p80" -eq 1 ]; then printf 'LINK_443_BLOCKED'; return 1; fi
+  if [ "$icmp" -eq 0 ] && [ "$p22" -eq 0 ]; then printf 'C_DOWN'; return 2; fi
+  printf 'LINK_PORTS_BLOCKED'; return 3
+}
+gateway_on() {
+  local tmp
+  tmp="$(mktemp)"
+  {
+    printf '%s\n' "$CN_HOSTS_BEGIN"
+    printf '%s %s\n' "$CN_GW_IP" "$CN_DOMAINS"
+    printf '%s\n' "$CN_HOSTS_END"
+    awk -v b="$CN_HOSTS_BEGIN" -v e="$CN_HOSTS_END" '$0 == b {skip=1; next} $0 == e {skip=0; next} !skip' /etc/hosts 2>/dev/null
+  } > "$tmp"
+  cat "$tmp" > /etc/hosts
+  rm -f "$tmp"
+  reload_dns
+  log "已恢复网关 hosts 块 -> $CN_GW_IP"
+}
+gateway_off() {
+  local tmp
+  grep -qxF "$CN_HOSTS_BEGIN" /etc/hosts 2>/dev/null || return 0
+  tmp="$(mktemp)"
+  awk -v b="$CN_HOSTS_BEGIN" -v e="$CN_HOSTS_END" '$0 == b {skip=1; next} $0 == e {skip=0; next} !skip' /etc/hosts > "$tmp"
+  cat "$tmp" > /etc/hosts
+  rm -f "$tmp"
+  reload_dns
+  log "已摘除网关 hosts 块（降级：改走直连解析）"
+}
+state_get() {
+  local key="$1" val=""
+  if [ -f "$CN_WATCH_STATE" ]; then
+    val="$(sed -n "s/^$key=//p" "$CN_WATCH_STATE" | head -n 1)"
+  fi
+  printf '%s' "${val:-0}"
+}
+state_put() {
+  printf 'mode=%s\nfails=%s\noks=%s\nresult=%s\nupdated=%s\n' "$1" "$2" "$3" "$4" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$CN_WATCH_STATE"
+}
+main() {
+  local mode fails oks result rc
+  mode="$(state_get mode)"
+  [ "$mode" = "0" ] && mode="gateway"
+  fails="$(state_get fails)"
+  oks="$(state_get oks)"
+  result="$(probe)"
+  rc=$?
+  case "$result" in
+    OK)
+      oks=$((oks + 1))
+      fails=0
+      if [ "$mode" = "degraded" ] && [ "$oks" -ge 2 ]; then
+        gateway_on
+        mode="gateway"
+      fi
+      ;;
+    LOCAL_BROKEN)
+      log "本机网络异常，跳过本次判定"
+      ;;
+    *)
+      fails=$((fails + 1))
+      oks=0
+      if [ "$mode" = "gateway" ] && [ "$fails" -ge 3 ]; then
+        log "探测结果 $result 连续 $fails 次，进入降级"
+        gateway_off
+        mode="degraded"
+      fi
+      ;;
+  esac
+  state_put "$mode" "$fails" "$oks" "$result"
+  return 0
+}
+main
+WATCHEOF
+  cn_put_file "$CN_WATCH_UNIT" 0644 <<WUNIT
+[Unit]
+Description=Warden Gateway CN watchdog (one shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=CN_WATCH_ENV_PATH=$CN_WATCH_ENV
+ExecStart=/bin/bash $CN_WATCH_SCRIPT
+WUNIT
+  cn_put_file "$CN_WATCH_TIMER" 0644 <<WTIMER
+[Unit]
+Description=Warden Gateway CN watchdog timer
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=${CN_WATCH_INTERVAL}s
+AccuracySec=5s
+Unit=$CN_WATCH_UNIT_NAME.service
+
+[Install]
+WantedBy=timers.target
+WTIMER
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if systemctl enable --now "$CN_WATCH_UNIT_NAME.timer" >/dev/null 2>&1; then
+    ok "看门狗已启用：每 ${CN_WATCH_INTERVAL}s 探测一次，日志 $CN_WATCH_LOG"
+    return 0
+  fi
+  warn "看门狗 timer 启动失败：journalctl -u $CN_WATCH_UNIT_NAME -n 30"
+  return 1
+}
+
+# cn_verify_split 应用后自检：分流域名必须解析到网关。
+cn_verify_split() {
+  local ip="$1" domains="$2" domain got bad=0
+  [ "$DRY_RUN" -eq 0 ] || return 0
+  domains="${domains//,/ }"
+  for domain in $domains; do
+    got="$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR == 1 {print $1}')"
+    if [ "$got" = "$ip" ]; then
+      kv "  $domain" "$got"
+    else
+      kv "  $domain" "${got:-解析失败}（期望 $ip）"
+      bad=1
+    fi
+  done
+  return "$bad"
+}
+
 cn_setup() {
   need_root
   title "国内机设置"
@@ -1262,14 +1776,29 @@ cn_setup() {
   title "设置摘要"
   cn_option_summary
   confirm "确认应用国内机设置？" || { say "已取消"; return 1; }
+  local probe_rc=0 probe_out upstreams
+  step "探测" "检查本机网络与代理机 $CN_GATEWAY"
+  probe_out="$(cn_probe_gateway "$CN_GATEWAY")" || probe_rc=$?
+  kv "探测结果" "$(cn_probe_label "$probe_out")"
+  if [ "$probe_rc" -eq 4 ]; then
+    die "本机无法访问外部网络（对照点全部失败），未做任何修改"
+  fi
+  if [ "$probe_rc" -ne 0 ]; then
+    warn "代理机当前未就绪，配置仍会写入，看门狗会在其恢复后自动切回"
+  fi
   CN_CHANGED=0
   cn_begin_backup
   local failed=0
-  if [ "$CN_DO_HOSTS" -eq 1 ] && cn_mode_wants_hosts; then
+  upstreams="$(cn_detect_upstreams)"
+  cn_apply_nm_guard || failed=1
+  if [ "$CN_PLAN_HOSTS" -eq 1 ]; then
     cn_apply_hosts "$CN_GATEWAY" "$CN_DOMAINS" || failed=1
   fi
-  if cn_mode_wants_dns; then
-    cn_apply_dns "$CN_GATEWAY" || failed=1
+  if [ "$CN_PLAN_LOCAL_DNS" -eq 1 ]; then
+    cn_apply_local_dns "$CN_LOCAL_DNS_ADDR" "$upstreams" || failed=1
+  fi
+  if [ "$CN_PLAN_RESOLVER" -eq 1 ]; then
+    cn_apply_resolver "$CN_LOCAL_DNS_ADDR" "$upstreams" || failed=1
   fi
   if [ "$CN_DO_APT" -eq 1 ]; then
     cn_apply_apt "$CN_APT_MIRROR" || failed=1
@@ -1289,9 +1818,14 @@ cn_setup() {
       apt-get update >/dev/null 2>&1 || { warn "apt-get update 失败"; failed=1; }
     fi
   fi
+  cn_apply_watchdog "$CN_GATEWAY" "$CN_DOMAINS" || failed=1
   cn_finish_backup
   cn_prune_backups
   title "国内机设置完成"
+  if [ "$CN_PLAN_HOSTS" -eq 1 ] || [ "$CN_PLAN_RESOLVER" -eq 1 ]; then
+    step "自检" "分流域名解析结果"
+    cn_verify_split "$CN_GATEWAY" "$CN_DOMAINS" || { warn "部分域名未解析到网关，请查看上方明细"; failed=1; }
+  fi
   if [ -n "$CN_BACKUP_DIR" ] && [ "$DRY_RUN" -eq 0 ]; then
     kv "备份" "$CN_BACKUP_DIR"
     if install_cn_cli; then
@@ -1349,9 +1883,114 @@ cn_restore_one() {
     fi
   done < "$manifest"
   if [ "$DRY_RUN" -eq 0 ] && have systemctl; then
+    systemctl stop "$CN_WATCH_UNIT_NAME.timer" >/dev/null 2>&1 || true
+    systemctl disable "$CN_WATCH_UNIT_NAME.timer" >/dev/null 2>&1 || true
+    systemctl stop "$CN_DNS_UNIT_NAME" >/dev/null 2>&1 || true
+    systemctl disable "$CN_DNS_UNIT_NAME" >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl reload docker >/dev/null 2>&1 || true
+    if systemctl is-active NetworkManager >/dev/null 2>&1; then
+      systemctl reload NetworkManager >/dev/null 2>&1 || true
+    fi
     sysctl --system >/dev/null 2>&1 || true
   fi
+  if [ -d "$CN_SPLIT_DIR" ]; then
+    rm -f "$CN_WATCH_STATE" "$CN_WATCH_LOG" >/dev/null 2>&1 || true
+    rmdir "$CN_SPLIT_DIR" >/dev/null 2>&1 || true
+  fi
+}
+
+# cn_check 只读体检：探测代理机、检查 hosts 块 / 本地 DNS / 看门狗状态，不改任何文件。
+cn_check() {
+  local ip="$1" domains="$2" rc=0 out got
+  if [ -f "$CN_WATCH_ENV" ]; then
+    # shellcheck disable=SC1090
+    . "$CN_WATCH_ENV" >/dev/null 2>&1 || true
+  fi
+  ip="${ip:-${CN_GW_IP:-${CN_GATEWAY:-${GATEWAY_IP:-}}}}"
+  if [ -z "$ip" ]; then
+    ip="$(detect_ip 2>/dev/null || true)"
+  fi
+  domains="${domains:-${CN_DOMAINS:-${GATEWAY_DOMAINS:-$CN_DEFAULT_DOMAINS}}}"
+  [ -n "$ip" ] || die "缺少网关地址，请指定 --gateway-ip"
+  is_ipv4 "$ip" || die "网关地址不是 IPv4：$ip"
+  title "国内机分流体检"
+  step "探测" "检查本机网络与代理机 $ip"
+  out="$(cn_probe_gateway "$ip")" || rc=$?
+  kv "探测结果" "$(cn_probe_label "$out")"
+  kv "本机外网" "$(cn_internet_ok && say_ok_text || say_bad_text)"
+  step "hosts" "检查 /etc/hosts 托管块"
+  if grep -qxF "$CN_HOSTS_BEGIN" /etc/hosts 2>/dev/null; then
+    kv "托管块" "存在"
+    got="$(getent ahostsv4 github.com 2>/dev/null | awk 'NR == 1 {print $1}')"
+    kv "github.com" "${got:-解析失败}"
+    if [ "$got" = "$ip" ]; then kv "判定" "命中网关"; else kv "判定" "未命中网关"; rc=1; fi
+  else
+    kv "托管块" "不存在（当前走直连解析）"
+    rc=1
+  fi
+  step "本地 DNS" "检查 dnsmasq 与本机 resolver"
+  if have systemctl && systemctl is-active "$CN_DNS_UNIT_NAME" >/dev/null 2>&1; then
+    kv "$CN_DNS_UNIT_NAME" "active"
+  else
+    kv "$CN_DNS_UNIT_NAME" "未运行"
+  fi
+  if [ -f /etc/resolv.conf ]; then
+    kv "resolv.conf" "$(awk '$1 == "nameserver" {printf "%s ", $2}' /etc/resolv.conf | sed 's/ $//')"
+  fi
+  if have systemctl && systemctl is-active "$CN_WATCH_UNIT_NAME.timer" >/dev/null 2>&1; then
+    kv "看门狗" "active（每 ${CN_WATCH_INTERVAL}s）"
+  else
+    kv "看门狗" "未运行"
+  fi
+  if [ -f "$CN_WATCH_STATE" ]; then
+    kv "看门狗状态" "$(tr '\n' ' ' < "$CN_WATCH_STATE" | sed 's/ $//')"
+  fi
+  if [ "$rc" -eq 0 ]; then
+    ok "分流路径正常"
+  else
+    warn "分流路径存在问题，详见上方各项；容器内可用 docker run --rm alpine:3.20 getent hosts github.com 复核"
+  fi
+  return "$rc"
+}
+
+say_ok_text() { printf '正常'; }
+say_bad_text() { printf '异常'; }
+
+# cn_status 打印当前分流配置快照（只读）。
+cn_status() {
+  local ip domains
+  if [ -f "$CN_WATCH_ENV" ]; then
+    # shellcheck disable=SC1090
+    . "$CN_WATCH_ENV" >/dev/null 2>&1 || true
+  fi
+  ip="${CN_GW_IP:-$CN_GATEWAY}"
+  domains="${CN_DOMAINS:-$CN_DEFAULT_DOMAINS}"
+  title "国内机分流状态"
+  kv "网关地址" "${ip:-未配置}"
+  kv "分流域名" "$domains"
+  if grep -qxF "$CN_HOSTS_BEGIN" /etc/hosts 2>/dev/null; then
+    kv "hosts 托管块" "存在（$(grep -nF "$CN_HOSTS_BEGIN" /etc/hosts | head -n 1 | cut -d: -f1) 行起）"
+  else
+    kv "hosts 托管块" "不存在"
+  fi
+  if have systemctl; then
+    kv "本地 DNS" "$(systemctl is-active "$CN_DNS_UNIT_NAME" 2>/dev/null || true)"
+    kv "看门狗" "$(systemctl is-active "$CN_WATCH_UNIT_NAME.timer" 2>/dev/null || true)"
+  fi
+  if [ -f /etc/resolv.conf ]; then
+    kv "resolv.conf" "$(awk '$1 == "nameserver" {printf "%s ", $2}' /etc/resolv.conf | sed 's/ $//')"
+  fi
+  if [ -f "$CN_WATCH_STATE" ]; then
+    kv "看门狗状态" "$(tr '\n' ' ' < "$CN_WATCH_STATE" | sed 's/ $//')"
+  fi
+  if [ -d "$CN_SPLIT_DIR" ]; then
+    kv "配置目录" "$CN_SPLIT_DIR"
+  fi
+  if [ -d "$(cn_backup_root)" ]; then
+    kv "备份数量" "$(cn_backup_count)"
+  fi
+  kv "恢复命令" "sudo warden-cn cn-restore"
 }
 
 cn_restore() {
@@ -1768,9 +2407,40 @@ cmd_singbox() {
   fi
 }
 
+cn_only_allowed() {
+  case "$1" in
+    cn-setup|cn-restore|cn-check|cn-status|version|help|-h|--help|"") return 0;;
+  esac
+  return 1
+}
+
 main() {
   ORIG_ARGS=("$@")
+  case "$(basename "${BASH_SOURCE[0]:-$0}")" in
+    warden-cn) CN_ONLY=1;;
+  esac
+  if [ "$CN_ONLY" -eq 1 ]; then
+    if [ "$#" -eq 0 ]; then
+      usage_cn
+      exit 0
+    fi
+    if ! cn_only_allowed "${1:-}"; then
+      printf 'warden-cn 是国内机维护命令，只能执行：cn-setup、cn-check、cn-status、cn-restore。\n' >&2
+      printf '安装、更新、卸载网关请到代理机上使用 warden 命令。\n' >&2
+      exit 2
+    fi
+  fi
   parse_args "$@"
+  if [ "$CN_ONLY" -eq 1 ]; then
+    # 选项解析后 COMMAND 可能仍是默认值 install，国内机副本一律拒绝。
+    case "$COMMAND" in
+      cn-setup|cn-check|cn-status|cn-restore|version) ;;
+      *)
+        printf 'warden-cn 不能执行 %s：这是代理机操作。\n' "$COMMAND" >&2
+        printf '国内机可用：cn-setup、cn-check、cn-status、cn-restore。\n' >&2
+        exit 2;;
+    esac
+  fi
   case "$COMMAND" in
     install) cmd_install;;
     update) cmd_update;;
@@ -1782,6 +2452,8 @@ main() {
     restore) cmd_restore;;
     doctor) cmd_doctor;;
     cn-setup) cn_setup;;
+    cn-check) cn_check;;
+    cn-status) cn_status;;
     cn-restore) cn_restore;;
     singbox) cmd_singbox;;
     self-test) cmd_self_test;;
