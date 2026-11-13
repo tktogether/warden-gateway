@@ -108,7 +108,7 @@ func New(opts Options) (*Server, error) {
 		cfg: opts.Config, cfgPath: opts.ConfigPath, dataDir: opts.DataDir, scriptDir: opts.ScriptDir,
 		serviceName: opts.ServiceName, auth: opts.Auth, backups: opts.Backups,
 		stats: opts.Stats, log: opts.Log, started: opts.Started,
-		host: newHostMetrics(5760), dns: opts.DNS, singbox: opts.SingBox,
+		host: newHostMetrics(hostSampleCapacity), dns: opts.DNS, singbox: opts.SingBox,
 		auditPath: filepath.Join(opts.DataDir, "audit.log"),
 	}
 	s.host.Sample()
@@ -119,8 +119,16 @@ func (s *Server) Start(ctx context.Context) {
 	go s.sampleLoop(ctx)
 }
 
+// hostSampleSeconds is how often the panel refreshes host level metrics. The
+// live pages rely on it, so it stays short enough to feel immediate while
+// keeping the /proc reads negligible.
+const hostSampleSeconds = 5
+
+// hostSampleCapacity keeps 24 hours of host samples in the memory ring.
+const hostSampleCapacity = 24 * 60 * 60 / hostSampleSeconds
+
 func (s *Server) sampleLoop(ctx context.Context) {
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(hostSampleSeconds * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -512,16 +520,17 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		latestBackup = backups[0].ID
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"as_of":       config.NowUTC(),
-		"host":        host,
-		"certificate": s.certificateSummary(),
-		"services":    s.serviceRows(),
-		"proxies":     s.proxyOverview(false), // overview keeps the payload small
-		"backups":     map[string]interface{}{"count": len(backups), "latest": latestBackup},
-		"panel":       s.panelInfo(),
-		"dns":         s.dnsInfo(),
-		"sni":         s.sniInfo(),
-		"audit":       s.auditItems(8, ""),
+		"as_of":           config.NowUTC(),
+		"refresh_seconds": hostSampleSeconds,
+		"host":            host,
+		"certificate":     s.certificateSummary(),
+		"services":        s.serviceRows(),
+		"proxies":         s.proxyOverview(false), // overview keeps the payload small
+		"backups":         map[string]interface{}{"count": len(backups), "latest": latestBackup},
+		"panel":           s.panelInfo(),
+		"dns":             s.dnsInfo(),
+		"sni":             s.sniInfo(),
+		"audit":           s.auditItems(8, ""),
 	})
 }
 
@@ -622,6 +631,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	total, per := s.stats.Series(minutes, step)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"range": rangeName, "as_of": config.NowUTC(), "points": series,
+		"sample_seconds": hostSampleSeconds, "refresh_seconds": hostSampleSeconds,
 		"latest": latest, "host": hostInfo(), "ifaces": s.host.Ifaces(),
 		"counters": s.stats.Counters(), "traffic": total,
 		"traffic_total": total, "proxy_series": per, "step_seconds": step,

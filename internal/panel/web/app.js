@@ -6,6 +6,8 @@
     csrf: '',
     view: 'overview',
     range: '1h',
+    theme: 'dark',
+    auditQuery: '',
     overview: null,
     metrics: null,
     proxies: null,
@@ -29,6 +31,150 @@
   }
   function add(parent, child) { if (child) { parent.appendChild(child); } return parent; }
   function clear(node) { while (node.firstChild) { node.removeChild(node.firstChild); } }
+
+  var THEME_KEY = 'wg-theme';
+  var refreshSeconds = { overview: 5, metrics: 5, proxies: 5, singbox: 15, effect: 10, diagnostics: 30, backups: 30, audit: 20, settings: 0 };
+  var lastRefresh = {};
+  var refreshing = {};
+  var pollTimer = null;
+
+  function cssVar(name, fallback) {
+    try {
+      var v = window.getComputedStyle(document.documentElement).getPropertyValue(name);
+      v = (v || '').trim();
+      return v || fallback;
+    } catch (e) { return fallback; }
+  }
+
+  function readTheme() {
+    try {
+      var saved = window.localStorage.getItem(THEME_KEY);
+      if (saved === 'light' || saved === 'dark') { return saved; }
+    } catch (e) { /* ignore */ }
+    try {
+      if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) { return 'light'; }
+    } catch (e) { /* ignore */ }
+    return 'dark';
+  }
+
+  function applyTheme(theme, replay) {
+    var next = theme === 'light' ? 'light' : 'dark';
+    state.theme = next;
+    document.documentElement.setAttribute('data-theme', next);
+    var meta = document.querySelector('meta[name="color-scheme"]');
+    if (meta) { meta.setAttribute('content', next); }
+    var label = next === 'light' ? '深色' : '浅色';
+    var hint = next === 'light' ? '切换到深色主题' : '切换到浅色主题';
+    ['#theme-toggle', '#theme-toggle-login'].forEach(function (sel) {
+      var b = qs(sel);
+      if (b) { b.textContent = label; b.setAttribute('title', hint); }
+    });
+    try { window.localStorage.setItem(THEME_KEY, next); } catch (e) { /* ignore */ }
+    if (replay !== false) { redrawCharts(); }
+  }
+
+  function toggleTheme() { applyTheme(state.theme === 'light' ? 'dark' : 'light'); }
+
+  function fmtPercent(v) { return (Number(v) || 0).toFixed(1) + '%'; }
+  function fmtCount(v) { return shortNumber(Number(v) || 0); }
+  function fmtLoad(v) { return (Number(v) || 0).toFixed(2); }
+  function fmtClock(at) {
+    if (!at) { return fmtTime(new Date()); }
+    var d = typeof at === 'number' ? new Date(at * 1000) : new Date(at);
+    if (isNaN(d.getTime())) { return fmtTime(at); }
+    return d.toLocaleTimeString('zh-CN', { hour12: false });
+  }
+
+  function flashNote(node) {
+    if (!node) { return; }
+    node.classList.remove('note-fade');
+    void node.offsetWidth;
+    node.classList.add('note-fade');
+  }
+  function flashBody(node) {
+    if (!node) { return; }
+    node.classList.remove('soft-update');
+    void node.offsetWidth;
+    node.classList.add('soft-update');
+  }
+  function noteUpdated(selector, at, seconds, extra) {
+    var node = qs(selector);
+    if (!node) { return; }
+    var parts = ['更新于 ' + fmtClock(at)];
+    if (seconds) { parts.push('每 ' + seconds + ' 秒自动刷新'); }
+    if (extra) { parts.push(extra); }
+    node.textContent = parts.join(' · ');
+    flashNote(node);
+  }
+
+  function currentViewFromHash() {
+    var raw = String(window.location.hash || '').replace(/^#/, '');
+    return views.indexOf(raw) >= 0 ? raw : '';
+  }
+  function setHashView(view) {
+    var target = '#' + view;
+    if (window.location.hash === target) { return; }
+    try { window.history.replaceState(null, '', target); } catch (e) { window.location.hash = view; }
+  }
+
+  function viewLoader(view) {
+    switch (view) {
+      case 'overview': return loadOverview;
+      case 'metrics': return loadMetrics;
+      case 'proxies': return loadProxies;
+      case 'singbox': return loadSingbox;
+      case 'effect': return loadEffect;
+      case 'diagnostics': return loadDiagnostics;
+      case 'backups': return loadBackups;
+      case 'audit': return loadAudit;
+      case 'settings': return loadSettings;
+    }
+    return null;
+  }
+
+  function canAutoRefresh() {
+    if (!state.session.authenticated) { return false; }
+    if (document.visibilityState && document.visibilityState !== 'visible') { return false; }
+    if (chartHoverActive) { return false; }
+    var modal = qs('#modal');
+    if (modal && !modal.hidden) { return false; }
+    var active = document.activeElement;
+    if (active) {
+      var tag = (active.tagName || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+        var view = qs('#view-' + state.view);
+        if (view && view.contains(active)) { return false; }
+      }
+    }
+    return true;
+  }
+
+  function startPolling() {
+    if (pollTimer) { return; }
+    pollTimer = setInterval(function () {
+      if (!canAutoRefresh()) { return; }
+      var view = state.view;
+      var load = viewLoader(view);
+      if (!load || refreshing[view]) { return; }
+      var wait = refreshSeconds[view] || 0;
+      if (!wait) { return; }
+      var last = lastRefresh[view] || 0;
+      if (Date.now() - last < wait * 1000 - 400) { return; }
+      load({ silent: true });
+    }, 1000);
+  }
+
+  function bindRefresh(selector, load, key) {
+    var btn = qs(selector);
+    if (!btn) { return; }
+    btn.addEventListener('click', async function () {
+      setBusy(btn, true);
+      btn.classList.add('is-busy');
+      try { await load({ silent: !!state[key] }); }
+      finally { setBusy(btn, false); btn.classList.remove('is-busy'); }
+    });
+  }
+
   function fmtBytes(n) {
     n = Number(n) || 0;
     var units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -104,6 +250,7 @@
   }
 
   function boot() {
+    applyTheme(readTheme(), false);
     api('/api/session').then(function (s) {
       applySession(s);
       if (s.authenticated) { showApp(); } else { showLogin(); }
@@ -124,6 +271,7 @@
   function showLogin() {
     state.session = { authenticated: false };
     state.csrf = '';
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     qs('#app').hidden = true;
     qs('#login').hidden = false;
     qs('#login-error').hidden = true;
@@ -137,13 +285,14 @@
     qs('#app').hidden = false;
     qs('#top-url').textContent = state.session.public_url || '';
     setStatus(true, '已连接');
-    navigate(state.view || 'overview');
-    loadOverview();
+    startPolling();
+    navigate(currentViewFromHash() || state.view || 'overview');
   }
 
   function navigate(view) {
     if (views.indexOf(view) < 0) { view = 'overview'; }
     state.view = view;
+    setHashView(view);
     views.forEach(function (v) {
       qs('#view-' + v).hidden = v !== view;
     });
@@ -191,27 +340,37 @@
     return dl;
   }
 
-  async function loadOverview() {
+  async function loadOverview(opts) {
+    opts = opts || {};
+    var silent = !!opts.silent;
+    if (refreshing.overview) { return; }
     if (state.loading.overview) { return; }
     state.loading.overview = true;
+    refreshing.overview = true;
     var box = qs('#overview-content');
-    pageNote('#overview-note', '加载中…');
+    if (!silent) {
+      if (!state.overview) { pageNote('#overview-note', '加载中…'); }
+    }
     try {
       var data = await api('/api/overview');
       state.overview = data;
-      renderOverview(data);
-      pageNote('#overview-note', '更新于 ' + fmtTime(data.as_of) + '，每 20 秒自动刷新');
+      lastRefresh.overview = Date.now();
+      renderOverview(data, silent);
+      noteUpdated('#overview-note', data.as_of, data.refresh_seconds || refreshSeconds.overview, '主机负载每 ' + (data.refresh_seconds || refreshSeconds.overview) + ' 秒采样');
     } catch (err) {
-      clear(box);
-      box.appendChild(el('div', 'empty', err.message));
-      pageNote('#overview-note', '加载失败');
-      showToast(err.message, true);
+      if (!silent || !state.overview) {
+        clear(box);
+        box.appendChild(el('div', 'empty', err.message));
+        pageNote('#overview-note', '加载失败');
+      }
+      if (!silent) { showToast(err.message, true); }
     } finally {
       state.loading.overview = false;
+      refreshing.overview = false;
     }
   }
 
-  function renderOverview(data) {
+  function renderOverview(data, silent) {
     var box = qs('#overview-content');
     clear(box);
     var host = data.host || {};
@@ -248,9 +407,34 @@
     var right = el('div', 'stack');
     right.appendChild(certPanel(data.certificate || {}));
     right.appendChild(edgePanel(data));
-    right.appendChild(panel('最近审计', auditList(data.audit || [], true)));
     grid.appendChild(right);
     box.appendChild(grid);
+
+    var recent = el('div', 'panel overview-audit');
+    var head = el('div', 'audit-head');
+    add(head, el('h3', 'section-title', '最近审计'));
+    var more = el('button', 'btn small', '查看全部');
+    more.type = 'button';
+    more.addEventListener('click', function () { navigate('audit'); });
+    head.appendChild(more);
+    recent.appendChild(head);
+    var items = (data.audit || []).slice(0, 6);
+    if (!items.length) {
+      add(recent, el('div', 'empty', '暂无记录'));
+    } else {
+      var rows = el('div', 'audit-timeline');
+      items.forEach(function (it) {
+        var row = el('div', 'audit-line');
+        add(row, el('span', 'audit-time', fmtClock(it.ts)));
+        add(row, el('span', 'audit-action', it.action || ''));
+        add(row, el('span', 'audit-ip', it.ip || ''));
+        row.appendChild(statusPill(it.result || '', it.result === 'ok' ? 'ok' : 'bad'));
+        rows.appendChild(row);
+      });
+      recent.appendChild(rows);
+    }
+    box.appendChild(recent);
+    if (silent) { flashBody(box); }
   }
 
   function panel(title, body, cls) {
@@ -411,23 +595,32 @@
     return list;
   }
 
-  async function loadMetrics() {
+  async function loadMetrics(opts) {
+    opts = opts || {};
+    var silent = !!opts.silent;
+    if (refreshing.metrics) { return; }
+    refreshing.metrics = true;
     var box = qs('#metrics-content');
-    pageNote('#metrics-note', '加载中…');
+    if (!silent && !state.metrics) { pageNote('#metrics-note', '加载中…'); }
     try {
       var data = await api('/api/metrics?range=' + encodeURIComponent(state.range));
       state.metrics = data;
-      renderMetrics(data);
-      pageNote('#metrics-note', '范围 ' + data.range + ' · 更新于 ' + fmtTime(data.as_of));
+      lastRefresh.metrics = Date.now();
+      renderMetrics(data, silent);
+      noteUpdated('#metrics-note', data.as_of, data.refresh_seconds || refreshSeconds.metrics, '范围 ' + data.range);
     } catch (err) {
-      clear(box);
-      box.appendChild(el('div', 'empty', err.message));
-      pageNote('#metrics-note', '加载失败');
-      showToast(err.message, true);
+      if (!silent || !state.metrics) {
+        clear(box);
+        box.appendChild(el('div', 'empty', err.message));
+        pageNote('#metrics-note', '加载失败');
+      }
+      if (!silent) { showToast(err.message, true); }
+    } finally {
+      refreshing.metrics = false;
     }
   }
 
-  function renderMetrics(data) {
+  function renderMetrics(data, silent) {
     var box = qs('#metrics-content');
     clear(box);
     var points = data.points || [];
@@ -540,19 +733,48 @@
     lower.appendChild(rightStack);
     box.appendChild(lower);
 
+    if (silent) { flashBody(box); }
     setTimeout(function () {
-      drawSeries('chart-cpu', points, [function (p) { return Number(p.cpu_percent) || 0; }], '#52d3c5', 100);
-      drawSeries('chart-mem', points, [function (p) { return p.mem_total ? p.mem_used / p.mem_total * 100 : 0; }, function (p) { return p.swap_total ? p.swap_used / p.swap_total * 100 : 0; }], ['#7cc4ff', '#f472b6'], 100);
-      drawSeries('chart-net', points, [function (p) { return Number(p.net_rx_rate) || 0; }, function (p) { return Number(p.net_tx_rate) || 0; }], ['#52d3c5', '#fbbf24'], 0);
-      drawSeries('chart-disk', points, [function (p) { return Number(p.disk_read_rate) || 0; }, function (p) { return Number(p.disk_write_rate) || 0; }], ['#7cc4ff', '#f472b6'], 0);
-      drawSeries('chart-load', points, [function (p) { return Number(p.load1) || 0; }, function (p) { return Number(p.load5) || 0; }, function (p) { return Number(p.load15) || 0; }], ['#52d3c5', '#7cc4ff', '#fbbf24'], 0);
-      drawSeries('chart-tcp', points, [function (p) { return Number(p.tcp_connections) || 0; }, function (p) { return Number(p.established) || 0; }], ['#52d3c5', '#7cc4ff'], 0);
-      drawSeries('chart-req', traffic, [function (p) { return Number(p.requests) || 0; }, function (p) { return Number(p.failures) || 0; }], ['#52d3c5', '#f87171'], 0);
-      drawSeries('chart-bytes', traffic, [function (p) { return Number(p.bytes_in) || 0; }, function (p) { return Number(p.bytes_out) || 0; }], ['#7cc4ff', '#fbbf24'], 0);
+      drawSeries('chart-cpu', points, [function (p) { return Number(p.cpu_percent) || 0; }], ['#52d3c5'], 100, { format: 'percent', labels: ['CPU'] });
+      drawSeries('chart-mem', points, [function (p) { return p.mem_total ? p.mem_used / p.mem_total * 100 : 0; }, function (p) { return p.swap_total ? p.swap_used / p.swap_total * 100 : 0; }], ['#7cc4ff', '#f472b6'], 100, { format: 'percent', labels: ['内存', '交换'] });
+      drawSeries('chart-net', points, [function (p) { return Number(p.net_rx_rate) || 0; }, function (p) { return Number(p.net_tx_rate) || 0; }], ['#52d3c5', '#fbbf24'], 0, { format: 'rate', labels: ['下行', '上行'] });
+      drawSeries('chart-disk', points, [function (p) { return Number(p.disk_read_rate) || 0; }, function (p) { return Number(p.disk_write_rate) || 0; }], ['#7cc4ff', '#f472b6'], 0, { format: 'rate', labels: ['读取', '写入'] });
+      drawSeries('chart-load', points, [function (p) { return Number(p.load1) || 0; }, function (p) { return Number(p.load5) || 0; }, function (p) { return Number(p.load15) || 0; }], ['#52d3c5', '#7cc4ff', '#fbbf24'], 0, { format: 'load', labels: ['1 分', '5 分', '15 分'] });
+      drawSeries('chart-tcp', points, [function (p) { return Number(p.tcp_connections) || 0; }, function (p) { return Number(p.established) || 0; }], ['#52d3c5', '#7cc4ff'], 0, { format: 'count', labels: ['连接', '已建立'] });
+      drawSeries('chart-req', traffic, [function (p) { return Number(p.requests) || 0; }, function (p) { return Number(p.failures) || 0; }], ['#52d3c5', '#f87171'], 0, { format: 'count', labels: ['请求', '失败'] });
+      drawSeries('chart-bytes', traffic, [function (p) { return Number(p.bytes_in) || 0; }, function (p) { return Number(p.bytes_out) || 0; }], ['#7cc4ff', '#fbbf24'], 0, { format: 'bytes', labels: ['入', '出'] });
       names.forEach(function (name) {
-        drawSeries('chan-' + name, per[name] || [], [function (p) { return Number(p.bytes_in) || 0; }, function (p) { return Number(p.bytes_out) || 0; }], ['#7cc4ff', '#fbbf24'], 0);
+        drawSeries('chan-' + name, per[name] || [], [function (p) { return Number(p.bytes_in) || 0; }, function (p) { return Number(p.bytes_out) || 0; }], ['#7cc4ff', '#fbbf24'], 0, { format: 'bytes', labels: ['入', '出'] });
       });
     }, 30);
+  }
+
+  var chartRegistry = {};
+  var chartHoverActive = false;
+
+  function dotClass(color) {
+    var map = { '#52d3c5': 'dot-teal', '#7cc4ff': 'dot-blue', '#fbbf24': 'dot-amber', '#f472b6': 'dot-pink', '#f87171': 'dot-red' };
+    return map[color] || 'dot-teal';
+  }
+
+  function seriesColor(color) {
+    var light = state.theme === 'light';
+    var map = {
+      '#52d3c5': light ? '#0e9488' : '#52d3c5',
+      '#7cc4ff': light ? '#2563eb' : '#7cc4ff',
+      '#fbbf24': light ? '#b45309' : '#fbbf24',
+      '#f472b6': light ? '#be185d' : '#f472b6',
+      '#f87171': light ? '#dc2626' : '#f87171'
+    };
+    return map[color] || color;
+  }
+
+  function formatValue(value, format) {
+    if (format === 'percent') { return (Number(value) || 0).toFixed(1) + '%'; }
+    if (format === 'bytes') { return fmtBytes(value); }
+    if (format === 'rate') { return fmtRate(value); }
+    if (format === 'load') { return (Number(value) || 0).toFixed(2); }
+    return shortNumber(value);
   }
 
   function chartCard(title, sub, id, legend) {
@@ -563,70 +785,210 @@
     canvas.id = id;
     card.appendChild(canvas);
     var leg = el('div', 'chart-legend');
-    legend.forEach(function (l) {
+    (legend || []).forEach(function (l) {
       var item = el('span');
-      var dot = el('span', 'dot');
-      dot.className = 'dot dot-' + (legend.indexOf(l) + 1);
+      var dot = el('span', 'dot ' + dotClass(l.color));
       item.appendChild(dot);
       item.appendChild(document.createTextNode(l.label));
       leg.appendChild(item);
     });
-    card.appendChild(leg);
+    if (leg.children.length) { card.appendChild(leg); }
     return card;
   }
 
-  function drawSeries(id, points, getters, colors, fixedMax) {
+  function chartGeom(canvas) {
+    var width = canvas.clientWidth;
+    var height = canvas.clientHeight;
+    if (!width || !height) { return null; }
+    var padL = 38, padR = 10, padT = 10, padB = 18;
+    return { width: width, height: height, padL: padL, padR: padR, padT: padT, padB: padB, w: width - padL - padR, h: height - padT - padB };
+  }
+
+  function drawSeries(id, points, getters, colors, fixedMax, opts) {
     var canvas = document.getElementById(id);
     if (!canvas) { return; }
+    chartRegistry[id] = { points: points || [], getters: getters, colors: colors, fixedMax: fixedMax, opts: opts || {} };
+    paintChart(id, -1);
+    if (canvas.dataset.hoverBound) { return; }
+    canvas.dataset.hoverBound = '1';
+    canvas.addEventListener('mousemove', function (ev) {
+      var reg = chartRegistry[id];
+      var geom = chartGeom(canvas);
+      if (!reg || !geom) { return; }
+      var n = reg.points.length;
+      if (n < 2) { return; }
+      var rect = canvas.getBoundingClientRect();
+      var mx = ev.clientX - rect.left;
+      if (mx < geom.padL - 6 || mx > geom.padL + geom.w + 6) { paintChart(id, -1); return; }
+      var idx = Math.round((mx - geom.padL) / geom.w * (n - 1));
+      if (idx < 0) { idx = 0; }
+      if (idx > n - 1) { idx = n - 1; }
+      paintChart(id, idx);
+    });
+    canvas.addEventListener('mouseenter', function () { chartHoverActive = true; });
+    canvas.addEventListener('mouseleave', function () { chartHoverActive = false; paintChart(id, -1); });
+  }
+
+  function paintChart(id, hoverIndex) {
+    var canvas = document.getElementById(id);
+    var reg = chartRegistry[id];
+    if (!canvas || !reg) { return; }
+    var geom = chartGeom(canvas);
+    if (!geom) { return; }
     var dpr = window.devicePixelRatio || 1;
-    var width = canvas.clientWidth || 400;
-    var height = canvas.clientHeight || 180;
-    canvas.width = Math.round(width * dpr);
-    canvas.height = Math.round(height * dpr);
+    var pixelW = Math.round(geom.width * dpr);
+    var pixelH = Math.round(geom.height * dpr);
+    if (canvas.width !== pixelW) { canvas.width = pixelW; }
+    if (canvas.height !== pixelH) { canvas.height = pixelH; }
     var ctx = canvas.getContext('2d');
     if (!ctx) { return; }
-    ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, width, height);
-    ctx.fillStyle = 'rgba(7, 12, 17, 0.55)';
-    ctx.fillRect(0, 0, width, height);
-    var padL = 38, padR = 8, padT = 10, padB = 18;
-    var w = width - padL - padR, h = height - padT - padB;
-    var max = Number(fixedMax) || 0;
-    var values = [];
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, geom.width, geom.height);
+
+    var points = reg.points;
+    var getters = reg.getters;
+    var colors = reg.colors;
+    var format = reg.opts.format || 'count';
+    var labels = reg.opts.labels || [];
+    var padL = geom.padL, padT = geom.padT, w = geom.w, h = geom.h;
+
+    ctx.fillStyle = cssVar('--chart-bg', 'rgba(7, 12, 17, 0.55)');
+    ctx.beginPath();
+    roundRect(ctx, 0, 0, geom.width, geom.height, 10);
+    ctx.fill();
+
+    var max = Number(reg.fixedMax) || 0;
     getters.forEach(function (g) {
-      var arr = points.map(function (p) { var v = Number(g(p)) || 0; if (v < 0) { v = 0; } values.push(v); return v; });
-      if (!max) { arr.forEach(function (v) { if (v > max) { max = v; } }); }
+      points.forEach(function (p) {
+        var v = Number(g(p)) || 0;
+        if (v < 0) { v = 0; }
+        if (!max && v > max) { max = v; }
+      });
     });
     if (!max || !isFinite(max)) { max = 1; }
     max = max * 1.15;
-    ctx.strokeStyle = 'rgba(35, 49, 63, 0.65)';
+
+    ctx.strokeStyle = cssVar('--chart-grid', 'rgba(35, 49, 63, 0.65)');
     ctx.lineWidth = 1;
     for (var i = 0; i <= 3; i++) {
-      var y = padT + h * i / 3;
-      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + w, y); ctx.stroke();
+      var gy = padT + h * i / 3;
+      ctx.beginPath();
+      ctx.moveTo(padL, gy);
+      ctx.lineTo(padL + w, gy);
+      ctx.stroke();
     }
-    ctx.fillStyle = '#64748b';
+    ctx.fillStyle = cssVar('--chart-axis', '#64748b');
     ctx.font = '10px system-ui, sans-serif';
     ctx.textAlign = 'right';
     for (var j = 0; j <= 3; j++) {
       var val = max * (3 - j) / 3.45;
       var yy = padT + h * j / 3 + 3;
-      ctx.fillText(shortNumber(val), padL - 6, yy);
+      ctx.fillText(formatValue(val, format), padL - 6, yy);
     }
-    if (points.length < 2) { return; }
-    getters.forEach(function (g, idx) {
-      ctx.strokeStyle = Array.isArray(colors) ? colors[idx] : colors;
-      ctx.lineWidth = 1.6;
-      ctx.beginPath();
-      points.forEach(function (p, k) {
+
+    if (points.length < 2) {
+      ctx.fillStyle = cssVar('--chart-axis', '#64748b');
+      ctx.font = '11px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('数据点不足，等待下一次采样', padL + w / 2, padT + h / 2);
+      return;
+    }
+
+    var series = getters.map(function (g) {
+      return points.map(function (p) {
         var v = Number(g(p)) || 0;
-        var x = padL + w * (k / (points.length - 1));
+        if (v < 0) { v = 0; }
+        return v;
+      });
+    });
+    var xs = points.map(function (p, k) { return padL + w * (k / (points.length - 1)); });
+
+    series.forEach(function (values, idx) {
+      var color = seriesColor(Array.isArray(colors) ? colors[idx] : colors);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.7;
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      values.forEach(function (v, k) {
         var y = padT + h - (v / max) * h;
         if (y < padT) { y = padT; }
         if (y > padT + h) { y = padT + h; }
-        if (k === 0) { ctx.moveTo(x, y); } else { ctx.lineTo(x, y); }
+        if (k === 0) { ctx.moveTo(xs[k], y); } else { ctx.lineTo(xs[k], y); }
       });
       ctx.stroke();
+    });
+
+    if (hoverIndex < 0 || hoverIndex >= points.length) { return; }
+
+    var hx = xs[hoverIndex];
+    ctx.strokeStyle = cssVar('--chart-cursor', 'rgba(139, 155, 173, 0.75)');
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(hx, padT);
+    ctx.lineTo(hx, padT + h);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    var tipLines = [];
+    var point = points[hoverIndex];
+    var at = point.at !== undefined ? point.at : point.t;
+    tipLines.push(at !== undefined ? fmtClock(at) : ('第 ' + (hoverIndex + 1) + ' 点'));
+    series.forEach(function (values, idx) {
+      var v = values[hoverIndex];
+      var y = padT + h - (v / max) * h;
+      if (y < padT) { y = padT; }
+      if (y > padT + h) { y = padT + h; }
+      var color = seriesColor(Array.isArray(colors) ? colors[idx] : colors);
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(hx, y, 3.2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = cssVar('--chart-dot-ring', 'rgba(7, 12, 17, 0.9)');
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+      var name = labels[idx] || ('系列 ' + (idx + 1));
+      tipLines.push(name + '  ' + formatValue(v, format));
+    });
+
+    ctx.font = '11px system-ui, sans-serif';
+    var tipWidth = 0;
+    tipLines.forEach(function (line) { tipWidth = Math.max(tipWidth, ctx.measureText(line).width); });
+    tipWidth += 20;
+    var tipHeight = tipLines.length * 16 + 12;
+    var tipX = hx + 12;
+    if (tipX + tipWidth > geom.width - 4) { tipX = hx - 12 - tipWidth; }
+    if (tipX < 4) { tipX = 4; }
+    var tipY = padT + 4;
+    ctx.fillStyle = cssVar('--chart-tip-bg', 'rgba(9, 14, 20, 0.94)');
+    ctx.strokeStyle = cssVar('--chart-tip-line', 'rgba(82, 211, 197, 0.4)');
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    roundRect(ctx, tipX, tipY, tipWidth, tipHeight, 8);
+    ctx.fill();
+    ctx.stroke();
+    ctx.textAlign = 'left';
+    tipLines.forEach(function (line, idx2) {
+      ctx.fillStyle = idx2 === 0 ? cssVar('--chart-axis', '#94a3b8') : cssVar('--chart-tip-text', '#e6edf5');
+      ctx.fillText(line, tipX + 10, tipY + 18 + idx2 * 16);
+    });
+  }
+
+  function roundRect(ctx, x, y, width, height, radius) {
+    var r = Math.min(radius, width / 2, height / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + width, y, x + width, y + height, r);
+    ctx.arcTo(x + width, y + height, x, y + height, r);
+    ctx.arcTo(x, y + height, x, y, r);
+    ctx.arcTo(x, y, x + width, y, r);
+    ctx.closePath();
+  }
+
+  function redrawCharts() {
+    Object.keys(chartRegistry).forEach(function (id) {
+      var canvas = document.getElementById(id);
+      if (!canvas) { delete chartRegistry[id]; return; }
+      paintChart(id, -1);
     });
   }
 
@@ -646,18 +1008,28 @@
     loadMetrics();
   }
 
-  async function loadProxies() {
+  async function loadProxies(opts) {
+    opts = opts || {};
+    var silent = !!opts.silent;
+    if (refreshing.proxies) { return; }
+    refreshing.proxies = true;
     var box = qs('#proxies-content');
-    pageNote('#proxies-note', '加载中…');
+    if (!silent && !state.proxies) { pageNote('#proxies-note', '加载中…'); }
     try {
       var data = await api('/api/proxies');
       state.proxies = data;
-      renderProxies(data);
-      pageNote('#proxies-note', '更新于 ' + fmtTime(data.as_of));
+      lastRefresh.proxies = Date.now();
+      renderProxies(data, silent);
+      noteUpdated('#proxies-note', data.as_of, data.refresh_seconds || refreshSeconds.proxies, '按通道统计最近 60 分钟');
     } catch (err) {
-      clear(box);
-      box.appendChild(el('div', 'empty', err.message));
-      showToast(err.message, true);
+      if (!silent || !state.proxies) {
+        clear(box);
+        box.appendChild(el('div', 'empty', err.message));
+        pageNote('#proxies-note', '加载失败');
+      }
+      if (!silent) { showToast(err.message, true); }
+    } finally {
+      refreshing.proxies = false;
     }
   }
 
@@ -750,7 +1122,7 @@
     return card;
   }
 
-  function renderProxies(data) {
+  function renderProxies(data, silent) {
     var box = qs('#proxies-content');
     clear(box);
     var proxies = data.proxies || [];
@@ -775,9 +1147,10 @@
     proxies.forEach(function (p) { grid.appendChild(proxyCard(p)); });
     box.appendChild(grid);
 
+    if (silent) { flashBody(box); }
     setTimeout(function () {
       proxies.forEach(function (p) {
-        drawSeries('px-' + p.name, p.series || [], [function (pt) { return Number(pt.requests) || 0; }, function (pt) { return Number(pt.failures) || 0; }], ['#52d3c5', '#f87171'], 0);
+        drawSeries('px-' + p.name, p.series || [], [function (pt) { return Number(pt.requests) || 0; }, function (pt) { return Number(pt.failures) || 0; }], ['#52d3c5', '#f87171'], 0, { format: 'count', labels: ['请求', '失败'] });
       });
     }, 30);
 
@@ -790,26 +1163,39 @@
     }
   }
 
-  async function loadEffect() {
+  async function loadEffect(opts) {
+    opts = opts || {};
+    var silent = !!opts.silent;
     var box = qs('#effect-content');
     if (!box) { return; }
-    pageNote('#effect-note', '加载中…');
-    clear(box);
-    box.appendChild(el('div', 'skeleton'));
+    if (refreshing.effect) { return; }
+    refreshing.effect = true;
+    if (!silent) {
+      if (!state.effect) {
+        pageNote('#effect-note', '加载中…');
+        clear(box);
+        box.appendChild(el('div', 'skeleton'));
+      }
+    }
     try {
       var data = await api('/api/effect');
       state.effect = data;
-      renderEffect(data);
-      pageNote('#effect-note', '最近 ' + data.window_minutes + ' 分钟 · 更新于 ' + fmtTime(data.as_of));
+      lastRefresh.effect = Date.now();
+      renderEffect(data, silent);
+      noteUpdated('#effect-note', data.as_of, refreshSeconds.effect, '最近 ' + data.window_minutes + ' 分钟');
     } catch (err) {
-      clear(box);
-      box.appendChild(el('div', 'empty', err.message));
-      pageNote('#effect-note', '加载失败');
-      showToast(err.message, true);
+      if (!silent || !state.effect) {
+        clear(box);
+        box.appendChild(el('div', 'empty', err.message));
+        pageNote('#effect-note', '加载失败');
+      }
+      if (!silent) { showToast(err.message, true); }
+    } finally {
+      refreshing.effect = false;
     }
   }
 
-  function renderEffect(data) {
+  function renderEffect(data, silent) {
     var box = qs('#effect-content');
     clear(box);
     var totals = data.totals || {};
@@ -868,8 +1254,11 @@
     }
 
     var series = data.series || [];
-    drawSeries('chart-effect-req', series, [function (p) { return p.requests; }, function (p) { return p.failures; }], ['#52d3c5', '#f472b6']);
-    drawSeries('chart-effect-bytes', series, [function (p) { return p.bytes_in; }, function (p) { return p.bytes_out; }], ['#7cc4ff', '#fbbf24']);
+    if (silent) { flashBody(box); }
+    setTimeout(function () {
+      drawSeries('chart-effect-req', series, [function (p) { return p.requests; }, function (p) { return p.failures; }], ['#52d3c5', '#f472b6'], 0, { format: 'count', labels: ['请求', '失败'] });
+      drawSeries('chart-effect-bytes', series, [function (p) { return p.bytes_in; }, function (p) { return p.bytes_out; }], ['#7cc4ff', '#fbbf24'], 0, { format: 'bytes', labels: ['入站', '出站'] });
+    }, 30);
   }
 
   function tablePanel(title, headers, rows) {
@@ -897,27 +1286,40 @@
     return ['跳过', ''];
   }
 
-  async function loadDiagnostics() {
+  async function loadDiagnostics(opts) {
+    opts = opts || {};
+    var silent = !!opts.silent;
+    if (refreshing.diagnostics) { return; }
+    refreshing.diagnostics = true;
     var box = qs('#diagnostics-content');
-    pageNote('#diagnostics-note', '检查中…');
-    clear(box);
-    box.appendChild(el('div', 'skeleton'));
+    if (!silent) {
+      if (!state.diagnostics) {
+        pageNote('#diagnostics-note', '检查中…');
+        clear(box);
+        box.appendChild(el('div', 'skeleton'));
+      }
+    }
     try {
       var results = await Promise.all([api('/api/diagnostics'), api('/api/cn')]);
       var report = results[0];
       state.diagnostics = report;
       state.cn = results[1];
-      renderDiagnostics(report, results[1]);
-      pageNote('#diagnostics-note', '检查于 ' + fmtTime(report.as_of));
+      lastRefresh.diagnostics = Date.now();
+      renderDiagnostics(report, results[1], silent);
+      noteUpdated('#diagnostics-note', report.as_of, refreshSeconds.diagnostics, '仅检查网关自身');
     } catch (err) {
-      clear(box);
-      box.appendChild(el('div', 'empty', err.message));
-      pageNote('#diagnostics-note', '检查失败');
-      showToast(err.message, true);
+      if (!silent || !state.diagnostics) {
+        clear(box);
+        box.appendChild(el('div', 'empty', err.message));
+        pageNote('#diagnostics-note', '检查失败');
+      }
+      if (!silent) { showToast(err.message, true); }
+    } finally {
+      refreshing.diagnostics = false;
     }
   }
 
-  function renderDiagnostics(report, cn) {
+  function renderDiagnostics(report, cn, silent) {
     var box = qs('#diagnostics-content');
     clear(box);
     var warns = 0;
@@ -929,6 +1331,7 @@
     box.appendChild(banner);
     box.appendChild(diagSection(report.project));
     if (cn) { box.appendChild(cnCommandPanel(cn)); }
+    if (silent) { flashBody(box); }
   }
 
   function diagSection(section) {
@@ -1024,22 +1427,32 @@
     if (ok) { done(); } else { showToast('复制失败，请手动选择文本', true); }
   }
 
-  async function loadBackups() {
+  async function loadBackups(opts) {
+    opts = opts || {};
+    var silent = !!opts.silent;
+    if (refreshing.backups) { return; }
+    refreshing.backups = true;
     var box = qs('#backups-content');
     try {
       var data = await api('/api/backups');
       state.backups = data.backups || [];
-      renderBackups();
+      lastRefresh.backups = Date.now();
+      renderBackups(silent);
     } catch (err) {
-      clear(box);
-      box.appendChild(el('div', 'empty', err.message));
-      showToast(err.message, true);
+      if (!silent || !state.backups.length) {
+        clear(box);
+        box.appendChild(el('div', 'empty', err.message));
+      }
+      if (!silent) { showToast(err.message, true); }
+    } finally {
+      refreshing.backups = false;
     }
   }
 
-  function renderBackups() {
+  function renderBackups(silent) {
     var box = qs('#backups-content');
     clear(box);
+    if (silent) { flashBody(box); }
     if (!state.backups.length) {
       box.appendChild(el('div', 'empty', '还没有备份。点击“创建备份”生成第一个备份。'));
       return;
@@ -1116,34 +1529,55 @@
     }
   }
 
-  async function loadAudit(q) {
+  async function loadAudit(opts) {
+    opts = opts || {};
+    var silent = !!opts.silent;
+    var q = typeof opts === 'string' ? opts : (opts.q !== undefined ? opts.q : state.auditQuery);
+    if (refreshing.audit) { return; }
+    refreshing.audit = true;
     var box = qs('#audit-content');
     try {
       var data = await api('/api/audit?limit=200' + (q ? '&q=' + encodeURIComponent(q) : ''));
+      state.auditQuery = q || '';
       state.audit = data.items || [];
+      lastRefresh.audit = Date.now();
       clear(box);
+      if (silent) { flashBody(box); }
       if (!state.audit.length) { box.appendChild(el('div', 'empty', '没有匹配的记录')); return; }
       var rows = state.audit.map(function (it) { return [fmtTime(it.ts), it.action, it.detail, it.result, it.ip]; });
       box.appendChild(tablePanel('操作记录', ['时间', '操作', '详情', '结果', '来源 IP'], rows));
     } catch (err) {
-      clear(box);
-      box.appendChild(el('div', 'empty', err.message));
-      showToast(err.message, true);
+      if (!silent) {
+        clear(box);
+        box.appendChild(el('div', 'empty', err.message));
+        showToast(err.message, true);
+      }
+    } finally {
+      refreshing.audit = false;
     }
   }
 
-  async function loadSettings() {
+  async function loadSettings(opts) {
+    opts = opts || {};
+    var silent = !!opts.silent;
+    if (refreshing.settings) { return; }
+    refreshing.settings = true;
     var box = qs('#settings-content');
     try {
       var results = await Promise.all([api('/api/settings'), api('/api/cn')]);
       var data = results[0];
       state.settings = data;
       state.cn = results[1];
-      renderSettings(data);
+      lastRefresh.settings = Date.now();
+      renderSettings(data, silent);
     } catch (err) {
-      clear(box);
-      box.appendChild(el('div', 'empty', err.message));
-      showToast(err.message, true);
+      if (!silent || !state.settings) {
+        clear(box);
+        box.appendChild(el('div', 'empty', err.message));
+      }
+      if (!silent) { showToast(err.message, true); }
+    } finally {
+      refreshing.settings = false;
     }
   }
 
@@ -1262,7 +1696,7 @@
     return panel;
   }
 
-  function renderSettings(data) {
+  function renderSettings(data, silent) {
     var box = qs('#settings-content');
     clear(box);
     var grid = el('div', 'settings-grid');
@@ -1351,6 +1785,7 @@
     grid.appendChild(configPanel);
 
     box.appendChild(grid);
+    if (silent) { flashBody(box); }
   }
 
   function field(label, type) {
@@ -1408,23 +1843,31 @@
   }
   function closeModal() { qs('#modal').hidden = true; }
 
-  async function loadSingbox() {
+  async function loadSingbox(opts) {
+    opts = opts || {};
+    var silent = !!opts.silent;
+    if (refreshing.singbox) { return; }
+    refreshing.singbox = true;
     var box = qs('#singbox-content');
-    if (!state.singbox) { clear(box); box.appendChild(el('div', 'skeleton')); }
-    pageNote('#singbox-note', '加载中…');
+    if (!silent && !state.singbox) { clear(box); box.appendChild(el('div', 'skeleton')); }
     try {
       var data = await api('/api/singbox');
       state.singbox = data;
-      renderSingbox(data);
-      pageNote('#singbox-note', (data.installed && data.version ? 'sing-box ' + data.version + ' · ' : '') + '更新于 ' + fmtTime(data.as_of));
+      lastRefresh.singbox = Date.now();
+      renderSingbox(data, silent);
+      noteUpdated('#singbox-note', data.as_of, refreshSeconds.singbox, (data.installed && data.version ? 'sing-box ' + data.version : ''));
     } catch (err) {
-      clear(box);
-      box.appendChild(el('div', 'empty', err.message));
-      pageNote('#singbox-note', '加载失败');
+      if (!silent || !state.singbox) {
+        clear(box);
+        box.appendChild(el('div', 'empty', err.message));
+        pageNote('#singbox-note', '加载失败');
+      }
+    } finally {
+      refreshing.singbox = false;
     }
   }
 
-  function renderSingbox(data) {
+  function renderSingbox(data, silent) {
     var box = qs('#singbox-content');
     clear(box);
     var tips = [];
@@ -1514,6 +1957,7 @@
         return [b.name, fmtBytes(b.size), fmtTime(b.modified)];
       })));
     }
+    if (silent) { flashBody(box); }
   }
 
   function sbDriftNotice(drift) {
@@ -2025,12 +2469,29 @@
     Array.prototype.forEach.call(document.querySelectorAll('.nav-item'), function (b) {
       b.addEventListener('click', function () { navigate(b.getAttribute('data-view')); });
     });
-    qs('#refresh-overview').addEventListener('click', loadOverview);
-    qs('#refresh-proxies').addEventListener('click', loadProxies);
-    qs('#refresh-singbox').addEventListener('click', function () { loadSingbox(); });
-    qs('#refresh-effect').addEventListener('click', loadEffect);
-    qs('#refresh-diagnostics').addEventListener('click', loadDiagnostics);
+    bindRefresh('#refresh-overview', loadOverview, 'overview');
+    bindRefresh('#refresh-proxies', loadProxies, 'proxies');
+    bindRefresh('#refresh-singbox', loadSingbox, 'singbox');
+    bindRefresh('#refresh-effect', loadEffect, 'effect');
+    bindRefresh('#refresh-diagnostics', loadDiagnostics, 'diagnostics');
     qs('#create-backup').addEventListener('click', function () { createBackup(this); });
+    qs('#theme-toggle').addEventListener('click', toggleTheme);
+    var themeLogin = qs('#theme-toggle-login');
+    if (themeLogin) { themeLogin.addEventListener('click', toggleTheme); }
+    window.addEventListener('resize', function () {
+      clearTimeout(bind.resizeTimer);
+      bind.resizeTimer = setTimeout(redrawCharts, 180);
+    });
+    window.addEventListener('hashchange', function () {
+      var v = currentViewFromHash();
+      if (v && v !== state.view) { navigate(v); }
+    });
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible' && state.session.authenticated) {
+        var load = viewLoader(state.view);
+        if (load) { load({ silent: true }); }
+      }
+    });
     qs('#metrics-range').addEventListener('click', function (ev) {
       var b = ev.target.closest('.range');
       if (b) { setRange(b.getAttribute('data-range')); }
@@ -2041,9 +2502,6 @@
     });
     qs('#modal-close').addEventListener('click', function () { qs('#modal').hidden = true; });
     qs('#modal').addEventListener('click', function (ev) { if (ev.target === qs('#modal')) { qs('#modal').hidden = true; } });
-    setInterval(function () {
-      if (state.session.authenticated && state.view === 'overview') { loadOverview(); }
-    }, 20000);
   }
 
   bind();

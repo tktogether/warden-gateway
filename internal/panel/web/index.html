@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -28,7 +28,10 @@
     </ul>
   </div>
   <form id="login-form" class="login-card">
-    <h2>登录</h2>
+    <div class="login-head">
+      <h2>登录</h2>
+      <button id="theme-toggle-login" class="btn ghost small" type="button">浅色</button>
+    </div>
     <p class="muted">请输入访问密钥。</p>
     <label class="field">
       <span>访问密钥</span>
@@ -50,7 +53,10 @@
       </div>
     </div>
     <div class="top-actions">
+      <span id="panel-version" class="top-chip"></span>
+      <span id="panel-key" class="top-chip"></span>
       <span id="top-status" class="pill">连接中</span>
+      <button id="theme-toggle" class="btn ghost small" type="button" title="切换主题">浅色</button>
       <button id="logout" class="btn ghost" type="button">退出登录</button>
     </div>
   </header>
@@ -68,10 +74,6 @@
         <button class="nav-item" data-view="audit" type="button">审计</button>
         <button class="nav-item" data-view="settings" type="button">设置</button>
       </nav>
-      <div class="sidebar-foot">
-        <span id="panel-version" class="muted"></span>
-        <span id="panel-key" class="muted"></span>
-      </div>
     </aside>
 
     <main class="main">
@@ -80,7 +82,7 @@
           <div><h2>总览</h2><p id="overview-note" class="muted">加载中…</p></div>
           <button id="refresh-overview" class="btn" type="button">刷新</button>
         </div>
-        <div id="overview-content"></div>
+        <div id="overview-content" class="view-body"></div>
       </section>
 
       <section id="view-metrics" class="view" hidden>
@@ -92,7 +94,7 @@
             <button class="range" data-range="24h" type="button">24 小时</button>
           </div>
         </div>
-        <div id="metrics-content"></div>
+        <div id="metrics-content" class="view-body"></div>
       </section>
 
       <section id="view-proxies" class="view" hidden>
@@ -100,7 +102,7 @@
           <div><h2>代理</h2><p id="proxies-note" class="muted">入口、镜像与下载代理</p></div>
           <button id="refresh-proxies" class="btn" type="button">刷新</button>
         </div>
-        <div id="proxies-content"></div>
+        <div id="proxies-content" class="view-body"></div>
       </section>
 
       <section id="view-singbox" class="view" hidden>
@@ -108,7 +110,7 @@
           <div><h2>节点</h2><p id="singbox-note" class="muted">sing-box 节点、分享链接与实时连接</p></div>
           <button id="refresh-singbox" class="btn" type="button">刷新</button>
         </div>
-        <div id="singbox-content"></div>
+        <div id="singbox-content" class="view-body"></div>
       </section>
 
       <section id="view-effect" class="view" hidden>
@@ -116,7 +118,7 @@
           <div><h2>承载</h2><p id="effect-note" class="muted">网关最近实际承载的流量、成功率与耗时</p></div>
           <button id="refresh-effect" class="btn" type="button">刷新</button>
         </div>
-        <div id="effect-content"></div>
+        <div id="effect-content" class="view-body"></div>
       </section>
 
       <section id="view-diagnostics" class="view" hidden>
@@ -124,7 +126,7 @@
           <div><h2>诊断</h2><p id="diagnostics-note" class="muted">网关自身的配置、监听与证书</p></div>
           <button id="refresh-diagnostics" class="btn" type="button">重新检查</button>
         </div>
-        <div id="diagnostics-content"></div>
+        <div id="diagnostics-content" class="view-body"></div>
       </section>
 
       <section id="view-backups" class="view" hidden>
@@ -132,7 +134,7 @@
           <div><h2>备份</h2><p class="muted">备份配置、ACME 证书和 systemd 单元；恢复后自动重启。</p></div>
           <button id="create-backup" class="btn primary" type="button">创建备份</button>
         </div>
-        <div id="backups-content"></div>
+        <div id="backups-content" class="view-body"></div>
       </section>
 
       <section id="view-audit" class="view" hidden>
@@ -143,14 +145,14 @@
             <button class="btn" type="submit">搜索</button>
           </form>
         </div>
-        <div id="audit-content"></div>
+        <div id="audit-content" class="view-body"></div>
       </section>
 
       <section id="view-settings" class="view" hidden>
         <div class="page-head">
           <div><h2>设置</h2><p class="muted">访问密钥、证书与运行配置。</p></div>
         </div>
-        <div id="settings-content"></div>
+        <div id="settings-content" class="view-body"></div>
       </section>
     </main>
   </div>

@@ -16,7 +16,7 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/overview` | 主机、证书、服务、代理、审计摘要 |
+| GET | `/api/overview` | 主机、证书、服务、代理、审计摘要，含 `refresh_seconds` |
 | GET | `/api/metrics?range=1h\|6h\|24h` | 主机指标序列与代理流量序列，见下 |
 | GET | `/api/proxies` | 代理统计，含速率、延迟分布、状态码、热点目标与近六十分钟序列 |
 | POST | `/api/proxies/test` | 测试代理，body `{"name":"docker\|github\|panel\|sni\|dns"}` |
@@ -36,7 +36,8 @@
 | 字段 | 说明 |
 | --- | --- |
 | `range` | `1h`、`6h` 或 `24h` |
-| `points` | 主机采样序列，最多 360 点 |
+| `points` | 主机采样序列，按范围降采样，最多 360 点 |
+| `sample_seconds`、`refresh_seconds` | 主机采样间隔，两者均为 5 秒，供面板定时刷新 |
 | `latest` | 最近一次采样 |
 | `host` | 主机名、系统、内核、架构、核数、运行时间、磁盘用量 |
 | `ifaces` | 各网卡当前收发速率 |
