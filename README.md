@@ -30,7 +30,7 @@ SNI 路由
 
 | 端口 | 协议 | 用途 |
 | --- | --- | --- |
-| 80 | TCP | ACME HTTP-01 校验；同时响应 `/healthz`，供国内机与看门狗探测 |
+| 80 | TCP | ACME HTTP-01 校验；响应 `/healthz`；并把短路径 `/<host>/<path>` 直接交给 GitHub 代理（HTTPS 不可靠的线路可用 `http://` 克隆） |
 | 443 | TCP | SNI 统一入口 |
 | 8443 | TCP | 面板与路径代理，默认只监听 127.0.0.1 |
 | 8080 | TCP | 本地 HTTP，默认只监听 127.0.0.1 |
@@ -172,6 +172,14 @@ git clone https://panel.example.com/github.com/owner/repo
 ```
 
 两种形式等价：`/github.com/owner/repo` 会被补全为 `https://github.com/owner/repo`。首段主机名必须在 `github.allow_hosts` 里，端口与 userinfo 不被接受。
+
+短路径在 80 端口同样可用，不需要跳到 HTTPS：
+
+```bash
+git clone http://panel.example.com/github.com/owner/repo
+```
+
+当某条线路到 443 的连接不稳定时（SYN 偶发丢失、握手超时），可以把构建机或 Coolify 的仓库地址写成 `http://` 短路径，让 git 走 80 端口。80 端口只对短路径做反代；ACME 校验路径 `/.well-known/acme-challenge/` 与其他所有路径仍然跳转到 HTTPS。
 
 ### GitHub 发布包
 

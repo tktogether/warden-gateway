@@ -9,7 +9,7 @@
 | SNI 入口 | `0.0.0.0:443` | 读取 TLS ClientHello，按 SNI 分流 |
 | HTTPS 面板 | `127.0.0.1:8443` | 面板、Docker 代理、GitHub 代理 |
 | HTTP | `127.0.0.1:8080` | 本地健康检查和调试 |
-| ACME | `0.0.0.0:80` | 证书 HTTP-01 校验；同时响应 `/healthz` |
+| ACME | `0.0.0.0:80` | 证书 HTTP-01 校验、`/healthz`、短路径 `/<host>/<path>` 的明文反代 |
 | DNS | `0.0.0.0:53` | 可选域名分流，默认关闭；53 被占用时自动回退到 5353、5300、9053 |
 
 sing-box 不由本进程托管：主配置 `/etc/sing-box/config.json` 引用 `/etc/sing-box/conf/*.json` 节点，内核在 `/etc/sing-box/bin/sing-box`，单元为 `sing-box.service`。面板与命令行通过 `sing-box check` 校验配置、通过 `systemctl` 重载服务；内核安装、备份与回滚由 `internal/singbox` 完成。
@@ -42,6 +42,8 @@ GET https://panel.example.com/github.com/owner/repo/...         -> SNI -> 8443 -
 两种形式等价：显式前缀 `/http://`、`/https://` 按原样解析；短路径 `/<host>/<path>` 的第一段若命中 `allow_hosts`，补全为 `https://<host>/<path>`。短路径不接受端口与 userinfo。路由由 `githubproxy.Handler.HandlesPath` 判定，命中后才进入 GitHub 分支，因此 `/warden/`、`/v2/` 等保留路径不受影响；代理关闭时短路径返回 503 而不是 404。
 
 `/healthz` 在 443 面板入口和 80 端口（ACME 监听）上都直接返回 `{"ok":true,"version":"...","started":"..."}`，不需要登录，供国内机与看门狗探测代理机是否可用。
+
+80 端口的明文 handler（`app.App.HTTPHandler`）除 `/healthz` 外，还把命中 `HandlesPath` 的短路径直接交给 GitHub 代理，其余请求（含 `/.well-known/acme-challenge/`）继续交给 TLS 管理器的明文 handler，也就是保持 ACME 校验并 301 到 HTTPS。这样某条线路到 443 的建连不稳定时，仍可以用 `http://panel.example.com/github.com/owner/repo` 完成 clone。
 
 ### 透传
 

@@ -186,13 +186,24 @@ func (a *App) Handler() http.Handler {
 	})
 }
 
-// HTTPHandler returns the plain-HTTP handler: it answers /healthz locally and
-// hands everything else to the configured TLS/ACME handler (which redirects to
-// https or serves ACME challenges).
+// acmeChallengePrefix is the path the ACME HTTP-01 solver answers on. Requests
+// under it must always reach the TLS manager's plain-HTTP handler.
+const acmeChallengePrefix = "/.well-known/acme-challenge/"
+
+// HTTPHandler returns the plain-HTTP handler. It answers /healthz locally, and
+// serves the GitHub proxy over plain HTTP for the short /<host>/<path> form so a
+// client that cannot reach 443 reliably can still fetch repositories. Every
+// other request, including ACME challenges, goes to the configured TLS/ACME
+// handler (which solves challenges or redirects to https).
 func (a *App) HTTPHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" {
+		p := r.URL.Path
+		if p == "/healthz" {
 			a.serveHealthz(w, r)
+			return
+		}
+		if a.github != nil && !strings.HasPrefix(p, acmeChallengePrefix) && a.github.HandlesPath(p) {
+			a.github.ServeHTTP(w, r)
 			return
 		}
 		if a.tls == nil || a.tls.HTTPHandler == nil {

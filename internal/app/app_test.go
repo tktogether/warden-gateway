@@ -140,6 +140,46 @@ func TestHandlerShortGitHubPath(t *testing.T) {
 	}
 }
 
+// TestPlainHTTPServesShortGitHubPath pins the plain-HTTP behaviour: the short
+// /<host>/<path> form is served by the GitHub proxy on port 80 as well, so a
+// client whose path to 443 is unreliable can still clone over http://, while
+// ACME challenges and every other path keep going to the TLS manager.
+func TestPlainHTTPServesShortGitHubPath(t *testing.T) {
+	a := newTestApp(t)
+	plain := a.HTTPHandler()
+
+	// The proxy is disabled in the test config, so the path must be claimed by
+	// the github branch (503) rather than falling through to the https redirect.
+	rec := httptest.NewRecorder()
+	plain.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/github.com/tktogether/llmio/info/refs?service=git-upload-pack", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("plain http short github status %d: %s", rec.Code, rec.Body)
+	}
+
+	rec = httptest.NewRecorder()
+	plain.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/https://github.com/tktogether/llmio", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("plain http long github status %d: %s", rec.Code, rec.Body)
+	}
+
+	// ACME challenges must never be swallowed by the proxy.
+	rec = httptest.NewRecorder()
+	plain.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/.well-known/acme-challenge/token", nil))
+	if rec.Code != http.StatusMovedPermanently {
+		t.Fatalf("acme challenge status %d", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); !strings.HasPrefix(loc, "https://") {
+		t.Fatalf("acme challenge location %q", loc)
+	}
+
+	// Unrelated paths still redirect to https.
+	rec = httptest.NewRecorder()
+	plain.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/favicon.svg", nil))
+	if rec.Code != http.StatusMovedPermanently {
+		t.Fatalf("favicon plain http status %d", rec.Code)
+	}
+}
+
 func newTestApp(t *testing.T) *App {
 	t.Helper()
 	cfg := config.Default()
