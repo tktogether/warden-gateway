@@ -51,9 +51,6 @@
       var saved = window.localStorage.getItem(THEME_KEY);
       if (saved === 'light' || saved === 'dark') { return saved; }
     } catch (e) { /* ignore */ }
-    try {
-      if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) { return 'light'; }
-    } catch (e) { /* ignore */ }
     return 'dark';
   }
 
@@ -103,7 +100,8 @@
     var parts = ['更新于 ' + fmtClock(at)];
     if (seconds) { parts.push('每 ' + seconds + ' 秒自动刷新'); }
     if (extra) { parts.push(extra); }
-    node.textContent = parts.join(' · ');
+    node.textContent = '更新于 ' + fmtClock(at);
+    node.title = parts.join(' · ');
     flashNote(node);
   }
 
@@ -310,7 +308,7 @@
     if (view === 'settings') { loadSettings(); }
   }
 
-  function pageNote(id, text) { var n = qs(id); if (n) { n.textContent = text; } }
+  function pageNote(id, text) { var n = qs(id); if (n) { n.textContent = text; n.title = text; } }
   function statCard(label, value, sub, tone, percent) {
     var card = el('div', 'stat-card');
     add(card, el('div', 'label', label));
@@ -773,7 +771,10 @@
     if (format === 'percent') { return (Number(value) || 0).toFixed(1) + '%'; }
     if (format === 'bytes') { return fmtBytes(value); }
     if (format === 'rate') { return fmtRate(value); }
-    if (format === 'load') { return (Number(value) || 0).toFixed(2); }
+    if (format === 'load') {
+      var n = Number(value) || 0;
+      return Math.abs(n) < 1 ? n.toFixed(3) : n.toFixed(2);
+    }
     return shortNumber(value);
   }
 
@@ -796,11 +797,12 @@
     return card;
   }
 
-  function chartGeom(canvas) {
+  function chartGeom(canvas, padL) {
     var width = canvas.clientWidth;
     var height = canvas.clientHeight;
     if (!width || !height) { return null; }
-    var padL = 38, padR = 10, padT = 10, padB = 18;
+    if (!padL || padL < 20) { padL = 38; }
+    var padR = 10, padT = 10, padB = 18;
     return { width: width, height: height, padL: padL, padR: padR, padT: padT, padB: padB, w: width - padL - padR, h: height - padT - padB };
   }
 
@@ -813,7 +815,7 @@
     canvas.dataset.hoverBound = '1';
     canvas.addEventListener('mousemove', function (ev) {
       var reg = chartRegistry[id];
-      var geom = chartGeom(canvas);
+      var geom = chartGeom(canvas, reg ? reg.padL : 0);
       if (!reg || !geom) { return; }
       var n = reg.points.length;
       if (n < 2) { return; }
@@ -833,7 +835,7 @@
     var canvas = document.getElementById(id);
     var reg = chartRegistry[id];
     if (!canvas || !reg) { return; }
-    var geom = chartGeom(canvas);
+    var geom = chartGeom(canvas, reg.padL);
     if (!geom) { return; }
     var dpr = window.devicePixelRatio || 1;
     var pixelW = Math.round(geom.width * dpr);
@@ -868,6 +870,25 @@
     if (!max || !isFinite(max)) { max = 1; }
     max = max * 1.15;
 
+    ctx.font = '10px system-ui, sans-serif';
+    var topValue = max / 1.15;
+    var ticks = [];
+    for (var t = 0; t <= 3; t++) { ticks.push(formatValue(topValue * (3 - t) / 3, format)); }
+    var needPad = 0;
+    ticks.forEach(function (label) { needPad = Math.max(needPad, ctx.measureText(label).width); });
+    needPad = Math.ceil(needPad) + 12;
+    if (needPad < 30) { needPad = 30; }
+    if (reg.padL !== needPad) {
+      reg.padL = needPad;
+      geom = chartGeom(canvas, needPad) || geom;
+      padL = geom.padL; padT = geom.padT; w = geom.w; h = geom.h;
+      ctx.fillStyle = cssVar('--chart-bg', 'rgba(7, 12, 17, 0.55)');
+      ctx.beginPath();
+      roundRect(ctx, 0, 0, geom.width, geom.height, 10);
+      ctx.fill();
+      ctx.font = '10px system-ui, sans-serif';
+    }
+
     ctx.strokeStyle = cssVar('--chart-grid', 'rgba(35, 49, 63, 0.65)');
     ctx.lineWidth = 1;
     for (var i = 0; i <= 3; i++) {
@@ -878,12 +899,10 @@
       ctx.stroke();
     }
     ctx.fillStyle = cssVar('--chart-axis', '#64748b');
-    ctx.font = '10px system-ui, sans-serif';
     ctx.textAlign = 'right';
     for (var j = 0; j <= 3; j++) {
-      var val = max * (3 - j) / 3.45;
       var yy = padT + h * j / 3 + 3;
-      ctx.fillText(formatValue(val, format), padL - 6, yy);
+      ctx.fillText(ticks[j], padL - 6, yy);
     }
 
     if (points.length < 2) {
@@ -1438,6 +1457,7 @@
       state.backups = data.backups || [];
       lastRefresh.backups = Date.now();
       renderBackups(silent);
+      noteUpdated('#backups-note', data.as_of, refreshSeconds.backups, state.backups.length + ' 个备份');
     } catch (err) {
       if (!silent || !state.backups.length) {
         clear(box);
@@ -1546,6 +1566,7 @@
       if (!state.audit.length) { box.appendChild(el('div', 'empty', '没有匹配的记录')); return; }
       var rows = state.audit.map(function (it) { return [fmtTime(it.ts), it.action, it.detail, it.result, it.ip]; });
       box.appendChild(tablePanel('操作记录', ['时间', '操作', '详情', '结果', '来源 IP'], rows));
+      noteUpdated('#audit-note', data.as_of, refreshSeconds.audit, q ? '搜索 “' + q + '”' : state.audit.length + ' 条记录');
     } catch (err) {
       if (!silent) {
         clear(box);
@@ -1570,6 +1591,7 @@
       state.cn = results[1];
       lastRefresh.settings = Date.now();
       renderSettings(data, silent);
+      noteUpdated('#settings-note', data.as_of, 0, '');
     } catch (err) {
       if (!silent || !state.settings) {
         clear(box);

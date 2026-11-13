@@ -924,6 +924,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) safeConfig() map[string]interface{} {
 	return map[string]interface{}{
+		"as_of":   config.NowUTC(),
 		"version": s.cfg.Version, "public_url": s.cfg.PanelURL(), "base_path": s.cfg.PanelPath,
 		"domain": s.cfg.Domain, "email": s.cfg.Email,
 		"tls":             map[string]interface{}{"mode": s.cfg.TLS.Mode, "cache_dir": s.cfg.TLS.CacheDir},
@@ -1124,7 +1125,7 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"items": s.auditItems(limit, r.URL.Query().Get("q"))})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"as_of": config.NowUTC(), "items": s.auditItems(limit, r.URL.Query().Get("q"))})
 }
 
 type auditItem struct {

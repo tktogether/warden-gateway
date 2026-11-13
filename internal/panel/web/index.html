@@ -79,19 +79,25 @@
     <main class="main">
       <section id="view-overview" class="view">
         <div class="page-head">
-          <div><h2>总览</h2><p id="overview-note" class="muted">加载中…</p></div>
-          <button id="refresh-overview" class="btn" type="button">刷新</button>
+          <div><h2>总览</h2><p class="muted">主机、服务、代理与证书快照。</p></div>
+          <div class="head-actions">
+            <span id="overview-note" class="update-note"></span>
+            <button id="refresh-overview" class="btn" type="button">刷新</button>
+          </div>
         </div>
         <div id="overview-content" class="view-body"></div>
       </section>
 
       <section id="view-metrics" class="view" hidden>
         <div class="page-head">
-          <div><h2>指标</h2><p id="metrics-note" class="muted">主机资源与网络趋势</p></div>
-          <div class="range-bar" id="metrics-range">
-            <button class="range active" data-range="1h" type="button">1 小时</button>
-            <button class="range" data-range="6h" type="button">6 小时</button>
-            <button class="range" data-range="24h" type="button">24 小时</button>
+          <div><h2>指标</h2><p class="muted">主机资源与网络趋势。</p></div>
+          <div class="head-actions">
+            <span id="metrics-note" class="update-note"></span>
+            <div class="range-bar" id="metrics-range">
+              <button class="range active" data-range="1h" type="button">1 小时</button>
+              <button class="range" data-range="6h" type="button">6 小时</button>
+              <button class="range" data-range="24h" type="button">24 小时</button>
+            </div>
           </div>
         </div>
         <div id="metrics-content" class="view-body"></div>
@@ -99,32 +105,44 @@
 
       <section id="view-proxies" class="view" hidden>
         <div class="page-head">
-          <div><h2>代理</h2><p id="proxies-note" class="muted">入口、镜像与下载代理</p></div>
-          <button id="refresh-proxies" class="btn" type="button">刷新</button>
+          <div><h2>代理</h2><p class="muted">入口、镜像与下载代理。</p></div>
+          <div class="head-actions">
+            <span id="proxies-note" class="update-note"></span>
+            <button id="refresh-proxies" class="btn" type="button">刷新</button>
+          </div>
         </div>
         <div id="proxies-content" class="view-body"></div>
       </section>
 
       <section id="view-singbox" class="view" hidden>
         <div class="page-head">
-          <div><h2>节点</h2><p id="singbox-note" class="muted">sing-box 节点、分享链接与实时连接</p></div>
-          <button id="refresh-singbox" class="btn" type="button">刷新</button>
+          <div><h2>节点</h2><p class="muted">sing-box 节点、分享链接与实时连接。</p></div>
+          <div class="head-actions">
+            <span id="singbox-note" class="update-note"></span>
+            <button id="refresh-singbox" class="btn" type="button">刷新</button>
+          </div>
         </div>
         <div id="singbox-content" class="view-body"></div>
       </section>
 
       <section id="view-effect" class="view" hidden>
         <div class="page-head">
-          <div><h2>承载</h2><p id="effect-note" class="muted">网关最近实际承载的流量、成功率与耗时</p></div>
-          <button id="refresh-effect" class="btn" type="button">刷新</button>
+          <div><h2>承载</h2><p class="muted">网关最近实际承载的流量、成功率与耗时。</p></div>
+          <div class="head-actions">
+            <span id="effect-note" class="update-note"></span>
+            <button id="refresh-effect" class="btn" type="button">刷新</button>
+          </div>
         </div>
         <div id="effect-content" class="view-body"></div>
       </section>
 
       <section id="view-diagnostics" class="view" hidden>
         <div class="page-head">
-          <div><h2>诊断</h2><p id="diagnostics-note" class="muted">网关自身的配置、监听与证书</p></div>
-          <button id="refresh-diagnostics" class="btn" type="button">重新检查</button>
+          <div><h2>诊断</h2><p class="muted">网关自身的配置、监听与证书。</p></div>
+          <div class="head-actions">
+            <span id="diagnostics-note" class="update-note"></span>
+            <button id="refresh-diagnostics" class="btn" type="button">重新检查</button>
+          </div>
         </div>
         <div id="diagnostics-content" class="view-body"></div>
       </section>
@@ -132,7 +150,10 @@
       <section id="view-backups" class="view" hidden>
         <div class="page-head">
           <div><h2>备份</h2><p class="muted">备份配置、ACME 证书和 systemd 单元；恢复后自动重启。</p></div>
-          <button id="create-backup" class="btn primary" type="button">创建备份</button>
+          <div class="head-actions">
+            <span id="backups-note" class="update-note"></span>
+            <button id="create-backup" class="btn primary" type="button">创建备份</button>
+          </div>
         </div>
         <div id="backups-content" class="view-body"></div>
       </section>
@@ -140,10 +161,13 @@
       <section id="view-audit" class="view" hidden>
         <div class="page-head">
           <div><h2>审计</h2><p class="muted">登录、密钥、服务操作、备份和探测记录。</p></div>
-          <form id="audit-search" class="toolbar">
-            <input id="audit-q" type="search" placeholder="搜索关键字">
-            <button class="btn" type="submit">搜索</button>
-          </form>
+          <div class="head-actions">
+            <span id="audit-note" class="update-note"></span>
+            <form id="audit-search" class="toolbar">
+              <input id="audit-q" type="search" placeholder="搜索关键字">
+              <button class="btn" type="submit">搜索</button>
+            </form>
+          </div>
         </div>
         <div id="audit-content" class="view-body"></div>
       </section>
@@ -151,6 +175,9 @@
       <section id="view-settings" class="view" hidden>
         <div class="page-head">
           <div><h2>设置</h2><p class="muted">访问密钥、证书与运行配置。</p></div>
+          <div class="head-actions">
+            <span id="settings-note" class="update-note"></span>
+          </div>
         </div>
         <div id="settings-content" class="view-body"></div>
       </section>
