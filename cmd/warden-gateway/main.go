@@ -347,6 +347,7 @@ func runSingbox(args []string) error {
 		fmt.Printf("platform=%s\n", status.Platform)
 		fmt.Printf("binary=%s\n", status.Binary)
 		fmt.Printf("unit_installed=%t\n", status.UnitInstalled)
+		fmt.Printf("unit_managed=%t\n", status.UnitManaged)
 		fmt.Printf("backups=%d\n", len(status.Backups))
 		if status.Note != "" {
 			fmt.Printf("note=%s\n", status.Note)

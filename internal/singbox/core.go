@@ -68,6 +68,7 @@ type CoreStatus struct {
 	Platform        string   `json:"platform"`
 	Binary          string   `json:"binary"`
 	UnitInstalled   bool     `json:"unit_installed"`
+	UnitManaged     bool     `json:"unit_managed"`
 	ReleaseURL      string   `json:"release_url"`
 	Backups         []string `json:"backups"`
 	Note            string   `json:"note,omitempty"`
@@ -195,6 +196,7 @@ func (m *Manager) CoreLocalStatus() CoreStatus {
 		Platform:      platform,
 		Backups:       m.coreBackups(),
 		UnitInstalled: coreUnitInstalled(m.service),
+		UnitManaged:   coreUnitManaged(m.service),
 		CheckedAt:     time.Now().UTC().Format(time.RFC3339),
 	}
 	if platformErr != nil {
@@ -397,6 +399,25 @@ func coreUnitPath(service string) string {
 
 func coreUnitInstalled(service string) bool {
 	return findUnitPath(service) != ""
+}
+
+// coreUnitManaged reports whether the installed unit was written by this
+// project, as opposed to a unit the host already had.
+func coreUnitManaged(service string) bool {
+	path := findUnitPath(service)
+	if path == "" {
+		return false
+	}
+	return unitManagedAt(path)
+}
+
+// unitManagedAt reports whether a unit file carries the managed marker.
+func unitManagedAt(path string) bool {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(raw), "managed by warden-gateway")
 }
 
 // coreUnitTemplate renders the unit the panel manages. The marker comment lets
@@ -842,9 +863,8 @@ func (m *Manager) UninstallCore(ctx context.Context) (CoreStatus, error) {
 	if unitPath == "" {
 		unitPath = coreUnitPath(m.service)
 	}
-	unitManaged := false
-	if raw, err := os.ReadFile(unitPath); err == nil && strings.Contains(string(raw), "managed by warden-gateway") {
-		unitManaged = true
+	unitManaged := unitManagedAt(unitPath)
+	if unitManaged {
 		dest := filepath.Join(archiveDir, filepath.Base(unitPath))
 		if err := copyFile(unitPath, dest, 0o644); err != nil {
 			return CoreStatus{}, fmt.Errorf("归档服务单元失败：%w", err)

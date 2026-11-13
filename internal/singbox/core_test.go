@@ -176,3 +176,27 @@ func TestCoreStatusWithoutLatestKeepsLocalFields(t *testing.T) {
 		t.Fatalf("CoreLocalStatus must report a platform: %+v", status)
 	}
 }
+
+func TestUnitManagedAtDetectsMarker(t *testing.T) {
+	dir := t.TempDir()
+	managed := filepath.Join(dir, "managed.service")
+	if err := os.WriteFile(managed, []byte("# managed by warden-gateway\n[Service]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !unitManagedAt(managed) {
+		t.Fatal("unitManagedAt(managed) = false, want true")
+	}
+	host := filepath.Join(dir, "host.service")
+	if err := os.WriteFile(host, []byte("[Service]\nExecStart=/bin/true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if unitManagedAt(host) {
+		t.Fatal("unitManagedAt(host) = true, want false")
+	}
+	if unitManagedAt(filepath.Join(dir, "missing.service")) {
+		t.Fatal("unitManagedAt(missing) = true, want false")
+	}
+	if coreUnitManaged("absent-for-test.service") {
+		t.Fatal("coreUnitManaged(absent) = true, want false")
+	}
+}

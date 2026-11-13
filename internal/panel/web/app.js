@@ -1571,7 +1571,8 @@
     add(wrap, el("p", "muted", ["sing-box 内核由本项目负责安装、更新与回滚", core.platform ? ("平台 " + core.platform) : ""].filter(Boolean).join(" · ")));
 
     var stats = el("div", "stat-grid");
-    stats.appendChild(statCard("当前版本", core.installed ? core.version : "未安装", core.unit_installed ? "系统服务由本项目管理" : "使用主机已有服务"));
+    var unitHint = !core.unit_installed ? "尚未检测到系统服务" : (core.unit_managed ? "系统服务由本项目管理" : "使用主机已有的系统服务");
+    stats.appendChild(statCard("当前版本", core.installed ? core.version : "未安装", unitHint));
     var latestCard = statCard("最新版本", "检查中…", "正在向 GitHub 查询");
     stats.appendChild(latestCard);
     wrap.appendChild(stats);

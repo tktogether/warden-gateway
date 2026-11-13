@@ -118,7 +118,7 @@ GET 请求，返回最近 `minutes`（5 到 60，默认 60）的承载统计。�
 
 `drift` 对象字段：`supported`、`running`、`configured`、`listening`、`missing`、`pending`、`changed_at`、`started_at`、`error`。它把启用节点配置的端口与 `ss -lntu` 的监听表对照：`listening` 只保留配置里也确实在监听的端口，`missing` 是配置了但没有任何监听者的端口（重启 sing-box 生效）。`pending` 表示节点文件或主配置在服务启动之后被修改过，`changed_at` 与 `started_at` 给出对应时间。服务单元只保留 `CAP_NET_BIND_SERVICE`，无法按进程归属套接字，因此不区分监听者是谁、也不统计预期之外的监听端口。sing-box 未运行时只返回配置端口，不计算差异；读取失败时 `supported` 为 false。Clash API 端口不参与比对。
 
-`core` 对象字段：`installed`、`version`、`latest`、`latest_error`、`update_available`、`platform`、`binary`、`unit_installed`、`backups`、`note`。
+`core` 对象字段：`installed`、`version`、`latest`、`latest_error`、`update_available`、`platform`、`binary`、`unit_installed`、`unit_managed`、`backups`、`note`。`unit_managed` 表示 systemd 单元由本项目写入。
 
 `install` 与 `update` 从 GitHub 发布页下载对应架构压缩包，解压后执行 `sing-box version` 核对版本再原子替换；`rollback-previous` 恢复上一份内核备份；`rollback-preinstall` 精确恢复首次安装前的内核、单元与服务状态；`uninstall` 把内核与单元归档到数据目录，节点配置保留。
 

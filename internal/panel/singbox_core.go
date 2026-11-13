@@ -20,6 +20,7 @@ func coreJSON(status singbox.CoreStatus) map[string]interface{} {
 		"platform":         status.Platform,
 		"binary":           status.Binary,
 		"unit_installed":   status.UnitInstalled,
+		"unit_managed":     status.UnitManaged,
 		"release_url":      status.ReleaseURL,
 		"backups":          status.Backups,
 	}
