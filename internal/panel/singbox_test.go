@@ -252,3 +252,27 @@ func TestSingboxDisabledReturns503(t *testing.T) {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
 }
+
+func TestSingboxPayloadExposesPortDrift(t *testing.T) {
+	srv, key, _ := newSingboxPanel(t)
+	cookie, _ := login(t, srv, key)
+	rec := do(t, srv, http.MethodGet, "/api/singbox", nil, cookie, "")
+	var payload struct {
+		Drift struct {
+			Supported  bool  `json:"supported"`
+			Configured []int `json:"configured"`
+			Listening  []int `json:"listening"`
+			Missing    []int `json:"missing"`
+			Extra      []int `json:"extra"`
+		} `json:"drift"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v (%s)", err, rec.Body)
+	}
+	if len(payload.Drift.Configured) != 1 || payload.Drift.Configured[0] != 21621 {
+		t.Fatalf("configured = %v, want [21621]", payload.Drift.Configured)
+	}
+	if len(payload.Drift.Missing) != 0 || len(payload.Drift.Extra) != 0 {
+		t.Fatalf("drift should be empty: %+v", payload.Drift)
+	}
+}

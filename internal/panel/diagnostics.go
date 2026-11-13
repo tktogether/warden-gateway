@@ -49,6 +49,7 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 			st := s.dns.Status()
 			return diagnostics.DNSState{Running: st.Running, Listen: st.Listen, Port: st.Port, Fallback: st.Fallback, Error: st.Error}
 		},
+		SingBox: s.singboxDiagState,
 	}
 	writeJSON(w, http.StatusOK, checker.Run(ctx))
 }

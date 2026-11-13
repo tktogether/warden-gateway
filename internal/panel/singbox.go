@@ -11,6 +11,7 @@ import (
 
 	"github.com/tktogether/warden-gateway/internal/auth"
 	"github.com/tktogether/warden-gateway/internal/config"
+	"github.com/tktogether/warden-gateway/internal/diagnostics"
 	"github.com/tktogether/warden-gateway/internal/singbox"
 )
 
@@ -46,6 +47,7 @@ func (s *Server) singboxPayload() map[string]interface{} {
 		"connections": s.singboxTraffic(),
 		"stats":       statsJSON(s.singbox.StatsStatus()),
 		"core":        coreJSON(s.singbox.CoreLocalStatus()),
+		"drift":       driftJSON(s.singbox.PortDrift()),
 	}
 }
 
@@ -433,4 +435,49 @@ func (s *Server) singboxDisabled(w http.ResponseWriter) bool {
 		return true
 	}
 	return false
+}
+
+// driftJSON exposes the configured/process port comparison to the node view.
+func driftJSON(drift singbox.PortDrift) map[string]interface{} {
+	return map[string]interface{}{
+		"supported":  drift.Supported,
+		"configured": drift.Configured,
+		"listening":  drift.Listening,
+		"missing":    drift.Missing,
+		"extra":      drift.Extra,
+		"error":      drift.Error,
+	}
+}
+
+// singboxDiagState feeds the diagnostics report with the live node state.
+func (s *Server) singboxDiagState() diagnostics.SingBoxState {
+	if s.singbox == nil {
+		return diagnostics.SingBoxState{Installed: false}
+	}
+	summary := s.singbox.Summary()
+	state := diagnostics.SingBoxState{
+		Installed:      summary.Installed,
+		Version:        summary.Version,
+		Binary:         summary.Binary,
+		Service:        summary.Service,
+		Running:        summary.Running,
+		State:          summary.State,
+		NodeCount:      len(summary.Nodes),
+		CheckOK:        summary.Check.OK,
+		CheckOutput:    summary.Check.Output,
+		CheckSupported: summary.Installed,
+	}
+	for _, node := range summary.Nodes {
+		if node.Enabled {
+			state.EnabledNodes++
+		}
+	}
+	drift := s.singbox.PortDrift()
+	if drift.Supported {
+		state.Configured = drift.Configured
+		state.Listening = drift.Listening
+	} else {
+		state.Error = drift.Error
+	}
+	return state
 }

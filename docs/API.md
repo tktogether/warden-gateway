@@ -27,7 +27,7 @@
 | POST | `/api/cert/renew` | 触发证书续期检查 |
 | GET | `/api/config` | 配置和设置 |
 | GET | `/api/audit?limit=100&q=` | 审计记录 |
-| GET | `/api/diagnostics` | 一键诊断（仅网关自身） |
+| GET | `/api/diagnostics` | 一键诊断（仅网关自身，含 sing-box 段） |
 
 ### /api/metrics
 
@@ -103,7 +103,7 @@ GET 请求，返回最近 `minutes`（5 到 60，默认 60）的承载统计。�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/singbox` | 内核、节点、校验结果、备份与流量总览 |
+| GET | `/api/singbox` | 内核、节点、校验结果、端口一致性、备份与流量总览 |
 | POST | `/api/singbox` | 新建节点，body `{"type":"hysteria2","name":"手机"}`，可带 `port`、`server`、`method` |
 | POST | `/api/singbox/action` | 节点操作，body `{"action":"reset","id":"Hysteria2-12538"}`；动作 `reset`、`enable`、`disable`、`delete`、`restart`、`check`、`stats-enable`、`stats-disable` |
 | GET | `/api/singbox/config?id=ID` | 读取节点配置文本 |
@@ -115,6 +115,8 @@ GET 请求，返回最近 `minutes`（5 到 60，默认 60）的承载统计。�
 | POST | `/api/singbox/core` | 内核操作，body `{"action":"install","version":"1.14.4"}`；动作 `install`、`update`、`rollback-previous`、`rollback-preinstall`、`restart`、`uninstall` |
 
 `stats` 对象字段：`enabled`、`controller`、`secret`。`stats-enable` 把 `experimental.clash_api` 写入主配置（默认 `127.0.0.1:19090`，自动生成 32 位密钥），`stats-disable` 移除该块；两者都会备份主配置、执行 `sing-box check` 并重启 sing-box，失败时恢复原文件。
+
+`drift` 对象字段：`supported`、`configured`、`listening`、`missing`、`extra`、`error`。它比对启用节点配置的端口与 `ss` 读到的 sing-box 实际监听端口：`missing` 表示配置了但进程没监听（需要重启），`extra` 表示配置已移除但进程还在监听。主机没有 `ss` 时 `supported` 为 false。Clash API 端口不参与比对。
 
 `core` 对象字段：`installed`、`version`、`latest`、`latest_error`、`update_available`、`platform`、`binary`、`unit_installed`、`backups`、`note`。
 

@@ -63,6 +63,7 @@ type Checker struct {
 	ServiceStatus func() (string, string)
 	Command       func(name string, args ...string) (string, error)
 	DNSState      func() DNSState
+	SingBox       func() SingBoxState
 }
 
 // Run collects the report.
@@ -130,6 +131,7 @@ func (c *Checker) project() Section {
 		section.Items = append(section.Items, Item{ID: "github", Label: "GitHub 下载代理", Status: StatusSkip, Detail: "未启用"})
 	}
 	section.Items = append(section.Items, c.dnsItem(cfg))
+	section.Items = append(section.Items, c.singboxItems(cfg)...)
 	if c.DataDir != "" {
 		if _, err := os.Stat(c.DataDir); err != nil {
 			section.Items = append(section.Items, Item{ID: "data", Label: "数据目录", Status: StatusFail, Detail: err.Error()})

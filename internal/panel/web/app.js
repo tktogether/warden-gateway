@@ -1394,7 +1394,10 @@
     'socks': 'SOCKS5'
   };
   function sbName(id) { return sbNames[id] || id || '节点'; }
-  function sbNodeLabel(node) { return node.name || sbNodeLabel(node); }
+  function sbNodeLabel(node) {
+    if (!node) { return '节点'; }
+    return node.name || node.tag || node.id || '节点';
+  }
 
   function openModal(title, build) {
     var body = qs('#modal-body');
@@ -1447,6 +1450,8 @@
     add(banner, el('span', '', tips.join(' ')));
     add(banner, el('span', '', [data.service, data.installed ? (stateText + ' · ' + data.version) : ''].filter(Boolean).join(' · ')));
     box.appendChild(banner);
+    var drift = sbDriftNotice(data.drift);
+    if (drift) { box.appendChild(drift); }
     box.appendChild(sbCorePanel(data));
 
     var nodes = data.nodes || [];
@@ -1469,17 +1474,7 @@
     var restart = el('button', 'btn', data.running ? '重启服务' : '启动服务');
     restart.type = 'button';
     restart.disabled = !data.installed;
-    restart.addEventListener('click', async function () {
-      var yes = await confirmDialog('重启 sing-box', '重启约需一秒，已连接的客户端会短暂断开后自动重连。确认继续？');
-      if (!yes) { return; }
-      setBusy(restart, true);
-      try {
-        await api('/api/singbox/action', { method: 'POST', body: { id: '', action: 'restart' } });
-        showToast('sing-box 已重启');
-        setTimeout(loadSingbox, 1200);
-      } catch (err) { showToast(err.message, true); }
-      finally { setBusy(restart, false); }
-    });
+    restart.addEventListener('click', function () { sbRestartService(restart); });
     bar.appendChild(restart);
 
     var verify = el('button', 'btn', '校验配置');
@@ -1519,6 +1514,39 @@
         return [b.name, fmtBytes(b.size), fmtTime(b.modified)];
       })));
     }
+  }
+
+  function sbDriftNotice(drift) {
+    if (!drift || !drift.supported) { return null; }
+    var missing = drift.missing || [];
+    var extra = drift.extra || [];
+    if (!missing.length && !extra.length) { return null; }
+    var parts = [];
+    if (missing.length) {
+      parts.push('配置了但未监听：' + missing.join('、') + '，重启 sing-box 后生效。');
+    }
+    if (extra.length) {
+      parts.push('仍在监听但配置已移除：' + extra.join('、') + '，重启 sing-box 后释放。');
+    }
+    var row = el('div', 'alert ' + (missing.length ? 'bad' : 'warn'));
+    add(row, el('span', '', parts.join(' ')));
+    var fix = el('button', 'btn', '重启 sing-box');
+    fix.type = 'button';
+    fix.addEventListener('click', function () { sbRestartService(fix); });
+    add(row, fix);
+    return row;
+  }
+
+  async function sbRestartService(btn) {
+    var yes = await confirmDialog('重启 sing-box', '重启约需一秒，已连接的客户端会短暂断开后自动重连。确认继续？');
+    if (!yes) { return; }
+    setBusy(btn, true);
+    try {
+      await api('/api/singbox/action', { method: 'POST', body: { id: '', action: 'restart' } });
+      showToast('sing-box 已重启');
+      setTimeout(loadSingbox, 1200);
+    } catch (err) { showToast(err.message, true); }
+    finally { setBusy(btn, false); }
   }
 
   async function sbCoreAction(btn, action, message) {
