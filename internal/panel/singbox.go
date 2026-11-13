@@ -441,6 +441,7 @@ func (s *Server) singboxDisabled(w http.ResponseWriter) bool {
 func driftJSON(drift singbox.PortDrift) map[string]interface{} {
 	return map[string]interface{}{
 		"supported":  drift.Supported,
+		"running":    drift.Running,
 		"configured": drift.Configured,
 		"listening":  drift.Listening,
 		"missing":    drift.Missing,

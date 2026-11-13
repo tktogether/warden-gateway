@@ -85,7 +85,9 @@ func (c *Checker) singboxItems(cfg *config.Config) []Item {
 		}
 		items = append(items, checkItem)
 	}
-	items = append(items, driftItem(state))
+	if state.Running {
+		items = append(items, driftItem(state))
+	}
 	return items
 }
 

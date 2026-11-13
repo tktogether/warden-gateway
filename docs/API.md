@@ -116,7 +116,7 @@ GET 请求，返回最近 `minutes`（5 到 60，默认 60）的承载统计。�
 
 `stats` 对象字段：`enabled`、`controller`、`secret`。`stats-enable` 把 `experimental.clash_api` 写入主配置（默认 `127.0.0.1:19090`，自动生成 32 位密钥），`stats-disable` 移除该块；两者都会备份主配置、执行 `sing-box check` 并重启 sing-box，失败时恢复原文件。
 
-`drift` 对象字段：`supported`、`configured`、`listening`、`missing`、`extra`、`error`。它比对启用节点配置的端口与 `ss` 读到的 sing-box 实际监听端口：`missing` 表示配置了但进程没监听（需要重启），`extra` 表示配置已移除但进程还在监听。主机没有 `ss` 时 `supported` 为 false。Clash API 端口不参与比对。
+`drift` 对象字段：`supported`、`running`、`configured`、`listening`、`missing`、`extra`、`error`。它比对启用节点配置的端口与进程实际监听端口：通过服务单元的 MainPID 读取该进程持有的 socket inode，再对照 `/proc/net/tcp`、`tcp6`、`udp`、`udp6` 得到监听端口，因此不依赖 `ss -p` 的进程属主权限。`missing` 表示配置了但进程没监听（需要重启），`extra` 表示配置已移除但进程还在监听。sing-box 未运行时只返回配置端口，不计算差异；读取失败时 `supported` 为 false。Clash API 端口不参与比对。
 
 `core` 对象字段：`installed`、`version`、`latest`、`latest_error`、`update_available`、`platform`、`binary`、`unit_installed`、`backups`、`note`。
 
