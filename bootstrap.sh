@@ -1369,16 +1369,23 @@ cn_apply_apt() {
   for file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
     [ -f "$file" ] || continue
     grep -Eq 'https?://[A-Za-z0-9._:-]+' "$file" || continue
+    # 只替换发行版仓库（URL 路径以 /ubuntu 开头）。Docker CE、pypi 等第三方仓库的
+    # 主机名与路径是一一对应的（download.docker.com/linux/ubuntu），换主机就会 404，
+    # 因此原样保留并提示。
+    if ! grep -Eq 'https?://[A-Za-z0-9._:-]+/ubuntu([/[:space:]]|$)' "$file"; then
+      info "跳过 $file：不是发行版仓库，保持原样"
+      continue
+    fi
     changed=1
     cn_snapshot_file "$file"
     if [ "$DRY_RUN" -eq 1 ]; then
       printf '  + 替换 %s 的源地址为 %s\n' "$file" "$mirror"
     else
-      sed -E -i "s#https?://[A-Za-z0-9._:-]+#${mirror}#g" "$file"
+      sed -E -i "s#https?://[A-Za-z0-9._:-]+(/ubuntu([/[:space:]]|$))#${mirror}\1#g" "$file"
     fi
   done
-  [ "$changed" -eq 1 ] || { warn "未找到可替换的 APT 源地址"; return 1; }
-  ok "APT 源已替换为 $mirror"
+  [ "$changed" -eq 1 ] || { warn "未找到可替换的发行版仓库地址"; return 1; }
+  ok "APT 发行版源已替换为 $mirror"
 }
 
 cn_apply_bbr() {

@@ -1,5 +1,11 @@
 # 更新记录
 
+## v1.5.1
+
+### 修复
+
+- `cn-setup` 的 APT 镜像替换会把**所有** http(s) 源地址换成新主机，包括 Docker CE 这类第三方仓库。第三方仓库的路径与主机是绑定的（`https://download.docker.com/linux/ubuntu`），换主机后 `apt-get update` 直接 404。现在只改写路径以 `/ubuntu` 结尾的发行版仓库，其余源原样保留并打印提示。
+
 ## v1.5.0
 
 ### 新增
