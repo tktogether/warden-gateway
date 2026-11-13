@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +33,9 @@ const (
 	restartAttempts = 3
 	restartBackoff  = 1200 * time.Millisecond
 	restartConfirm  = 6 * time.Second
+	// restartSettle is how long the unit must stay up after a restart, so a
+	// process that dies right after starting is not reported as success.
+	restartSettle = 2 * time.Second
 )
 
 // Options configures a Manager.
@@ -221,6 +226,7 @@ func (m *Manager) Restart() error {
 		return fmt.Errorf("未安装 %s，无法重启", m.service)
 	}
 	resetFailedHook()
+	previousRestarts := unitRestartCountHook(m.service)
 	var failure error
 	for attempt := 0; attempt < restartAttempts; attempt++ {
 		if attempt > 0 {
@@ -231,15 +237,64 @@ func (m *Manager) Restart() error {
 			continue
 		}
 		state, sub := waitActiveHook(m.service, restartConfirm)
-		if state == "active" {
-			return nil
+		if state != "active" {
+			failure = fmt.Errorf("sing-box 重启后未进入运行状态：%s %s", state, sub)
+			continue
 		}
-		failure = fmt.Errorf("sing-box 重启后未进入运行状态：%s %s", state, sub)
+		if err := settleHook(m.service, previousRestarts); err != nil {
+			failure = err
+			continue
+		}
+		return nil
 	}
 	if detail := m.journalTail(); detail != "" {
 		return fmt.Errorf("%w；服务日志：%s", failure, detail)
 	}
 	return failure
+}
+
+// restartSettleWait is the settle delay; tests shorten it.
+var restartSettleWait = restartSettle
+
+// stateHook reads the unit state; tests replace it.
+var stateHook = systemdState
+
+// settleHook confirms the unit stays up; tests replace it.
+var settleHook = settleActive
+
+// settleActive waits out the settle window and re-checks the unit. A process
+// that crashes right after the restart is caught either by the state turning
+// away from active or by systemd recording one more automatic restart.
+func settleActive(service string, previousRestarts int) error {
+	time.Sleep(restartSettleWait)
+	state, sub := stateHook(service)
+	if state != "active" {
+		return fmt.Errorf("sing-box 启动后随即退出：%s %s", state, sub)
+	}
+	if previousRestarts >= 0 {
+		if current := unitRestartCountHook(service); current > previousRestarts {
+			return errors.New("sing-box 启动后随即崩溃并被 systemd 重新拉起")
+		}
+	}
+	return nil
+}
+
+// unitRestartCountHook reads the unit restart counter; tests replace it.
+var unitRestartCountHook = unitRestartCount
+
+// unitRestartCount returns NRestarts of the unit, or -1 when unavailable.
+func unitRestartCount(service string) int {
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "systemctl", "show", service, "--no-page", "--property=NRestarts", "--value").Output()
+	if err != nil {
+		return -1
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return -1
+	}
+	return value
 }
 
 // unitPathHook resolves the installed unit file; tests replace it.
@@ -328,13 +383,19 @@ func (m *Manager) journalTail() string {
 	}
 	detail := ""
 	for _, line := range strings.Split(string(out), "\n") {
-		trimmed := strings.TrimSpace(line)
+		trimmed := strings.TrimSpace(stripANSI(line))
 		if strings.Contains(trimmed, "FATAL") || strings.Contains(trimmed, "error") {
 			detail = trimmed
 		}
 	}
 	return detail
 }
+
+// ansiPattern matches the colour escapes journalctl keeps in its output.
+var ansiPattern = regexp.MustCompile("\x1b\\[[0-9;]*[A-Za-z]")
+
+// stripANSI removes escape sequences so an error message stays readable.
+func stripANSI(s string) string { return ansiPattern.ReplaceAllString(s, "") }
 
 // restartHook restarts the unit. Tests replace it so node operations can run on
 // hosts without systemd.
