@@ -110,6 +110,39 @@ func TestSplitDomainsCoverGHCRBlobs(t *testing.T) {
 	}
 }
 
+// TestBootstrapAgentMode locks the agent-mode migration pieces of
+// bootstrap.sh (spec §9.4): the new CLI flags, the agent systemd unit with
+// the controller-ruled watchdog budget, the resolv.conf final form (agent
+// stub first, public fallback second), the managed hosts block removal, the
+// binary rollback guard, the agent.json heartbeat floor, and the legacy
+// deprecation hint printed when cn-setup runs without --enroll-token.
+func TestBootstrapAgentMode(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "bootstrap.sh"))
+	if err != nil {
+		t.Fatalf("read bootstrap.sh: %v", err)
+	}
+	required := []string{
+		"--enroll-token", // new flag switching cn-setup into agent mode
+		"--no-agent",     // force the legacy path
+		"--upstream",     // agent upstream DNS override
+		"warden-cn-agent.service",
+		"WatchdogSec=60",        // ruling R7: worst-case cycle ~39s, 30s would starve
+		"nameserver 198.18.0.1", // agent stub resolver is primary after migration
+		"nameserver 223.5.5.5",  // public fallback after migration
+		"cn_remove_hosts",       // spec §9.4 step 7: managed hosts block removal
+		"CN_HOSTS_BEGIN",        // the block markers the removal works on
+		"agent-rollback-guard",  // ExecStartPre crash-rollback guard script
+		"heartbeat_seconds",     // agent.json field, written >= 10
+		"已弃用",                   // legacy path deprecation hint
+	}
+	script := string(raw)
+	for _, want := range required {
+		if !strings.Contains(script, want) {
+			t.Errorf("bootstrap.sh is missing %q", want)
+		}
+	}
+}
+
 func TestSelfModeAllowsEmptyEntry(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.PublicURL = "https://203.0.113.10:8443/warden"
