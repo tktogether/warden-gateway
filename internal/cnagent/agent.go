@@ -96,17 +96,20 @@ type Agent struct {
 	// tests inject a scripted fake (ruling 2).
 	prober prober
 	// notifyFn is the sd_notify hook invoked once per cycle with
-	// watchdogPing. Default: no-op. Task 8 wires it to SDNotify so the
-	// systemd watchdog (WatchdogSec=30) sees liveness every cycle; do not
-	// remove or move this call when wiring Task 8.
+	// watchdogPing. New wires it to SDNotify (Task 8) so the systemd
+	// watchdog (WatchdogSec=30) sees liveness every cycle; hand-built Agent
+	// structs (tests) keep a nil notifyFn, which RunOnce skips; do not
+	// remove or move this call.
 	notifyFn func(state string)
 	// upgradeFn is the self-upgrade dispatch (Task 7). New wires it to
 	// SelfUpgrade with the executable path resolved at call time; only
 	// hand-built Agent structs (tests) carry a nil upgradeFn, which makes
 	// the command report OK=false "not wired yet".
 	upgradeFn func(ctx context.Context, version string) error
-	// checkFn is the self-check dispatch (Task 8). nil (default) makes the
-	// command report OK=false "not wired yet".
+	// checkFn is the self-check dispatch (Task 8). New wires it to a
+	// SelfCheck closure reading the CURRENT statePath and bound DNS listener
+	// at call time; hand-built Agent structs (tests) keep a nil checkFn,
+	// which makes the command report OK=false "not wired yet".
 	checkFn func() map[string]interface{}
 	// execFn runs the deregister shell-outs (resolv.conf restore, systemctl
 	// disable). Default: os/exec. Tests inject a recorder so systemctl is
@@ -140,14 +143,13 @@ func New(cfg *Config, log *logging.Logger) (*Agent, error) {
 	if listen == "" {
 		listen = DefaultDNSListen
 	}
-	return &Agent{
+	a := &Agent{
 		cfg:        cfg,
 		log:        log,
 		statePath:  DefaultStatePath,
 		configPath: defaultConfigPath,
 		dnsListen:  listen,
 		prober:     realProber{},
-		notifyFn:   func(string) {},
 		execFn:     func(name string, args ...string) error { return exec.Command(name, args...).Run() },
 		// Task 7 wiring: dispatch self-upgrade into SelfUpgrade. The binary
 		// path is resolved at CALL time (the path is stable, but tests may
@@ -162,7 +164,46 @@ func New(cfg *Config, log *logging.Logger) (*Agent, error) {
 			return SelfUpgrade(ctx, cfg, ver, runtime.GOARCH, selfPath, nil)
 		},
 		httpClient: &http.Client{Timeout: heartbeatHTTPTimeout},
-	}, nil
+	}
+
+	// Task 8 wiring (ruling 2): the sd_notify watchdog ping goes through
+	// SDNotify; the returned error is deliberately dropped here — a missing
+	// socket (running outside systemd) must never break a cycle.
+	a.notifyFn = func(state string) { _ = SDNotify(state) }
+
+	// Task 8 wiring (ruling 1): dispatch self-check into SelfCheck. The
+	// closure reads statePath and the bound DNS listener AT CALL TIME so
+	// overrides made after New (tests) and proxy rebuilds are checked, not
+	// the values frozen at construction.
+	a.checkFn = func() map[string]interface{} {
+		ccfg := *cfg
+		ccfg.DNSListen = a.boundDNSListen()
+		return SelfCheck(context.Background(), &ccfg, a.statePath)
+	}
+
+	return a, nil
+}
+
+// SetConfigPath overrides the agent.json location deregister rewrites to
+// clear the machine token. cmd/warden-cn-agent calls it after New when
+// --config points somewhere other than the default /etc path.
+func (a *Agent) SetConfigPath(path string) {
+	a.configPath = path
+}
+
+// IsDeregistered reports whether err is the sentinel RunOnce returns after a
+// successful deregister. Run converts the sentinel into a clean nil exit
+// itself; cmd/warden-cn-agent once-mode uses this helper to exit 0 on it.
+func IsDeregistered(err error) bool {
+	return errors.Is(err, errAgentDeregistered)
+}
+
+// Close releases the agent's local resources (the DNS proxy listener).
+// Run calls shutdown internally on ctx cancellation and deregister; one-shot
+// callers (cmd/warden-cn-agent once mode) call Close after RunOnce returns.
+// Proxy.Close is idempotent, so the two paths never conflict.
+func (a *Agent) Close() {
+	a.shutdown()
 }
 
 // RunOnce executes one complete cycle: probe → dns sync → heartbeat → apply
