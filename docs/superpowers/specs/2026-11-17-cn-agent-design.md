@@ -88,14 +88,14 @@ agent 自己监听 198.18.0.1:53，分流域名答网关 IP、其余转发上游
 - **workload 自动发现**：通过 docker socket 枚举容器（名称、镜像、状态、启动时间）；带 Coolify 标签的容器归组为应用上报。只采集元数据（见 8.2）。
 - **心跳**：默认每 10 秒 `POST /api/agent/heartbeat`（Bearer machine token；±20% 抖动避免多台机器同拍，间隔可在 agent 配置调整）。单台负载约 6 次请求/分钟，网关侧可忽略。响应携带：待执行命令、域名列表（含版本 hash，agent 本地 hash 一致则忽略）、升级意图——网关为每台机器持久化「目标版本」，开启「自动跟随网关版本」的机器随网关发版自动更新目标版本；agent 仅在目标版本与本地不一致时执行自升级。
 - **命令执行**：`sync-domains`（立即重新拉取并应用）、`self-check`（执行等价 cn-check 的检查，报告随下次心跳回传）、`self-upgrade`、`deregister`（清除本机分流配置、恢复直连 resolv.conf、停用自身单元）。**没有远程重启命令**：升级与配置变更本身会重启 agent，卡死由 systemd 看门狗处理；面板不做整机 reboot 能力（已决策，2026-11-17）。
-- **自升级**：`GET /api/agent/binary` + 校验和验证 → 临时文件写入 → 原子 rename 替换自身 → 退出交由 systemd 重启。新版本启动失败（连续 2 次崩溃）时 systemd 自动回退到备份的旧二进制（unit 里用 `ExecStartPre` 恢复机制）。
+- **自升级**：从 GitHub Releases 下载目标版本二进制——URL 走**网关自己的 GitHub 代理短路径**（`{origin}/github.com/tktogether/warden-gateway/releases/download/{tag}/...`），同源拉取 `.sha256` 侧车校验通过 → 临时文件写入 → 原子 rename 替换自身 → 退出交由 systemd 重启。下载失败或校验不过 → 本次不动，下个心跳重试（安全网第 6 条）。新版本启动失败（连续 2 次崩溃）时 systemd 自动回退到备份的旧二进制（unit 里用 `ExecStartPre` 恢复机制）。
 - **本地状态文件**：`/etc/warden-gateway-cn/agent.json`（0600：machine token、网关 origin、上游 DNS、当前列表 hash）；所有改动前快照（沿用现有 `cn_snapshot_file` 模式）。
 
 ### 6.2 网关侧 `/api/agent/*`（新）
 
 - `POST /api/agent/enroll`：一次性 enroll token + 机器信息 → 颁发 machine token（随机 32 字节，网关只存 SHA-256 摘要）。enroll token 用后即焚。
 - `POST /api/agent/heartbeat`：认证后接收上报，返回命令队列 + 域名列表 + agent 版本。连续 3 个周期（30 秒）无心跳判定离线。每 token 限流。
-- `GET /api/agent/binary`、`GET /api/agent/binary/checksum`：托管 agent 二进制（**多版本**版本化路径，模式同现有 `/bootstrap.sh` 静态托管，支持回退与灰度）。
+- **不设 agent 二进制托管端点**：分发走网关 GitHub 代理短路径直取 GitHub Releases（见 6.1 与 9.3），网关只掌控"目标版本"。
 - **升级策略（已决策，2026-11-17）**：默认手动——面板逐台点「升级」才设置该机器的目标版本；每台机器可单独打开「自动跟随网关版本」开关（默认关）。生产机上不会出现无人触发的二进制替换。
 - **持久化**：注册表、machine token 摘要、待执行命令队列、每台机器的最新快照与事件 journal 落盘到 DataDir 独立状态文件（0600），并纳入现有备份/恢复流程；内存仅作运行缓存。网关重启或升级不得丢失已注册机器——否则国内机就得登机重跑 enroll，直接违背"全程无需登录国内机"。所有 agent 管理操作进 audit log。
 
@@ -161,18 +161,18 @@ agent 自己监听 198.18.0.1:53，分流域名答网关 IP、其余转发上游
 - 首次以 v1.6.0 启动：`cfg.DNS.Domains` 为空则用 `DefaultSplitDomains()` 播种并保存（配置版本号 +1）。此后面板编辑改的就是这份 live 列表——这是"事实源切换"的落地点。
 - 注册表 / 命令队列状态文件按需创建（DataDir，0600），纳入现有备份/恢复。
 
-### 9.3 agent 二进制的供给
+### 9.3 agent 二进制的供给（已决策：经代理机获取，不捆绑托管）
 
-- CI 同时构建 `warden-gateway` 与 `warden-cn-agent`（linux-amd64 静态编译），同一 release 发布。
-- 网关安装/升级时把 agent 二进制解包到 `/opt/warden-gateway/agent/`，按版本目录保留最近 2 个版本（当前 + 上一版）供回退。
-- `/api/agent/binary` 从该目录服务，附 checksum 侧车文件。
+- CI 同时构建 `warden-gateway` 与 `warden-cn-agent`（linux-amd64 静态编译），发布到同一 GitHub Release——tag 化即天然多版本，回退与灰度免费获得。
+- 国内机（cn-setup 首装与 agent 自升级）一律经**代理机的 GitHub 代理短路径**下载：`{origin}/github.com/tktogether/warden-gateway/releases/download/{tag}/warden-cn-agent-linux-amd64`（+ `.sha256` 侧车）。网关不为 agent 设托管端点、不解包捆绑——分发复用现有、已被 v1.5.2/v1.5.3 打磨过的代理链路。
+- 升级时机控制权仍在网关（目标版本来自心跳）；代理链路故障时升级自动搁置，本地照旧运行。
 
 ### 9.4 国内机迁移步骤（cn-setup agent 模式，顺序即设计）
 
 1. **快照**全部将被改动的文件与单元（沿用 `cn_snapshot_file` 机制）。
 2. **先建立安全网**：把公网兜底 DNS 写进 resolv.conf。
 3. **停旧**：停止并禁用旧 dnsmasq 单元与看门狗 service+timer；resolv.conf 暂置为纯公网直连（避免指向刚停掉的监听造成 5 秒超时延迟）。此刻机器处于"无分流直连"状态——就是装 warden 之前的老状态，业务不中断。
-4. **装新**：下载 agent 二进制 + 写 `agent.json` + 装 unit，启动 agent，绑定 198.18.0.1:53（旧单元已停，无冲突）。若端口仍被异常残留占用，agent 进入重试并上报本地状态，cn-setup 报错走回滚。
+4. **装新**：经网关 GitHub 代理短路径下载 agent 二进制（`{origin}/github.com/.../releases/download/{tag}/...`）+ 写 `agent.json` + 装 unit，启动 agent，绑定 198.18.0.1:53（旧单元已停，无冲突）。若端口仍被异常残留占用，agent 进入重试并上报本地状态，cn-setup 报错走回滚。
 5. **接入**：enroll → 等待首次心跳成功 → 域名列表到手 → 本机 DNS 应答自检（`getent` 抽查分流域名解析到网关 IP）通过。
 6. **定型**：resolv.conf 写最终形态（agent DNS 在前 + 公网在后），NetworkManager `dns=none` 守卫保留。
 7. **摘除 hosts 托管块**——必须摘：不摘的话 agent 降级直连时，hosts 仍把分流域名钉在网关 IP，第 8 节安全网第 1/2 条失效。
