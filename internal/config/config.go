@@ -188,6 +188,10 @@ func DefaultSplitDomains() []string {
 		"objects.githubusercontent.com",
 		"gist.githubusercontent.com",
 		"ghcr.io",
+		// GHCR answers every blob request with a redirect to this host. Routing
+		// only ghcr.io gets the manifest through and then stalls on the layers,
+		// which is what a hung `docker pull ghcr.io/...` looks like.
+		"pkg-containers.githubusercontent.com",
 		"registry-1.docker.io",
 		"auth.docker.io",
 		"production.cloudfront.docker.com",

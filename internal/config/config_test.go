@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -66,6 +67,46 @@ func TestSaveAndLoad(t *testing.T) {
 	}
 	if loaded.PublicURL != cfg.PublicURL || loaded.AccessKeySHA256 != cfg.AccessKeySHA256 {
 		t.Fatalf("loaded config mismatch: %+v", loaded)
+	}
+}
+
+// GHCR serves manifests from ghcr.io but redirects every blob request to
+// pkg-containers.githubusercontent.com. The CN split must route both hosts
+// through the gateway: with only ghcr.io, docker pull fetches the manifest and
+// then stalls on layers that a domestic line cannot reach.
+func TestSplitDomainsCoverGHCRBlobs(t *testing.T) {
+	required := []string{"ghcr.io", "pkg-containers.githubusercontent.com"}
+	got := DefaultSplitDomains()
+	for _, want := range required {
+		if !slices.Contains(got, want) {
+			t.Errorf("DefaultSplitDomains() is missing %s", want)
+		}
+	}
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", "bootstrap.sh"))
+	if err != nil {
+		t.Fatalf("read bootstrap.sh: %v", err)
+	}
+	line := ""
+	for _, l := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(l, "CN_DEFAULT_DOMAINS=") {
+			line = strings.Trim(strings.TrimPrefix(l, "CN_DEFAULT_DOMAINS="), `"`)
+			break
+		}
+	}
+	if line == "" {
+		t.Fatal("CN_DEFAULT_DOMAINS not found in bootstrap.sh")
+	}
+	script := strings.Split(line, ",")
+	for _, want := range required {
+		if !slices.Contains(script, want) {
+			t.Errorf("bootstrap.sh CN_DEFAULT_DOMAINS is missing %s", want)
+		}
+	}
+	slices.Sort(got)
+	slices.Sort(script)
+	if !slices.Equal(got, script) {
+		t.Errorf("DefaultSplitDomains() and bootstrap.sh CN_DEFAULT_DOMAINS diverge:\nconfig: %v\nscript: %v", got, script)
 	}
 }
 

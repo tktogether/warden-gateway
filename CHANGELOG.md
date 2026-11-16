@@ -1,5 +1,16 @@
 # 更新记录
 
+## v1.5.3
+
+### 修复
+
+- 国内机分流域名补上 `pkg-containers.githubusercontent.com`（GHCR 的层下载主机）。GHCR 对每个 blob 请求返回 307，跳到这台 CDN；此前只分流 `ghcr.io`，manifest 能取到，层数据却直连该主机，`docker pull ghcr.io/...` 停在 `Pulling from ...` 不动。现在 hosts 托管块与本地 DNS 一并指向网关，经 443 SNI 透传取回。
+- 新增测试锁定 `DefaultSplitDomains()` 与 `bootstrap.sh` 的 `CN_DEFAULT_DOMAINS` 一致，避免两处列表再次分叉。
+
+### 兼容性
+
+- 已执行过 `cn-setup` 的国内机需要重跑一次 `cn-setup` 才会拿到新的分流域名；升级网关本身不会改写国内机的 hosts。
+
 ## v1.5.2
 
 ### 新增

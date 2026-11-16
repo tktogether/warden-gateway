@@ -147,6 +147,8 @@ sudo warden uninstall
 sudo systemctl reload docker
 ```
 
+`registry-mirrors` 只对 Docker Hub 生效，`ghcr.io` 等仓库不会走这里。国内机上要拉取 GHCR 镜像，靠的是 `cn-setup` 的分流域名（默认已包含 `ghcr.io` 与它的层下载主机 `pkg-containers.githubusercontent.com`），两者缺一个就会在 `Pulling from ...` 停住。
+
 验证：
 
 ```bash
@@ -282,6 +284,8 @@ sudo bash /tmp/wg-bootstrap.sh cn-setup --gateway-ip 192.0.2.10 \
 | NetworkManager | 写 `/etc/NetworkManager/conf.d/90-warden-gateway-cn.conf` 的 `dns=none`，防止 resolver 被重写 |
 
 本地 DNS 不是可选项：容器不读宿主 `/etc/hosts`，只继承 `/etc/resolv.conf`，所以 Coolify 构建容器里的 `git clone`、`docker pull` 只有走本机 DNS 才能解析到网关。监听地址必须是回环地址之外的一个地址（默认 `198.18.0.1`，由 `wg-dns0` dummy 网卡承载），Docker 会剔除回环 nameserver。
+
+分流域名默认覆盖 GitHub、GHCR 与 Docker Hub。GHCR 的 manifest 在 `ghcr.io`，每个层请求会被 307 到 `pkg-containers.githubusercontent.com`，两个主机都要指向网关，只分流其中一个会卡在层下载。
 
 其余设置：
 

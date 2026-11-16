@@ -105,7 +105,7 @@ CN_BACKUP_ROOT="/var/backups/warden-gateway-cn"
 CN_RESTORE_ID="latest"
 CN_HOSTS_BEGIN="# >>> warden-gateway cn >>>"
 CN_HOSTS_END="# <<< warden-gateway cn <<<"
-CN_DEFAULT_DOMAINS="github.com,api.github.com,codeload.github.com,raw.githubusercontent.com,objects.githubusercontent.com,gist.githubusercontent.com,ghcr.io,registry-1.docker.io,auth.docker.io,production.cloudfront.docker.com"
+CN_DEFAULT_DOMAINS="github.com,api.github.com,codeload.github.com,raw.githubusercontent.com,objects.githubusercontent.com,gist.githubusercontent.com,ghcr.io,pkg-containers.githubusercontent.com,registry-1.docker.io,auth.docker.io,production.cloudfront.docker.com"
 
 C_RESET=""
 C_BOLD=""
