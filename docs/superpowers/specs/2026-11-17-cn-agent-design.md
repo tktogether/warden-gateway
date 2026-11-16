@@ -27,7 +27,7 @@
 
 Goals：
 
-- 面板增删分流域名，国内机在 ≤ 2 个心跳周期（约 60–120 秒）内生效，全程无需发版、无需登录国内机。
+- 面板增删分流域名，国内机在 ≤ 2 个心跳周期（≤ 20 秒）内生效，全程无需发版；迁移后的日常变更无需登录国内机（存量机器的一次性迁移除外，见第 9 节）。
 - 面板能看到每台国内机：在线状态、健康分类、版本、磁盘/内存/负载、容器与应用列表、最后心跳时间。
 - 面板可远程触发：立即同步、自检、升级、重启、注销。
 - agent 自升级：从网关下载新版本二进制，原子替换，失败回滚。
@@ -86,7 +86,7 @@ agent 自己监听 198.18.0.1:53，分流域名答网关 IP、其余转发上游
 - **内置 DNS 服务器**：复用 `internal/dnsproxy.Proxy`（同一 Go module），监听 `198.18.0.1:53`（地址与现网一致，resolv.conf 语义不变）。分流域名 → 网关 IP；其余 → 上游。降级时（探测判定网关不可达）分流域名也直接走上游返回——降级逐查询生效，无状态机延迟。
 - **健康探测循环**：沿用现有分类 `OK` / `LINK_443_BLOCKED` / `LINK_PORTS_BLOCKED` / `C_DOWN` / `LOCAL_BROKEN`；保留"本地对照组先确认外网正常，再判定网关故障"的逻辑，避免把本机断网误判成网关故障。
 - **workload 自动发现**：通过 docker socket 枚举容器（名称、镜像、状态、启动时间）；带 Coolify 标签的容器归组为应用上报。只采集元数据（见 8.2）。
-- **心跳**：默认每 30 秒 `POST /api/agent/heartbeat`（Bearer machine token）。响应携带：待执行命令、域名列表（含版本 hash，agent 本地 hash 一致则忽略）、升级意图——网关为每台机器持久化「目标版本」，开启「自动跟随网关版本」的机器随网关发版自动更新目标版本；agent 仅在目标版本与本地不一致时执行自升级。
+- **心跳**：默认每 10 秒 `POST /api/agent/heartbeat`（Bearer machine token；±20% 抖动避免多台机器同拍，间隔可在 agent 配置调整）。单台负载约 6 次请求/分钟，网关侧可忽略。响应携带：待执行命令、域名列表（含版本 hash，agent 本地 hash 一致则忽略）、升级意图——网关为每台机器持久化「目标版本」，开启「自动跟随网关版本」的机器随网关发版自动更新目标版本；agent 仅在目标版本与本地不一致时执行自升级。
 - **命令执行**：`sync-domains`（立即重新拉取并应用）、`self-check`（执行等价 cn-check 的检查，报告随下次心跳回传）、`self-upgrade`、`deregister`（清除本机分流配置、恢复直连 resolv.conf、停用自身单元）。**没有远程重启命令**：升级与配置变更本身会重启 agent，卡死由 systemd 看门狗处理；面板不做整机 reboot 能力（已决策，2026-11-17）。
 - **自升级**：`GET /api/agent/binary` + 校验和验证 → 临时文件写入 → 原子 rename 替换自身 → 退出交由 systemd 重启。新版本启动失败（连续 2 次崩溃）时 systemd 自动回退到备份的旧二进制（unit 里用 `ExecStartPre` 恢复机制）。
 - **本地状态文件**：`/etc/warden-gateway-cn/agent.json`（0600：machine token、网关 origin、上游 DNS、当前列表 hash）；所有改动前快照（沿用现有 `cn_snapshot_file` 模式）。
@@ -94,7 +94,7 @@ agent 自己监听 198.18.0.1:53，分流域名答网关 IP、其余转发上游
 ### 6.2 网关侧 `/api/agent/*`（新）
 
 - `POST /api/agent/enroll`：一次性 enroll token + 机器信息 → 颁发 machine token（随机 32 字节，网关只存 SHA-256 摘要）。enroll token 用后即焚。
-- `POST /api/agent/heartbeat`：认证后接收上报，返回命令队列 + 域名列表 + agent 版本。30 秒无心跳判定离线。每 token 限流。
+- `POST /api/agent/heartbeat`：认证后接收上报，返回命令队列 + 域名列表 + agent 版本。连续 3 个周期（30 秒）无心跳判定离线。每 token 限流。
 - `GET /api/agent/binary`、`GET /api/agent/binary/checksum`：托管 agent 二进制（**多版本**版本化路径，模式同现有 `/bootstrap.sh` 静态托管，支持回退与灰度）。
 - **升级策略（已决策，2026-11-17）**：默认手动——面板逐台点「升级」才设置该机器的目标版本；每台机器可单独打开「自动跟随网关版本」开关（默认关）。生产机上不会出现无人触发的二进制替换。
 - **持久化**：注册表、machine token 摘要、待执行命令队列、每台机器的最新快照与事件 journal 落盘到 DataDir 独立状态文件（0600），并纳入现有备份/恢复流程；内存仅作运行缓存。网关重启或升级不得丢失已注册机器——否则国内机就得登机重跑 enroll，直接违背"全程无需登录国内机"。所有 agent 管理操作进 audit log。
@@ -113,7 +113,7 @@ agent 自己监听 198.18.0.1:53，分流域名答网关 IP、其余转发上游
 ### 6.4 bootstrap.sh `cn-setup`（agent 模式）
 
 - 新流程：下载 agent 二进制（走网关托管路径）→ 写 `agent.json` → 装 systemd unit（含资源约束与看门狗配置）→ enroll → 等待首次心跳成功 → 写 resolv.conf（agent DNS + 公网 DNS 兜底双 nameserver）→ NetworkManager `dns=none` 守卫保留。
-- **迁移**：检测旧部署（dnsmasq 单元、watchdog timer、hosts 托管块）→ 停用并清理 → 装 agent。老机器重跑 cn-setup 即完成迁移。
+- **迁移**：检测旧部署 → 按第 9 节的顺序与回滚语义执行。老机器重跑 cn-setup 即完成迁移。
 - `cn-restore` / `cn-check` / `cn-status` 保留命令名与语义，内部改为驱动 agent（restore：停用 agent、还原 resolv.conf、清 agent.json；check/status：读 agent 本地状态）。
 
 ## 7. 域名列表的生命周期（原诉求 1+2+5 的合并视图)
@@ -145,9 +145,55 @@ agent 自己监听 198.18.0.1:53，分流域名答网关 IP、其余转发上游
 - 网关侧快照与 journal 权限 0600，面板访问走现有会话 + CSRF 体系。
 - agent 端点按 token 限流。防重放**不引入**严格单调时间戳校验：单调时钟在机器重启后归零，照字面实现会把每台重启过的国内机永久判定为"时间回退"而失联。心跳携带 boot 时间与 uptime 仅作展示用途，安全边界由 HTTPS + per-machine token + 限流构成，不过度设计。
 
-## 9. 兼容性
+## 9. 存量升级方案
 
-- 老版部署（dnsmasq + watchdog）在升级网关后继续可用；迁移由用户择机重跑 cn-setup 完成。
+存量 = 已按 v1.5.x 部署的代理机 + 国内机（dnsmasq + watchdog + hosts 托管块，无 agent）。
+
+### 9.1 升级顺序与独立性
+
+- **先代理机，后国内机**，两步互相独立，中间可停留任意久。
+- 代理机升级 = 普通 `warden upgrade` 到 v1.6.0。升级后 `/api/agent/*` 可用但注册表为空；老国内机不感知网关版本，行为完全不变。
+- 国内机迁移 = 择机在面板拿新命令（带 enroll token）重跑 cn-setup，**每台独立迁移，无全局切换开关**。
+- 存量迁移是唯一需要登录国内机的动作（NAT 决定无法省略）；迁移完成后一切变更远程进行。
+
+### 9.2 代理机侧数据迁移
+
+- 首次以 v1.6.0 启动：`cfg.DNS.Domains` 为空则用 `DefaultSplitDomains()` 播种并保存（配置版本号 +1）。此后面板编辑改的就是这份 live 列表——这是"事实源切换"的落地点。
+- 注册表 / 命令队列状态文件按需创建（DataDir，0600），纳入现有备份/恢复。
+
+### 9.3 agent 二进制的供给
+
+- CI 同时构建 `warden-gateway` 与 `warden-cn-agent`（linux-amd64 静态编译），同一 release 发布。
+- 网关安装/升级时把 agent 二进制解包到 `/opt/warden-gateway/agent/`，按版本目录保留最近 2 个版本（当前 + 上一版）供回退。
+- `/api/agent/binary` 从该目录服务，附 checksum 侧车文件。
+
+### 9.4 国内机迁移步骤（cn-setup agent 模式，顺序即设计）
+
+1. **快照**全部将被改动的文件与单元（沿用 `cn_snapshot_file` 机制）。
+2. **先建立安全网**：把公网兜底 DNS 写进 resolv.conf。
+3. **停旧**：停止并禁用旧 dnsmasq 单元与看门狗 service+timer；resolv.conf 暂置为纯公网直连（避免指向刚停掉的监听造成 5 秒超时延迟）。此刻机器处于"无分流直连"状态——就是装 warden 之前的老状态，业务不中断。
+4. **装新**：下载 agent 二进制 + 写 `agent.json` + 装 unit，启动 agent，绑定 198.18.0.1:53（旧单元已停，无冲突）。若端口仍被异常残留占用，agent 进入重试并上报本地状态，cn-setup 报错走回滚。
+5. **接入**：enroll → 等待首次心跳成功 → 域名列表到手 → 本机 DNS 应答自检（`getent` 抽查分流域名解析到网关 IP）通过。
+6. **定型**：resolv.conf 写最终形态（agent DNS 在前 + 公网在后），NetworkManager `dns=none` 守卫保留。
+7. **摘除 hosts 托管块**——必须摘：不摘的话 agent 降级直连时，hosts 仍把分流域名钉在网关 IP，第 8 节安全网第 1/2 条失效。
+8. **清理**：删除 watchdog 脚本/env/state、dnsmasq 配置、cn.env；快照归档保留供 cn-restore 回退。
+
+**失败中止语义**：任何一步失败，执行已写入的回滚（恢复快照、重新启用旧单元、还原 resolv.conf），机器回到迁移前状态；第 2 步写入的公网兜底 DNS 保留（无害且有益）。
+
+### 9.5 旧命令兼容
+
+- **无 `--enroll-token` 的 cn-setup 回退 legacy 模式**：按 v1.5.x 行为安装 dnsmasq + watchdog，打印弃用提示。已发出去的旧命令、脚本里的收藏命令继续可用。legacy 代码路径标记 deprecated，后续版本移除。
+- `warden-cn` 包装命令保留：`cn-check` / `cn-status` / `cn-restore` 在两种模式下语义一致（agent 模式下读 agent 状态、驱动 agent；restore 还原到迁移前快照）。
+
+### 9.6 跨版本协议兼容
+
+- 心跳请求带 protocol 版本号，网关接受当前与上一版。
+- agent 的自升级目标版本永远来自网关，二进制与协议同步演进，不会出现 agent 升到不兼容协议的中间态。
+- agent 心跳被拒（token 被吊销/机器被注销）时：本地一切照旧运行（安全网第 6 条），日志标注"已注销"，**不自毁配置**——机器永远可以手动恢复。
+
+### 9.7 兼容性清单
+
+- 老版部署（dnsmasq + watchdog）在升级网关后继续可用；迁移由用户择机完成。
 - `/api/cn` 保留全部现有字段，新增 agent 相关字段（`agent_binary_url` 等）。
 - `--cn-mode` 参数语义不变（`auto` / `none`），`none` 模式不安装 agent。
 
