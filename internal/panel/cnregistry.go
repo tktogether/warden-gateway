@@ -216,6 +216,64 @@ func (r *CNRegistry) QueueCommand(id, action string, params map[string]string) e
 	return nil
 }
 
+// PopCommands returns up to max commands from the machine's pending queue and
+// clears them, appending a "dispatched" event per command and persisting the
+// change. Unknown machines and empty queues yield an empty slice. If the save
+// fails the in-memory queue is restored so the commands are handed out again
+// on the next beat instead of being lost or silently re-dispatched after a
+// restart.
+func (r *CNRegistry) PopCommands(id string, max int) []CNCommand {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := r.machineByIDLocked(id)
+	if m == nil || len(m.Pending) == 0 {
+		return []CNCommand{}
+	}
+	n := len(m.Pending)
+	if max > 0 && max < n {
+		n = max
+	}
+	out := make([]CNCommand, n)
+	rest := make([]CNCommand, len(m.Pending)-n)
+	copy(out, m.Pending[:n])
+	copy(rest, m.Pending[n:])
+	for i := range out {
+		if out[i].Params != nil {
+			params := make(map[string]string, len(out[i].Params))
+			for k, v := range out[i].Params {
+				params[k] = v
+			}
+			out[i].Params = params
+		}
+	}
+	now := time.Now().UTC()
+	for _, cmd := range out {
+		r.appendEventLocked(m, "dispatched", "action "+cmd.Action, now)
+	}
+	saved := m.Pending
+	m.Pending = rest
+	if err := r.saveLocked(); err != nil {
+		m.Pending = saved
+		m.Events = m.Events[len(out):]
+		return []CNCommand{}
+	}
+	return out
+}
+
+// UpdateReport stores the machine's latest heartbeat report and desired agent
+// version, then persists both.
+func (r *CNRegistry) UpdateReport(id string, report map[string]interface{}, desiredVersion string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := r.machineByIDLocked(id)
+	if m == nil {
+		return ErrUnknownMachine
+	}
+	m.Report = report
+	m.DesiredVersion = desiredVersion
+	return r.saveLocked()
+}
+
 // MachineByID returns the machine with the given ID, or nil.
 func (r *CNRegistry) MachineByID(id string) *CNMachine {
 	r.mu.Lock()

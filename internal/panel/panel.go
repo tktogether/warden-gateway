@@ -55,6 +55,7 @@ type Options struct {
 	Started     time.Time
 	DNS         *dnsproxy.Proxy
 	SingBox     *singbox.Manager
+	CNReg       *CNRegistry
 }
 
 type Server struct {
@@ -72,8 +73,14 @@ type Server struct {
 	dns         *dnsproxy.Proxy
 	singbox     *singbox.Manager
 	auditPath   string
-	sampleMu    sync.Mutex
-	restartMu   sync.Mutex
+	cnReg       *CNRegistry
+	beatMu      sync.Mutex
+	lastBeat    map[string]time.Time
+	// minBeatInterval is the heartbeat rate limit window; tests set it to 0
+	// to disable limiting.
+	minBeatInterval time.Duration
+	sampleMu        sync.Mutex
+	restartMu       sync.Mutex
 }
 
 func New(opts Options) (*Server, error) {
@@ -109,7 +116,10 @@ func New(opts Options) (*Server, error) {
 		serviceName: opts.ServiceName, auth: opts.Auth, backups: opts.Backups,
 		stats: opts.Stats, log: opts.Log, started: opts.Started,
 		host: newHostMetrics(hostSampleCapacity), dns: opts.DNS, singbox: opts.SingBox,
-		auditPath: filepath.Join(opts.DataDir, "audit.log"),
+		auditPath:       filepath.Join(opts.DataDir, "audit.log"),
+		cnReg:           opts.CNReg,
+		lastBeat:        make(map[string]time.Time),
+		minBeatInterval: cnBeatMinInterval,
 	}
 	s.host.Sample()
 	return s, nil
@@ -203,6 +213,12 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, p string) {
 		return
 	case "/api/logout":
 		s.handleLogout(w, r)
+		return
+	case "/api/agent/enroll":
+		s.handleAgentEnroll(w, r)
+		return
+	case "/api/agent/heartbeat":
+		s.handleAgentHeartbeat(w, r)
 		return
 	case "/api/overview":
 		s.handleOverview(w, r)

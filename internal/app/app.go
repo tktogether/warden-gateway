@@ -120,11 +120,16 @@ func New(opts Options) (*App, error) {
 			return nil, err
 		}
 	}
+	cnReg, err := panel.LoadCNRegistry(opts.Paths.DataDir)
+	if err != nil {
+		return nil, err
+	}
 	panelSrv, err := panel.New(panel.Options{
 		Config: cfg, ConfigPath: opts.Paths.ConfigPath, DataDir: opts.Paths.DataDir,
 		ScriptDir:   opts.Paths.ScriptDir,
 		ServiceName: "warden-gateway.service", Auth: authMgr, Backups: backups,
 		Stats: stats, Log: logger, Started: time.Now(), DNS: dnsProxy, SingBox: singboxMgr,
+		CNReg: cnReg,
 	})
 	if err != nil {
 		return nil, err
