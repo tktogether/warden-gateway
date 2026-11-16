@@ -138,6 +138,82 @@ func startUpstream(t *testing.T, rcode int) (string, func()) {
 	return pc.LocalAddr().String(), func() { _ = srv.Shutdown() }
 }
 
+// startFakeUpstream answers every A query with 192.0.2.1 (TEST-NET-1).
+func startFakeUpstream(t *testing.T) (string, func()) {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		for _, q := range r.Question {
+			if q.Qtype == dns.TypeA {
+				m.Answer = append(m.Answer, &dns.A{
+					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+					A:   net.IPv4(192, 0, 2, 1).To4(),
+				})
+			}
+		}
+		_ = w.WriteMsg(m)
+	})}
+	go func() { _ = srv.ActivateAndServe() }()
+	return pc.LocalAddr().String(), func() { _ = srv.Shutdown() }
+}
+
+func TestProxyNilStatsServes(t *testing.T) {
+	upstream, stop := startFakeUpstream(t)
+	defer stop()
+	proxy := newTestProxy(t, nil, upstream)
+	for _, name := range []string{"github.com.", "example.com."} {
+		req := new(dns.Msg)
+		req.SetQuestion(name, dns.TypeA)
+		w := &fakeWriter{}
+		proxy.serveDNS(w, req)
+		if w.msg == nil {
+			t.Fatalf("no response for %s", name)
+		}
+		if w.msg.Rcode != dns.RcodeSuccess {
+			t.Fatalf("%s rcode = %d, want NOERROR", name, w.msg.Rcode)
+		}
+		if len(w.msg.Answer) == 0 {
+			t.Fatalf("%s answer missing", name)
+		}
+	}
+}
+
+func TestProxyDegradedRoutesUpstream(t *testing.T) {
+	upstream, stop := startFakeUpstream(t)
+	defer stop()
+	proxy := newTestProxy(t, nil, upstream)
+	proxy.SetDegraded(true)
+	if !proxy.Status().Degraded {
+		t.Fatal("status.Degraded = false, want true")
+	}
+	req := new(dns.Msg)
+	req.SetQuestion("github.com.", dns.TypeA)
+	w := &fakeWriter{}
+	proxy.serveDNS(w, req)
+	if w.msg == nil {
+		t.Fatal("no response written")
+	}
+	for _, rr := range w.msg.Answer {
+		if a, ok := rr.(*dns.A); ok && a.A.Equal(net.IPv4(203, 0, 113, 10)) {
+			t.Fatalf("degraded query answered locally with gateway IP: %v", w.msg.Answer)
+		}
+	}
+	fromUpstream := false
+	for _, rr := range w.msg.Answer {
+		if a, ok := rr.(*dns.A); ok && a.A.Equal(net.IPv4(192, 0, 2, 1)) {
+			fromUpstream = true
+		}
+	}
+	if !fromUpstream {
+		t.Fatalf("degraded query not answered from upstream (A 192.0.2.1): %v", w.msg.Answer)
+	}
+}
+
 func TestServeDNSRecordsHitAsSuccess(t *testing.T) {
 	store := telemetry.NewStore()
 	proxy := newTestProxy(t, store, "127.0.0.1:1")
