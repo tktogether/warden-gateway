@@ -1478,10 +1478,24 @@
       try {
         var out = await api('/api/cnmachines/enroll-token', { method: 'POST', body: {} });
         var token = (out && out.token) || '';
-        var cmd = 'curl -fsSL ' + window.location.origin + '/bootstrap.sh -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh cn-setup --origin ' + window.location.origin + ' --enroll-token ' + token + ' --yes';
-        state.cnEnroll = { command: cmd, expires_at: (out && out.expires_at) || '' };
+        var origin = window.location.origin;
+        // The agent probes the gateway address, so the command must carry the
+        // gateway IP explicitly; without it bootstrap falls back to the CN
+        // machine's own egress IP and the probe can never succeed.
+        var gatewayIP = (state.cn && state.cn.gateway_ip) || '';
+        if (!gatewayIP) {
+          try {
+            var cn = await api('/api/cn');
+            state.cn = cn || {};
+            gatewayIP = cn.gateway_ip || '';
+          } catch (cnErr) { /* surfaced as the manual --gateway-ip warning below */ }
+        }
+        var cmd = 'curl -fsSL ' + origin + '/bootstrap.sh -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh cn-setup --origin ' + origin;
+        if (gatewayIP) { cmd += ' --gateway-ip ' + gatewayIP; }
+        cmd += ' --enroll-token ' + token + ' --yes';
+        state.cnEnroll = { command: cmd, expires_at: (out && out.expires_at) || '', gateway_missing: !gatewayIP };
         renderCnmachines(state.cnmachines, true);
-        showToast('注册命令已生成，令牌仅可使用一次');
+        showToast(gatewayIP ? '注册命令已生成，令牌仅可使用一次' : '注册命令已生成，但缺少网关 IP，请手动补上 --gateway-ip', !gatewayIP);
       } catch (err) {
         showToast(err.message, true);
       } finally {
@@ -1495,6 +1509,12 @@
       var parts = ['命令只在生成后的 15 分钟内有效'];
       if (state.cnEnroll.expires_at) { parts.push('令牌到期时间 ' + fmtTime(state.cnEnroll.expires_at)); }
       add(p, el('p', 'muted cn-enroll-note', parts.join(' · ') + '。'));
+      if (state.cnEnroll.gateway_missing) {
+        var gwWarn = el('div', 'alert');
+        add(gwWarn, el('span', '', '未能获取网关地址'));
+        add(gwWarn, el('span', '', '上面的命令缺少 --gateway-ip，bootstrap 会回退到国内机自己的出口 IP，导致 agent 探测永远不通过。请先手动在 cn-setup 后补上 --gateway-ip <网关 IPv4> 再执行。'));
+        p.appendChild(gwWarn);
+      }
     }
     return p;
   }
