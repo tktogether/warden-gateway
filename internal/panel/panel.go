@@ -262,6 +262,9 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, p string) {
 	case "/api/cn":
 		s.handleCNCommands(w, r)
 		return
+	case "/api/cnmachines":
+		s.handleCNMachines(w, r)
+		return
 	case "/api/dns":
 		s.handleDNSStatus(w, r)
 		return
@@ -299,6 +302,10 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, p string) {
 	}
 	if strings.HasPrefix(p, "/api/backups/") {
 		s.handleBackupItem(w, r, strings.TrimPrefix(p, "/api/backups/"))
+		return
+	}
+	if strings.HasPrefix(p, "/api/cnmachines/") {
+		s.handleCNMachineItem(w, r, strings.TrimPrefix(p, "/api/cnmachines/"))
 		return
 	}
 	http.NotFound(w, r)

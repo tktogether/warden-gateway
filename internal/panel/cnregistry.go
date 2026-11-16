@@ -274,6 +274,25 @@ func (r *CNRegistry) UpdateReport(id string, report map[string]interface{}, desi
 	return r.saveLocked()
 }
 
+// SetAutoFollow toggles a machine's auto-follow flag and persists the change.
+// An auto-following machine adopts the gateway version as its desired agent
+// version on the next heartbeat.
+func (r *CNRegistry) SetAutoFollow(machineID string, enabled bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := r.machineByIDLocked(machineID)
+	if m == nil {
+		return ErrUnknownMachine
+	}
+	m.AutoFollow = enabled
+	state := "disabled"
+	if enabled {
+		state = "enabled"
+	}
+	r.appendEventLocked(m, "auto_follow", state, time.Now().UTC())
+	return r.saveLocked()
+}
+
 // MachineByID returns the machine with the given ID, or nil.
 func (r *CNRegistry) MachineByID(id string) *CNMachine {
 	r.mu.Lock()
