@@ -1478,7 +1478,7 @@
       try {
         var out = await api('/api/cnmachines/enroll-token', { method: 'POST', body: {} });
         var token = (out && out.token) || '';
-        var cmd = 'curl -fsSL ' + window.location.origin + '/bootstrap.sh -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh cn-setup --enroll-token ' + token + ' --yes';
+        var cmd = 'curl -fsSL ' + window.location.origin + '/bootstrap.sh -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh cn-setup --origin ' + window.location.origin + ' --enroll-token ' + token + ' --yes';
         state.cnEnroll = { command: cmd, expires_at: (out && out.expires_at) || '' };
         renderCnmachines(state.cnmachines, true);
         showToast('注册命令已生成，令牌仅可使用一次');
