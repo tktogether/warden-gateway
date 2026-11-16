@@ -239,11 +239,7 @@ func (r *CNRegistry) PopCommands(id string, max int) []CNCommand {
 	copy(rest, m.Pending[n:])
 	for i := range out {
 		if out[i].Params != nil {
-			params := make(map[string]string, len(out[i].Params))
-			for k, v := range out[i].Params {
-				params[k] = v
-			}
-			out[i].Params = params
+			out[i].Params = cnCopyParams(out[i].Params)
 		}
 	}
 	now := time.Now().UTC()
@@ -306,6 +302,86 @@ func (r *CNRegistry) Machines() []*CNMachine {
 	defer r.mu.Unlock()
 	out := make([]*CNMachine, len(r.machines))
 	copy(out, r.machines)
+	return out
+}
+
+// Snapshot returns value copies of every registered machine so callers can
+// render or filter them without touching memory the heartbeat path mutates
+// under the registry lock. Machines() keeps returning live pointers for
+// internal read-only uses; anything handed to handlers must come from here.
+func (r *CNRegistry) Snapshot() []CNMachine {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]CNMachine, 0, len(r.machines))
+	for _, m := range r.machines {
+		out = append(out, cnCopyMachine(m))
+	}
+	return out
+}
+
+// cnCopyMachine deep-copies one machine record: the report map including its
+// nested probe/system objects and the workloads slice, the event slice and
+// the pending commands with their params maps.
+func cnCopyMachine(m *CNMachine) CNMachine {
+	c := *m
+	if m.Report != nil {
+		c.Report = make(map[string]interface{}, len(m.Report))
+		for k, v := range m.Report {
+			switch val := v.(type) {
+			case map[string]interface{}:
+				c.Report[k] = cnCopyMap(val)
+			case []interface{}:
+				c.Report[k] = cnCopySliceOfMaps(val)
+			default:
+				c.Report[k] = v
+			}
+		}
+	}
+	if m.Events != nil {
+		c.Events = make([]CNEvent, len(m.Events))
+		copy(c.Events, m.Events)
+	}
+	if m.Pending != nil {
+		c.Pending = make([]CNCommand, len(m.Pending))
+		for i, cmd := range m.Pending {
+			c.Pending[i] = cmd
+			if cmd.Params != nil {
+				c.Pending[i].Params = cnCopyParams(cmd.Params)
+			}
+		}
+	}
+	return c
+}
+
+// cnCopyMap clones one level of a report object; the leaves the agent reports
+// are JSON scalars, which are safe to share by value.
+func cnCopyMap(in map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// cnCopySliceOfMaps clones a workloads-style slice and each element map.
+func cnCopySliceOfMaps(in []interface{}) []interface{} {
+	out := make([]interface{}, len(in))
+	for i, v := range in {
+		if m, ok := v.(map[string]interface{}); ok {
+			out[i] = cnCopyMap(m)
+		} else {
+			out[i] = v
+		}
+	}
+	return out
+}
+
+// cnCopyParams clones a command params map.
+func cnCopyParams(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
 	return out
 }
 

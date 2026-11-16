@@ -223,11 +223,13 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	s.recordBeat(tokenHash)
 	if deregistered {
 		// The agent picked up the deregister command: revoke the machine now
-		// so its token stops beating. A concurrent force removal or a save
-		// failure is fine to ignore here — the machine either is already gone
-		// or the command is dispatched again on the next beat.
+		// so its token stops beating. The pop itself was already persisted, so
+		// if this Remove fails the soft removal is silently dropped until the
+		// operator re-queues it — the audit line below records the failure.
 		if err := s.cnReg.Remove(machine.ID); err == nil {
 			s.forgetBeat(tokenHash)
+		} else {
+			s.audit("cn.remove", machine.ID, "fail: "+err.Error(), auth.ClientIP(r))
 		}
 	}
 	writeJSON(w, http.StatusOK, &reply)
@@ -261,10 +263,11 @@ type cnMachineRow struct {
 	Pending        int                    `json:"pending"`
 }
 
-// newCNMachineRow copies the listable fields out of a registry machine. Registry
-// methods hand out live pointers, so nothing here keeps or mutates them and
-// the report maps pass through verbatim.
-func newCNMachineRow(m *CNMachine, now time.Time) cnMachineRow {
+// newCNMachineRow builds a list row from a machine value copy (see
+// CNRegistry.Snapshot): nothing here shares memory with the registry, so the
+// read cannot race the heartbeat path and the report maps pass through
+// verbatim from the copy.
+func newCNMachineRow(m CNMachine, now time.Time) cnMachineRow {
 	online := false
 	if seen, err := time.Parse(time.RFC3339, m.LastSeen); err == nil {
 		online = now.Sub(seen) < cnOnlineWindow
@@ -305,7 +308,7 @@ func (s *Server) handleCNMachines(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	machines := s.cnReg.Machines()
+	machines := s.cnReg.Snapshot()
 	rows := make([]cnMachineRow, 0, len(machines))
 	for _, m := range machines {
 		rows = append(rows, newCNMachineRow(m, now))

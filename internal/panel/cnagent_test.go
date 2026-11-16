@@ -729,3 +729,61 @@ func TestRemoveQueuedDeregisterAck(t *testing.T) {
 		t.Fatalf("post-ack beat status %d, want 401", rec.Code)
 	}
 }
+
+func TestMachineListConcurrentWithHeartbeats(t *testing.T) {
+	srv, key := newAgentPanel(t)
+	srv.minBeatInterval = 0
+
+	id, token := enrollMachine(t, srv, "edge-01")
+	report := heartbeatReport(srv, id)
+	// A small pending queue lets the early beats also mutate Pending and
+	// Events while the list runs, exercising every Snapshot clone path.
+	for i := 0; i < 10; i++ {
+		if err := srv.cnReg.QueueCommand(id, "self-check", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cookie, _ := login(t, srv, key)
+
+	// -race cannot link on this machine, so the race is exercised by
+	// hammering both endpoints concurrently and asserting the final state
+	// afterwards instead of relying on the detector. The list builds its rows
+	// from registry snapshots (value copies taken under the lock), so the
+	// reads never share memory with the heartbeat writer.
+	const rounds = 200
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < rounds; i++ {
+			rec := postAgentJSON(t, srv, srv.cfg.PanelPath+"/api/agent/heartbeat", token, report)
+			if rec.Code != http.StatusOK {
+				t.Errorf("concurrent heartbeat status %d: %s", rec.Code, rec.Body)
+				return
+			}
+		}
+	}()
+	for i := 0; i < rounds; i++ {
+		rec := do(t, srv, "GET", srv.cfg.PanelPath+"/api/cnmachines", nil, cookie, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("concurrent list status %d: %s", rec.Code, rec.Body)
+		}
+	}
+	<-done
+
+	// Final state: the machine survived the hammering with a fresh report and
+	// still shows up online in the list.
+	m := srv.cnReg.MachineByID(id)
+	if m == nil {
+		t.Fatal("machine missing after concurrent list + heartbeats")
+	}
+	if m.Report == nil || m.Report["agent_version"] != "test-1" {
+		t.Errorf("report after concurrent runs = %v, want agent_version test-1", m.Report)
+	}
+	if seen, err := time.Parse(time.RFC3339, m.LastSeen); err != nil || time.Since(seen) >= 30*time.Second {
+		t.Errorf("last_seen = %q, want fresh after the last beat", m.LastSeen)
+	}
+	list, _ := cnMachineList(t, srv, cookie)
+	if len(list.Machines) != 1 || !list.Machines[0].Online {
+		t.Fatalf("list after concurrent runs = %+v, want one online machine", list.Machines)
+	}
+}
