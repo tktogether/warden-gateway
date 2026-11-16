@@ -10,6 +10,7 @@ import (
 
 	"github.com/tktogether/warden-gateway/internal/config"
 	"github.com/tktogether/warden-gateway/internal/diagnostics"
+	"github.com/tktogether/warden-gateway/internal/version"
 )
 
 func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
@@ -122,21 +123,29 @@ func (s *Server) handleCNCommands(w http.ResponseWriter, r *http.Request) {
 		healthURL = origin + "/healthz"
 		checkCommand = "curl -fsSL " + scriptURL + " -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh cn-check"
 	}
+	// agent_binary_url points the CN machine at the self-hosted agent binary so
+	// the download never touches GitHub directly; without an origin the panel
+	// cannot host it and the URL stays empty.
+	agentBinaryURL := ""
+	if origin != "" {
+		agentBinaryURL = origin + "/github.com/tktogether/warden-gateway/releases/download/v" + version.Version + "/warden-cn-agent-linux-amd64"
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"as_of":           config.NowUTC(),
-		"origin":          origin,
-		"gateway_ip":      gateway,
-		"panel_host":      host,
-		"domains":         config.DefaultSplitDomains(),
-		"script_url":      scriptURL,
-		"command":         command,
-		"commands":        commands,
-		"restore_command": restoreCommand,
-		"health_url":      healthURL,
-		"check_command":   checkCommand,
-		"cn_mode":         "auto",
-		"dns":             info,
-		"dns_ready":       dnsReady,
+		"as_of":            config.NowUTC(),
+		"origin":           origin,
+		"gateway_ip":       gateway,
+		"panel_host":       host,
+		"domains":          s.liveSplitDomains(),
+		"script_url":       scriptURL,
+		"command":          command,
+		"commands":         commands,
+		"restore_command":  restoreCommand,
+		"health_url":       healthURL,
+		"check_command":    checkCommand,
+		"agent_binary_url": agentBinaryURL,
+		"cn_mode":          "auto",
+		"dns":              info,
+		"dns_ready":        dnsReady,
 	})
 }
 

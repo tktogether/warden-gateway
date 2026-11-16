@@ -9,7 +9,18 @@ import (
 	"github.com/tktogether/warden-gateway/internal/auth"
 	"github.com/tktogether/warden-gateway/internal/config"
 	"github.com/tktogether/warden-gateway/internal/dnsproxy"
+	"github.com/tktogether/warden-gateway/internal/gateway"
 )
+
+// liveSplitDomains is the domain list the panel presents as the source of
+// truth: whatever the operator configured, falling back to the built-in
+// defaults when nothing is configured (spec §9.2).
+func (s *Server) liveSplitDomains() []string {
+	if len(s.cfg.DNS.Domains) > 0 {
+		return s.cfg.DNS.Domains
+	}
+	return config.DefaultSplitDomains()
+}
 
 // handleDNSConfig toggles the gateway DNS listener. Enabling it probes the
 // candidate addresses so the panel can report the address that is actually
@@ -49,6 +60,21 @@ func (s *Server) handleDNSConfig(w http.ResponseWriter, r *http.Request) {
 	if len(next.Domains) == 0 {
 		next.Domains = config.DefaultSplitDomains()
 	}
+	// The CN machines resolve these names through the gateway, so the SNI
+	// passthrough list must cover every one of them regardless of whether SNI
+	// is enabled: add the missing domains verbatim instead of inventing
+	// wildcards. The matcher is built once from the existing patterns; a
+	// wildcard such as *.githubusercontent.com already covers its subdomains.
+	nextSNI := s.cfg.SNI
+	added := []string{}
+	matcher := gateway.NewHostMatcher(nextSNI.Passthrough)
+	for _, d := range next.Domains {
+		if matcher.Match(d) {
+			continue
+		}
+		nextSNI.Passthrough = append(nextSNI.Passthrough, d)
+		added = append(added, d)
+	}
 	if strings.TrimSpace(next.GatewayIP) == "" {
 		next.GatewayIP = resolveGateway(s.cfg.PublicHost())
 	}
@@ -82,9 +108,12 @@ func (s *Server) handleDNSConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	previous := s.cfg.DNS
+	previousSNI := s.cfg.SNI
 	s.cfg.DNS = next
+	s.cfg.SNI = nextSNI
 	if err := s.cfg.Save(s.cfgPath); err != nil {
 		s.cfg.DNS = previous
+		s.cfg.SNI = previousSNI
 		writeError(w, http.StatusInternalServerError, "保存配置失败: "+err.Error())
 		return
 	}
@@ -92,7 +121,19 @@ func (s *Server) handleDNSConfig(w http.ResponseWriter, r *http.Request) {
 	if next.Enabled {
 		state = "started"
 	}
-	s.audit("dns.config", state+" "+next.Listen, "ok", auth.ClientIP(r))
+	detail := state + " " + next.Listen
+	if len(added) > 0 {
+		detail += " sni+=" + strings.Join(added, ",")
+	}
+	s.audit("dns.config", detail, "ok", auth.ClientIP(r))
+	if len(added) > 0 {
+		covered := "已补进 SNI 透传: " + strings.Join(added, ", ")
+		if note != "" {
+			note = note + "；" + covered
+		} else {
+			note = covered
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok": true, "restarting": true, "note": note, "dns": s.dnsInfo(),
 	})
@@ -114,7 +155,7 @@ func (s *Server) handleDNSStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"as_of":                config.NowUTC(),
 		"dns":                  s.dnsInfo(),
-		"domains":              config.DefaultSplitDomains(),
+		"domains":              s.liveSplitDomains(),
 		"suggested_gateway_ip": gateway,
 	})
 }

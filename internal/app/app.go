@@ -120,6 +120,14 @@ func New(opts Options) (*App, error) {
 			return nil, err
 		}
 	}
+	// Seed the CN split domain list (spec §9.2): a configuration written before
+	// dns.domains existed must still serve the default split list, and the
+	// seeded value is persisted so the panel shows the same list afterwards.
+	if config.SeedSplitDomains(cfg) {
+		if err := cfg.Save(opts.Paths.ConfigPath); err != nil {
+			logger.Warnf("seed dns.domains: %v", err)
+		}
+	}
 	cnReg, err := panel.LoadCNRegistry(opts.Paths.DataDir)
 	if err != nil {
 		return nil, err
