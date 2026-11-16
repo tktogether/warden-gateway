@@ -116,6 +116,11 @@ type testAgent struct {
 	mu       sync.Mutex
 	notifies []string
 	execs    [][]string
+	// tokenAtExec[i] is the agent token as it stood ON DISK when execs[i]
+	// ran (empty when the config file is unreadable). It lets tests pin the
+	// deregister ordering: the token must be cleared before the systemd
+	// stop, because the stop kills this very process.
+	tokenAtExec []string
 }
 
 func newTestAgent(t *testing.T, cfg *Config) *testAgent {
@@ -139,6 +144,11 @@ func newTestAgent(t *testing.T, cfg *Config) *testAgent {
 	a.execFn = func(name string, args ...string) error {
 		ta.mu.Lock()
 		ta.execs = append(ta.execs, append([]string{name}, args...))
+		if c, err := Load(a.configPath); err == nil {
+			ta.tokenAtExec = append(ta.tokenAtExec, c.Token)
+		} else {
+			ta.tokenAtExec = append(ta.tokenAtExec, "")
+		}
 		ta.mu.Unlock()
 		return nil
 	}
@@ -431,9 +441,12 @@ func TestStateFileWritten(t *testing.T) {
 }
 
 // TestRunOnceDeregisterRestoresAndClearsToken pins the deregister execution
-// order through the injected execFn: resolv.conf restored to public-only
-// resolvers first, then the service disabled, then the token cleared on disk;
-// RunOnce reports the sentinel so the run loop exits cleanly.
+// order through the injected execFn (review fix): resolv.conf restored to
+// public-only resolvers first, then the token cleared on disk, and the
+// irreversible `systemctl disable --now` LAST — because it stops this very
+// process, nothing after it is guaranteed to run, so the token must already
+// be off disk when it fires. RunOnce reports the sentinel so the run loop
+// exits cleanly.
 func TestRunOnceDeregisterRestoresAndClearsToken(t *testing.T) {
 	upstream := startFakeUpstream(t, "192.0.2.1")
 	gw := &fakeGateway{reply: func(n int, body map[string]any) (int, any) {
@@ -443,6 +456,7 @@ func TestRunOnceDeregisterRestoresAndClearsToken(t *testing.T) {
 	}}
 	cfg := gw.start(t)
 	cfg.Upstream = upstream
+	origToken := cfg.Token // deregister clears cfg.Token in place; keep the original for the ordering assertions
 
 	cfgPath := filepath.Join(t.TempDir(), "agent.json")
 	if err := Save(cfgPath, cfg); err != nil {
@@ -458,7 +472,7 @@ func TestRunOnceDeregisterRestoresAndClearsToken(t *testing.T) {
 
 	execs := ta.snapshotExecs()
 	if len(execs) != 2 {
-		t.Fatalf("exec calls = %v, want 2 (resolv.conf restore + systemctl disable)", execs)
+		t.Fatalf("exec calls = %v, want 2 (resolv.conf restore, then systemctl disable last)", execs)
 	}
 	if execs[0][0] != "sh" || execs[0][1] != "-c" {
 		t.Errorf("first exec = %v, want sh -c ...", execs[0])
@@ -469,9 +483,20 @@ func TestRunOnceDeregisterRestoresAndClearsToken(t *testing.T) {
 		if !strings.Contains(script, "/etc/resolv.conf") || !strings.Contains(script, "nameserver 127.0.0.1") || !strings.Contains(script, "nameserver 119.29.29.29") {
 			t.Errorf("resolv.conf restore script = %q, want public-only nameservers", script)
 		}
+		// The token must still be on disk while the resolver is restored:
+		// only the stop may run after the token clear.
+		if ta.tokenAtExec[0] != origToken {
+			t.Errorf("token on disk during resolv.conf restore = %q, want it still present (%q...)", ta.tokenAtExec[0], origToken[:8])
+		}
 	}
 	if len(execs[1]) != 4 || execs[1][0] != "systemctl" || execs[1][1] != "disable" || execs[1][2] != "--now" || execs[1][3] != "warden-cn-agent" {
-		t.Errorf("second exec = %v, want systemctl disable --now warden-cn-agent", execs[1])
+		t.Errorf("second (final) exec = %v, want systemctl disable --now warden-cn-agent", execs[1])
+	}
+	// The self-stop race regression: by the time `disable --now` runs, the
+	// token must already be cleared on disk (the stop may kill the process,
+	// so nothing after it is guaranteed to execute).
+	if ta.tokenAtExec[1] != "" {
+		t.Errorf("token on disk when systemctl disable ran = %q, want empty (Save must happen before the stop)", ta.tokenAtExec[1])
 	}
 
 	loaded, err := Load(cfgPath)
@@ -488,6 +513,78 @@ func TestRunOnceDeregisterRestoresAndClearsToken(t *testing.T) {
 	st := ta.readState(t)
 	if last, ok := st["last_command"].(map[string]any); !ok || last["ok"] != true {
 		t.Errorf("state last_command = %v, want ok=true", st["last_command"])
+	}
+}
+
+// TestRunOnceDeregisterStopFailureStillExits pins the failure branch of the
+// reordered teardown: when `systemctl disable --now` fails AFTER the token
+// was cleared, the error lands in the command detail (last_command.ok=false)
+// but the agent still exits via the sentinel — heartbeats with the cleared
+// token fail harmlessly.
+func TestRunOnceDeregisterStopFailureStillExits(t *testing.T) {
+	upstream := startFakeUpstream(t, "192.0.2.1")
+	gw := &fakeGateway{reply: func(n int, body map[string]any) (int, any) {
+		return http.StatusOK, HeartbeatReply{
+			Commands: []Command{{ID: "d1", Action: "deregister"}},
+		}
+	}}
+	cfg := gw.start(t)
+	cfg.Upstream = upstream
+
+	cfgPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := Save(cfgPath, cfg); err != nil {
+		t.Fatalf("save agent config: %v", err)
+	}
+	ta := newTestAgent(t, cfg)
+	ta.agent.configPath = cfgPath
+	// resolv.conf restore succeeds, the systemd stop fails.
+	a := ta.agent
+	a.execFn = func(name string, args ...string) error {
+		ta.mu.Lock()
+		ta.execs = append(ta.execs, append([]string{name}, args...))
+		if c, err := Load(a.configPath); err == nil {
+			ta.tokenAtExec = append(ta.tokenAtExec, c.Token)
+		} else {
+			ta.tokenAtExec = append(ta.tokenAtExec, "")
+		}
+		ta.mu.Unlock()
+		if name == "systemctl" {
+			return errors.New("systemd not running")
+		}
+		return nil
+	}
+
+	err := a.RunOnce(context.Background())
+	if !errors.Is(err, errAgentDeregistered) {
+		t.Fatalf("RunOnce err = %v, want errAgentDeregistered even though the stop failed", err)
+	}
+
+	execs := ta.snapshotExecs()
+	if len(execs) != 2 || execs[1][0] != "systemctl" {
+		t.Fatalf("exec calls = %v, want resolv.conf restore then the failing systemctl stop", execs)
+	}
+	if ta.tokenAtExec[1] != "" {
+		t.Errorf("token on disk when the failing stop ran = %q, want empty (clear happens before the stop)", ta.tokenAtExec[1])
+	}
+
+	loaded, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("reload agent config: %v", err)
+	}
+	if loaded.Token != "" {
+		t.Errorf("token after failed stop = %q, want empty (cleared before the stop)", loaded.Token)
+	}
+
+	st := ta.readState(t)
+	if last, ok := st["last_command"].(map[string]any); !ok {
+		t.Fatalf("state last_command = %v, want object", st["last_command"])
+	} else {
+		if last["ok"] != false {
+			t.Errorf("last_command.ok = %v, want false after a failed stop", last["ok"])
+		}
+		if detail, _ := last["detail"].(string); !strings.Contains(detail, "disable") {
+			t.Errorf("last_command.detail = %q, want the disable failure recorded", detail)
+		}
 	}
 }
 

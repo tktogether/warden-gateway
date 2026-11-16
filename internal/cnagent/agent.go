@@ -530,18 +530,24 @@ func hashDomains(domains []string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// deregister tears the CN setup down in an order that can never leave the
-// machine without a working resolver: first resolv.conf is restored to
-// public-only nameservers (while the local proxy is still serving), then the
-// agent unit is stopped and disabled, and only then is the machine token
-// cleared on disk. Any failure aborts before the steps that would make the
-// failure permanent.
+// deregister tears the CN setup down in an order that is safe against the
+// self-stop race (review finding): `systemctl disable --now warden-cn-agent`
+// stops this very process, so nothing after that call is guaranteed to run.
+// The steps therefore run as:
+//  1. resolv.conf is restored to public-only nameservers while the local DNS
+//     proxy is still serving — a failure here aborts the whole teardown,
+//     because stopping the unit now would leave the machine without a working
+//     resolver;
+//  2. the machine token is cleared on disk — from here on the machine is in a
+//     safe state even if the stop kills this process mid-call: no token,
+//     heartbeats impossible, unit still running but harmless;
+//  3. the irreversible stop goes last. A failure there is reported for the
+//     command detail but the teardown still completes via the sentinel:
+//     heartbeats with the cleared token fail harmlessly and the unit will not
+//     come back on the next boot.
 func (a *Agent) deregister() error {
 	if err := a.execFn("sh", "-c", a.restoreResolvConfCmd()); err != nil {
 		return fmt.Errorf("restore %s: %w", resolvConfPath, err)
-	}
-	if err := a.execFn("systemctl", "disable", "--now", cnAgentService); err != nil {
-		return fmt.Errorf("disable %s: %w", cnAgentService, err)
 	}
 	cfg := *a.cfg
 	cfg.Token = ""
@@ -549,9 +555,13 @@ func (a *Agent) deregister() error {
 		return fmt.Errorf("clear token in %s: %w", a.configPath, err)
 	}
 	a.cfg.Token = ""
+	stopErr := a.execFn("systemctl", "disable", "--now", cnAgentService)
 	a.mu.Lock()
 	a.deregistered = true
 	a.mu.Unlock()
+	if stopErr != nil {
+		return fmt.Errorf("disable %s (token already cleared): %w", cnAgentService, stopErr)
+	}
 	return nil
 }
 
