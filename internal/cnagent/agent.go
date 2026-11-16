@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -99,7 +100,9 @@ type Agent struct {
 	// systemd watchdog (WatchdogSec=30) sees liveness every cycle; do not
 	// remove or move this call when wiring Task 8.
 	notifyFn func(state string)
-	// upgradeFn is the self-upgrade dispatch (Task 7). nil (default) makes
+	// upgradeFn is the self-upgrade dispatch (Task 7). New wires it to
+	// SelfUpgrade with the executable path resolved at call time; only
+	// hand-built Agent structs (tests) carry a nil upgradeFn, which makes
 	// the command report OK=false "not wired yet".
 	upgradeFn func(ctx context.Context, version string) error
 	// checkFn is the self-check dispatch (Task 8). nil (default) makes the
@@ -146,6 +149,18 @@ func New(cfg *Config, log *logging.Logger) (*Agent, error) {
 		prober:     realProber{},
 		notifyFn:   func(string) {},
 		execFn:     func(name string, args ...string) error { return exec.Command(name, args...).Run() },
+		// Task 7 wiring: dispatch self-upgrade into SelfUpgrade. The binary
+		// path is resolved at CALL time (the path is stable, but tests may
+		// replace the executable between construction and the command), the
+		// arch is the build target, and the nil client makes SelfUpgrade use
+		// its own 60s download budget instead of the 8s heartbeat client.
+		upgradeFn: func(ctx context.Context, ver string) error {
+			selfPath, err := os.Executable()
+			if err != nil {
+				return fmt.Errorf("cnagent upgrade: resolve executable path: %w", err)
+			}
+			return SelfUpgrade(ctx, cfg, ver, runtime.GOARCH, selfPath, nil)
+		},
 		httpClient: &http.Client{Timeout: heartbeatHTTPTimeout},
 	}, nil
 }

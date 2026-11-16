@@ -699,6 +699,39 @@ func TestRunOnceContextCancelledStillSafe(t *testing.T) {
 	}
 }
 
+// TestNewWiresUpgradeFn pins the Task 7 wiring: New() must set upgradeFn (a
+// hand-built Agent{} keeps it nil and self-upgrade reports "not wired yet"),
+// and the wired hook must dispatch into SelfUpgrade rather than being a
+// no-op. The closure passes runtime.GOARCH, which is always a supported
+// build target, so the arch rejection the ruling asks about is asserted
+// against SelfUpgrade itself.
+func TestNewWiresUpgradeFn(t *testing.T) {
+	cfg := testConfig(t)
+	a, err := New(cfg, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if a.upgradeFn == nil {
+		t.Fatal("New did not wire upgradeFn; self-upgrade would report \"not wired yet\"")
+	}
+
+	// Dispatch proof: SelfUpgrade rejects an empty target version before any
+	// network call, so the wired hook must surface that error instead of
+	// returning nil (or the unwired placeholder).
+	if err := a.upgradeFn(context.Background(), ""); err == nil {
+		t.Error("upgradeFn(\"\") = nil, want the SelfUpgrade \"version is required\" error")
+	} else if !strings.Contains(err.Error(), "version") {
+		t.Errorf("upgradeFn(\"\") = %v, want an error mentioning the missing version", err)
+	}
+
+	// The arch leg of the ruling: the dispatched function errors on an
+	// unsupported arch, mentioning arch.
+	err = SelfUpgrade(context.Background(), cfg, "v1.6.0", "riscv64", filepath.Join(t.TempDir(), "agent"), nil)
+	if err == nil || !strings.Contains(err.Error(), "arch") {
+		t.Errorf("SelfUpgrade with arch riscv64 = %v, want an error mentioning arch", err)
+	}
+}
+
 // TestBuildReportFillsWireFields pins the Report construction: identity from
 // config, probe round, DNS state, hash, and metrics all filled.
 func TestBuildReportFillsWireFields(t *testing.T) {
