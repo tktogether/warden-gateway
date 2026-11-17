@@ -198,6 +198,18 @@ func DefaultSplitDomains() []string {
 	}
 }
 
+// SeedSplitDomains backfills dns.domains with the built-in defaults when the
+// configuration carries none, so a config written before the field existed
+// still serves the CN split list (spec §9.2). It reports whether the config
+// was changed and needs a save.
+func SeedSplitDomains(c *Config) bool {
+	if c == nil || len(c.DNS.Domains) > 0 {
+		return false
+	}
+	c.DNS.Domains = DefaultSplitDomains()
+	return true
+}
+
 func DefaultPassthroughHosts() []string {
 	return []string{
 		"github.com",

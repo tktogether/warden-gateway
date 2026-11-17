@@ -122,21 +122,27 @@ func (s *Server) handleCNCommands(w http.ResponseWriter, r *http.Request) {
 		healthURL = origin + "/healthz"
 		checkCommand = "curl -fsSL " + scriptURL + " -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh cn-check"
 	}
+	// agent_binary_url points the CN machine at this gateway's own cached agent
+	// build, so install and upgrade never touch GitHub directly. Without an
+	// origin there is nothing to point at and the URL stays empty.
+	agentBinaryURL := agentBinaryURL(origin, AgentBinaryVersion(), "amd64")
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"as_of":           config.NowUTC(),
-		"origin":          origin,
-		"gateway_ip":      gateway,
-		"panel_host":      host,
-		"domains":         config.DefaultSplitDomains(),
-		"script_url":      scriptURL,
-		"command":         command,
-		"commands":        commands,
-		"restore_command": restoreCommand,
-		"health_url":      healthURL,
-		"check_command":   checkCommand,
-		"cn_mode":         "auto",
-		"dns":             info,
-		"dns_ready":       dnsReady,
+		"as_of":                config.NowUTC(),
+		"origin":               origin,
+		"gateway_ip":           gateway,
+		"panel_host":           host,
+		"domains":              s.liveSplitDomains(),
+		"script_url":           scriptURL,
+		"command":              command,
+		"commands":             commands,
+		"restore_command":      restoreCommand,
+		"health_url":           healthURL,
+		"agent_binary_version": AgentBinaryVersion(),
+		"check_command":        checkCommand,
+		"agent_binary_url":     agentBinaryURL,
+		"cn_mode":              "auto",
+		"dns":                  info,
+		"dns_ready":            dnsReady,
 	})
 }
 

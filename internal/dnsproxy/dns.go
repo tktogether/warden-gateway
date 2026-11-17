@@ -28,6 +28,7 @@ type Status struct {
 	Listen     string   `json:"listen"`
 	Port       string   `json:"port"`
 	Fallback   bool     `json:"fallback"`
+	Degraded   bool     `json:"degraded"`
 	Error      string   `json:"error,omitempty"`
 	GatewayIP  string   `json:"gateway_ip"`
 	Domains    []string `json:"domains"`
@@ -44,10 +45,11 @@ type Proxy struct {
 	stats    *telemetry.Store
 	log      *logging.Logger
 
-	mu     sync.Mutex
-	udp    *dns.Server
-	tcp    *dns.Server
-	status Status
+	mu       sync.Mutex
+	degraded bool
+	udp      *dns.Server
+	tcp      *dns.Server
+	status   Status
 }
 
 // New builds a DNS proxy. It returns (nil, nil) when the feature is disabled.
@@ -97,6 +99,19 @@ func (p *Proxy) Status() Status {
 	st := p.status
 	st.Domains = append([]string(nil), p.status.Domains...)
 	return st
+}
+
+// SetDegraded toggles degraded mode. While degraded, split-domain queries are
+// no longer answered with the gateway address but forwarded upstream, so DNS
+// keeps working when the gateway itself is unreachable.
+func (p *Proxy) SetDegraded(degraded bool) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.degraded = degraded
+	p.status.Degraded = degraded
 }
 
 // ListenCandidates returns the bind addresses handled in order: the configured
@@ -243,7 +258,10 @@ func (p *Proxy) Close() error {
 }
 
 func (p *Proxy) serveDNS(w dns.ResponseWriter, req *dns.Msg) {
-	call := p.stats.Begin("dns")
+	var call *telemetry.Call
+	if p.stats != nil {
+		call = p.stats.Begin("dns")
+	}
 	in, out := req.Len(), 0
 	qname := ""
 	if len(req.Question) > 0 {
@@ -253,10 +271,14 @@ func (p *Proxy) serveDNS(w dns.ResponseWriter, req *dns.Msg) {
 	resp.SetReply(req)
 	resp.RecursionAvailable = true
 	if p.matches(qname) {
-		p.stats.Increment("dns_hit")
+		if p.stats != nil {
+			p.stats.Increment("dns_hit")
+		}
 		p.localAnswer(resp, qname)
 	} else {
-		p.stats.Increment("dns_miss")
+		if p.stats != nil {
+			p.stats.Increment("dns_miss")
+		}
 		upstream := &dns.Client{Net: "udp", Timeout: 5 * time.Second}
 		answer, _, err := upstream.Exchange(req, p.upstream)
 		if err != nil {
@@ -305,6 +327,12 @@ func httpStatusForRcode(rcode int) int {
 
 func (p *Proxy) matches(name string) bool {
 	if name == "" {
+		return false
+	}
+	p.mu.Lock()
+	degraded := p.degraded
+	p.mu.Unlock()
+	if degraded {
 		return false
 	}
 	for _, d := range p.domains {

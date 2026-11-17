@@ -14,12 +14,15 @@ jobs:
           - arch: amd64
             goarch: amd64
             goarm: ""
+            agent_arch: amd64
           - arch: arm64
             goarch: arm64
             goarm: ""
+            agent_arch: arm64
           - arch: armv7
             goarch: arm
             goarm: "7"
+            agent_arch: arm
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -38,10 +41,18 @@ jobs:
           mkdir -p dist
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/tktogether/warden-gateway/internal/version.Version=${VERSION} -X github.com/tktogether/warden-gateway/internal/version.Commit=${COMMIT} -X github.com/tktogether/warden-gateway/internal/version.BuildTime=${BUILD_TIME}" -o dist/warden-gateway ./cmd/warden-gateway
           tar -czf dist/warden-gateway_linux_${{ matrix.arch }}.tar.gz -C dist warden-gateway
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/tktogether/warden-gateway/internal/version.Version=${VERSION} -X github.com/tktogether/warden-gateway/internal/version.Commit=${COMMIT} -X github.com/tktogether/warden-gateway/internal/version.BuildTime=${BUILD_TIME}" -o dist/warden-cn-agent ./cmd/warden-cn-agent
+          cp dist/warden-cn-agent dist/warden-cn-agent-linux-${{ matrix.agent_arch }}
+          sha256sum dist/warden-cn-agent-linux-${{ matrix.agent_arch }} | awk '{print $1}' > dist/warden-cn-agent-linux-${{ matrix.agent_arch }}.sha256
+          tar -czf dist/warden-cn-agent_linux_${{ matrix.agent_arch }}.tar.gz -C dist warden-cn-agent
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.arch }}
-          path: dist/warden-gateway_linux_${{ matrix.arch }}.tar.gz
+          path: |
+            dist/warden-gateway_linux_${{ matrix.arch }}.tar.gz
+            dist/warden-cn-agent-linux-${{ matrix.agent_arch }}
+            dist/warden-cn-agent-linux-${{ matrix.agent_arch }}.sha256
+            dist/warden-cn-agent_linux_${{ matrix.agent_arch }}.tar.gz
   publish:
     needs: release
     runs-on: ubuntu-latest
@@ -52,12 +63,13 @@ jobs:
           merge-multiple: true
           path: dist
       - name: 校验和
-        run: cd dist && sha256sum *.tar.gz > checksums.txt
+        run: cd dist && sha256sum warden-gateway_*.tar.gz > checksums.txt
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.tar.gz
             dist/checksums.txt
+            dist/warden-cn-agent-linux-*
           generate_release_notes: true
   image:
     needs: release

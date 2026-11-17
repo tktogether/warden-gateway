@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/tktogether/warden-gateway/internal/backup"
 	"github.com/tktogether/warden-gateway/internal/config"
 	"github.com/tktogether/warden-gateway/internal/telemetry"
+	"github.com/tktogether/warden-gateway/internal/version"
 )
 
 func newPanel(t *testing.T) (*Server, string) {
@@ -477,5 +479,161 @@ func TestCNEndpointExposesCommandsOnly(t *testing.T) {
 		if rec := do(t, srv, "POST", "/warden"+path, []byte("{}"), cookie, "x"); rec.Code != http.StatusNotFound {
 			t.Fatalf("%s status %d, want 404", path, rec.Code)
 		}
+	}
+}
+
+// The panel must serve the configured domain list, not the built-in defaults:
+// the CN machine applies exactly what the gateway operator edited on the
+// panel's DNS tab.
+func TestCNCommandsServesLiveDomains(t *testing.T) {
+	srv, key := newPanel(t)
+	cookie, _ := login(t, srv, key)
+	srv.cfg.DNS.Domains = []string{"example.test", "extra.test"}
+	rec := do(t, srv, "GET", "/warden/api/cn", nil, cookie, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cn status %d: %s", rec.Code, rec.Body)
+	}
+	var payload struct {
+		Domains        []string `json:"domains"`
+		AgentBinaryURL string   `json:"agent_binary_url"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(payload.Domains, []string{"example.test", "extra.test"}) {
+		t.Fatalf("domains = %v, want the configured list", payload.Domains)
+	}
+	if slices.Contains(payload.Domains, "github.com") {
+		t.Fatalf("domains %v still contains a removed default", payload.Domains)
+	}
+	// agent_binary_url must point at this gateway's own cached build. The
+	// version segment is the bare version (no "v"): CI stamps version.Version
+	// as "v1.6.0" while dev builds are "1.6.0", and both must land on the same
+	// URL that bootstrap.sh and the agent's own SelfUpgrade request. Stamp a
+	// fixed test version and cover both forms (computing the expectation from
+	// version.Version itself would be circular).
+	stampedURL := "http://127.0.0.1:18080/api/agent/binary/9.9.9/warden-cn-agent-linux-amd64"
+	origVersion := version.Version
+	t.Cleanup(func() { version.Version = origVersion })
+	for _, stamp := range []string{"v9.9.9", "9.9.9"} {
+		version.Version = stamp
+		rec = do(t, srv, "GET", "/warden/api/cn", nil, cookie, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("cn status %d: %s", rec.Code, rec.Body)
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.AgentBinaryURL != stampedURL {
+			t.Fatalf("agent_binary_url with version.Version=%q = %q, want %q", stamp, payload.AgentBinaryURL, stampedURL)
+		}
+	}
+	version.Version = origVersion
+	// An empty configured list falls back to the built-in defaults.
+	srv.cfg.DNS.Domains = nil
+	rec = do(t, srv, "GET", "/warden/api/cn", nil, cookie, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cn status %d: %s", rec.Code, rec.Body)
+	}
+	var fallback struct {
+		Domains []string `json:"domains"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &fallback); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(fallback.Domains, config.DefaultSplitDomains()) {
+		t.Fatalf("empty configured domains = %v, want defaults", fallback.Domains)
+	}
+}
+
+func TestDNSStatusServesLiveDomains(t *testing.T) {
+	srv, key := newPanel(t)
+	cookie, _ := login(t, srv, key)
+	srv.cfg.DNS.Domains = []string{"example.test"}
+	rec := do(t, srv, "GET", "/warden/api/dns", nil, cookie, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dns status %d: %s", rec.Code, rec.Body)
+	}
+	var payload struct {
+		Domains []string `json:"domains"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(payload.Domains, []string{"example.test"}) {
+		t.Fatalf("dns status domains = %v, want the configured list", payload.Domains)
+	}
+}
+
+// Adding a domain that the SNI passthrough does not cover must extend the
+// passthrough list with the exact domain so the CN machine can actually reach
+// it through the entry listener. The change must also survive a config reload.
+func TestDNSConfigAddsSNICoverage(t *testing.T) {
+	srv, key := newPanel(t)
+	cookie, csrf := login(t, srv, key)
+	srv.cfg.SNI.Passthrough = []string{"github.com"}
+	rec := do(t, srv, "POST", "/warden/api/dns/config", map[string]any{
+		"enabled": false,
+		"domains": []string{"new.example.test"},
+	}, cookie, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dns config status %d: %s", rec.Code, rec.Body)
+	}
+	var payload struct {
+		Note string `json:"note"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(payload.Note, "new.example.test") {
+		t.Fatalf("note %q does not mention the added domain", payload.Note)
+	}
+	if !slices.Contains(srv.cfg.SNI.Passthrough, "new.example.test") {
+		t.Fatalf("passthrough %v missing new.example.test", srv.cfg.SNI.Passthrough)
+	}
+	if !slices.Contains(srv.cfg.DNS.Domains, "new.example.test") {
+		t.Fatalf("domains %v missing new.example.test", srv.cfg.DNS.Domains)
+	}
+	// The edit is persisted, not just applied to the live config.
+	reloaded, err := config.Load(srv.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(reloaded.SNI.Passthrough, "new.example.test") {
+		t.Fatalf("persisted passthrough %v missing new.example.test", reloaded.SNI.Passthrough)
+	}
+	if !slices.Contains(reloaded.DNS.Domains, "new.example.test") {
+		t.Fatalf("persisted domains %v missing new.example.test", reloaded.DNS.Domains)
+	}
+}
+
+// A domain already covered by an existing wildcard pattern must not duplicate
+// an entry into the passthrough list.
+func TestDNSConfigKeepsCoveredDomains(t *testing.T) {
+	srv, key := newPanel(t)
+	cookie, csrf := login(t, srv, key)
+	srv.cfg.SNI.Passthrough = []string{"github.com", "*.githubusercontent.com"}
+	before := slices.Clone(srv.cfg.SNI.Passthrough)
+	rec := do(t, srv, "POST", "/warden/api/dns/config", map[string]any{
+		"enabled": false,
+		"domains": []string{"raw.githubusercontent.com"},
+	}, cookie, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dns config status %d: %s", rec.Code, rec.Body)
+	}
+	var payload struct {
+		Note string `json:"note"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(srv.cfg.SNI.Passthrough, before) {
+		t.Fatalf("passthrough = %v, want unchanged %v", srv.cfg.SNI.Passthrough, before)
+	}
+	if strings.Contains(payload.Note, "SNI") {
+		t.Fatalf("note %q should not report SNI additions", payload.Note)
+	}
+	if !slices.Contains(srv.cfg.DNS.Domains, "raw.githubusercontent.com") {
+		t.Fatalf("domains %v missing raw.githubusercontent.com", srv.cfg.DNS.Domains)
 	}
 }

@@ -13,6 +13,7 @@ Warden Gateway 是面向个人和小团队的自托管入口程序。它在一�
 - 一键诊断：检查网关自身的配置校验、服务状态、监听端口、证书与上游连通性。
 - 承载统计：按 Docker、GitHub、DNS、SNI 四个通道展示网关实际承载的请求、成功率、耗时与流量。
 - 维护命令：安装时注册 warden 命令，日常执行状态、升级、诊断、日志、备份与恢复。
+- 国内机 agent：国内机常驻 warden-cn-agent，分流域名在面板在线编辑并经心跳下发，机器状态、容器与应用在「国内机」页可见，支持远程同步、自检、升级与注销。
 - 访问控制：访问密钥只保存 SHA-256 摘要；会话使用 HMAC 签名 Cookie 和 CSRF 校验。
 
 ## 架构
@@ -264,15 +265,61 @@ warden-gateway version
 
 ## 国内机设置
 
-国内服务器访问 GitHub 和 Docker Hub 不稳定时，把分流与镜像设置应用到这些机器上。网关本身不执行国内机设置，只在面板「诊断」「设置」页生成命令；脚本通过面板地址下载，不依赖 GitHub。
+国内服务器访问 GitHub 和 Docker Hub 不稳定时，在这台机器上安装 warden-cn-agent：agent 在本机监听 `198.18.0.1:53` 做分流解析，向网关心跳上报状态，分流域名由面板在线管理。接入流程：面板「国内机」页生成一次性注册命令（enroll token 15 分钟内有效）→ 复制到国内机以 root 执行 → 机器自动出现在面板列表。
+
+```bash
+curl -fsSL https://panel.example.com/bootstrap.sh -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh cn-setup \
+  --origin https://panel.example.com --gateway-ip 192.0.2.10 \
+  --enroll-token <面板生成的令牌> --yes
+```
+
+命令由面板生成；`--gateway-ip` 是网关公网地址（agent 探测用它判定网关可达），enroll token 只能用一次。脚本通过面板地址下载，不依赖 GitHub。执行时按固定顺序迁移：
+
+1. 快照所有将被改动的文件；resolv.conf 先写入公网兜底 DNS 作为安全网。
+2. 停止并禁用旧 dnsmasq 与看门狗单元，resolv.conf 暂置纯公网直连——此刻就是装 warden 之前的老状态，业务不中断。
+3. 从网关自托管端点下载 agent 二进制（网关安装/升级时已预取三种架构的构建到 `$SCRIPT_DIR/agent/`），安装 `warden-cn-agent` systemd 服务（`Restart=always` + `WatchdogSec=60` + 内存约束），注册（enroll）并等待首次心跳成功，抽检分流域名在本机解析到网关 IP。
+4. resolv.conf 定型为 agent DNS（`198.18.0.1`）在前 + 公网 DNS 兜底在后：agent 进程整体死亡时解析落到公网 DNS，退化为无分流但绝不断网。NetworkManager `dns=none` 守卫保留。
+5. 摘除 `/etc/hosts` 托管块，清理旧 dnsmasq 配置与看门狗脚本。任何一步失败自动回滚快照，机器回到迁移前状态。
+
+### agent 提供什么
+
+| 项目 | 说明 |
+| --- | --- |
+| 内置 DNS | 分流域名答网关 IP，其余转发上游；网关不可达时逐查询降级为直连解析，任何查询都有答案，不悬挂到客户端超时 |
+| 健康探测 | 沿用 legacy 看门狗的判定分类（见下文），先确认本机外网正常再判定网关故障 |
+| 心跳 | 默认每 10 秒上报状态、领命令、拿最新分流域名列表（±20% 抖动避免多机同拍）；网关 30 秒无心跳判定离线 |
+| workload 发现 | 通过 docker socket 枚举运行中容器（名称、镜像、状态、启动时间），带 Coolify 标签的归组为应用，只采集元数据，不含环境变量与业务数据 |
+| 自升级 | 面板逐台触发（可选任意**已缓存**版本，低于网关版本即回退，未缓存版本被拒绝），或为单台打开「自动跟随网关版本」（默认关）；从网关自托管端点 `/api/agent/binary/{version}/{arch}` 下载、SHA-256 校验、原子替换，失败下个心跳重试，新版本连续崩溃由 systemd 回退旧二进制并阻止该版本被反复重试 |
+
+面板「国内机」页展示每台机器的在线状态、健康分类、版本、磁盘/内存/负载、容器与应用摘要、最后心跳时间，可远程触发：立即同步、自检、升级、注销。没有远程重启或整机 reboot。
+
+分流域名在面板「设置」页的分流域名编辑器增删：保存后成为运行时唯一事实源，自动补进 SNI 透传列表，网关重启生效，并在心跳周期内下发到所有在线 agent。迁移完成后，分流域名的日常变更不再需要登录国内机。
+
+agent 与网关全程 HTTPS（复用面板证书）；machine token 在网关只存 SHA-256 摘要，在 agent 端保存在 0600 的 `/etc/warden-gateway-cn/agent.json`。
+
+### 检查与回退
+
+```bash
+sudo warden-cn cn-status    # 当前配置快照（agent 模式读 agent 本地状态）
+sudo warden-cn cn-check     # 只读体检：agent 服务与状态、探测判定、resolver
+sudo warden-cn cn-restore --id latest
+```
+
+每次修改前自动备份到 `/var/backups/warden-gateway-cn`，最多保留 10 个。回退按 manifest 逐个文件还原：agent 模式停用 agent、还原 resolv.conf、清除 `agent.json`；legacy 模式删除 `cn-setup` 期间新建的文件，停用并禁用本地 DNS 与看门狗单元。长期离线、收不到注销命令的机器，也可以用 `cn-restore` 退出。不带 `--id` 时使用最新备份。
+
+执行 `cn-setup` 时脚本保存为 `/usr/local/bin/warden-cn`。这个副本按调用名自我限制，只提供 `cn-setup`、`cn-check`、`cn-status`、`cn-restore`、`version`、`help`；安装、升级、卸载代理机网关仍然只能用代理机上的 `warden` 命令。`warden-cn` 不可用时，重新下载脚本后执行 `sudo bash /tmp/wg-bootstrap.sh cn-restore`。
+
+### Legacy 模式（已弃用）
+
+不带 `--enroll-token` 的 `cn-setup` 按 v1.5.x 行为执行 legacy 模式（dnsmasq + 看门狗 + hosts 托管块），打印弃用提示；已发出去的旧命令不会失败。已执行过 `cn-setup` 的国内机，建议在面板「国内机」页生成带 enroll token 的新命令重跑一次 `cn-setup` 完成迁移；升级网关本身不会改写国内机，两步互相独立。
+
+legacy 模式仍负责 APT/BBR/Docker/Git 镜像等宿主机设置（agent 模式只接管分流与注册）。分流方式由 `--cn-mode` 选择：`auto`（默认）和 `none`（关闭分流，只做镜像）。旧值 `hosts`、`dns`、`both` 仍被接受，会提示已弃用并按 `auto` 处理。
 
 ```bash
 curl -fsSL https://panel.example.com/bootstrap.sh -o /tmp/wg-bootstrap.sh
 sudo bash /tmp/wg-bootstrap.sh cn-setup --gateway-ip 192.0.2.10 \
   --docker-mirror https://panel.example.com --git-mirror https://panel.example.com --yes
 ```
-
-分流方式只有两种，由 `--cn-mode` 选择：`auto`（默认）和 `none`（关闭分流，只做 APT/BBR/Docker/Git 镜像）。旧值 `hosts`、`dns`、`both` 仍被接受，会提示已弃用并按 `auto` 处理。
 
 `auto` 一次写入四件事：
 
@@ -297,7 +344,7 @@ sudo bash /tmp/wg-bootstrap.sh cn-setup --gateway-ip 192.0.2.10 \
 | Git 镜像 | 写入 `/etc/gitconfig`，改写 `https`、`http`、`git`、`git@github.com:` 和 `ssh://git@github.com/` 地址 |
 | 看门狗 | `warden-gateway-cn-watchdog.timer`，默认每 60 秒探测一次，代理机不可达时自动摘除 hosts 块 |
 
-### 看门狗
+### 看门狗（仅 legacy 模式）
 
 看门狗先看本机外网对照组，再探测代理机，只有判定为代理机侧故障才动 hosts 块：
 
@@ -309,19 +356,7 @@ sudo bash /tmp/wg-bootstrap.sh cn-setup --gateway-ip 192.0.2.10 \
 | `C_DOWN` | ICMP 与 22/80/443 全不通 | 计入故障 |
 | `LOCAL_BROKEN` | 本机三个对照组都不通 | 不计入故障，不做任何切换 |
 
-连续 3 次非 `OK` 才降级：摘掉 hosts 托管块，改回直连解析。降级只是止损，不保证直连可用：被劫持的域名往往本身就不可达。状态写在 `/etc/warden-gateway-cn/watchdog.state`，日志在 `/var/log/warden-gateway-cn-watchdog.log`。
-
-### 检查与回退
-
-```bash
-sudo warden-cn cn-status    # 当前配置快照
-sudo warden-cn cn-check     # 只读体检：探测判定、hosts 块、本地 DNS、resolver、看门狗
-sudo warden-cn cn-restore --id latest
-```
-
-每次修改前自动备份到 `/var/backups/warden-gateway-cn`，最多保留 10 个。回退按 manifest 逐个文件还原，`cn-setup` 期间新建的文件会被删除，同时停用并禁用本地 DNS 与看门狗单元。不带 `--id` 时使用最新备份。
-
-执行 `cn-setup` 时脚本保存为 `/usr/local/bin/warden-cn`。这个副本按调用名自我限制，只提供 `cn-setup`、`cn-check`、`cn-status`、`cn-restore`、`version`、`help`；安装、升级、卸载代理机网关仍然只能用代理机上的 `warden` 命令。`warden-cn` 不可用时，重新下载脚本后执行 `sudo bash /tmp/wg-bootstrap.sh cn-restore`。
+连续 3 次非 `OK` 才降级：摘掉 hosts 托管块，改回直连解析。降级只是止损，不保证直连可用：被劫持的域名往往本身就不可达。状态写在 `/etc/warden-gateway-cn/watchdog.state`，日志在 `/var/log/warden-gateway-cn-watchdog.log`。agent 模式下这套判定内置在 agent 的健康探测循环里，不再有独立的看门狗单元。
 
 ## 一键诊断
 

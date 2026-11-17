@@ -70,6 +70,7 @@
         <button class="nav-item" data-view="singbox" type="button">节点</button>
         <button class="nav-item" data-view="effect" type="button">承载</button>
         <button class="nav-item" data-view="diagnostics" type="button">诊断</button>
+        <button class="nav-item" data-view="cnmachines" type="button">国内机</button>
         <button class="nav-item" data-view="backups" type="button">备份</button>
         <button class="nav-item" data-view="audit" type="button">审计</button>
         <button class="nav-item" data-view="settings" type="button">设置</button>
@@ -145,6 +146,17 @@
           </div>
         </div>
         <div id="diagnostics-content" class="view-body"></div>
+      </section>
+
+      <section id="view-cnmachines" class="view" hidden>
+        <div class="page-head">
+          <div><h2>国内机</h2><p class="muted">已注册国内机的在线状态、探测结果与远程管理。</p></div>
+          <div class="head-actions">
+            <span id="cnmachines-note" class="update-note"></span>
+            <button id="refresh-cnmachines" class="btn" type="button">刷新</button>
+          </div>
+        </div>
+        <div id="cnmachines-content" class="view-body"></div>
       </section>
 
       <section id="view-backups" class="view" hidden>

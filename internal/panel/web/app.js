@@ -14,13 +14,15 @@
     effect: null,
     diagnostics: null,
     cn: null,
+    cnmachines: null,
+    cnEnroll: null,
     singbox: null,
     backups: [],
     audit: [],
     settings: null,
     loading: {}
   };
-  var views = ['overview', 'metrics', 'proxies', 'singbox', 'effect', 'diagnostics', 'backups', 'audit', 'settings'];
+  var views = ['overview', 'metrics', 'proxies', 'singbox', 'effect', 'diagnostics', 'cnmachines', 'backups', 'audit', 'settings'];
 
   function qs(sel) { return document.querySelector(sel); }
   function el(tag, cls, text) {
@@ -33,7 +35,7 @@
   function clear(node) { while (node.firstChild) { node.removeChild(node.firstChild); } }
 
   var THEME_KEY = 'wg-theme';
-  var refreshSeconds = { overview: 5, metrics: 5, proxies: 5, singbox: 15, effect: 10, diagnostics: 30, backups: 30, audit: 20, settings: 0 };
+  var refreshSeconds = { overview: 5, metrics: 5, proxies: 5, singbox: 15, effect: 10, diagnostics: 30, cnmachines: 10, backups: 30, audit: 20, settings: 0 };
   var lastRefresh = {};
   var refreshing = {};
   var pollTimer = null;
@@ -110,6 +112,7 @@
       case 'singbox': return loadSingbox;
       case 'effect': return loadEffect;
       case 'diagnostics': return loadDiagnostics;
+      case 'cnmachines': return loadCnmachines;
       case 'backups': return loadBackups;
       case 'audit': return loadAudit;
       case 'settings': return loadSettings;
@@ -181,6 +184,17 @@
     var d = typeof ts === 'number' ? new Date(ts * 1000) : new Date(ts);
     if (isNaN(d.getTime())) { return String(ts); }
     return d.toLocaleString('zh-CN', { hour12: false });
+  }
+  function fmtRel(ts) {
+    if (!ts) { return '—'; }
+    var d = typeof ts === 'number' ? new Date(ts * 1000) : new Date(ts);
+    if (isNaN(d.getTime())) { return String(ts); }
+    var diff = Math.floor((Date.now() - d.getTime()) / 1000);
+    if (diff < 0) { diff = 0; }
+    if (diff < 60) { return diff + ' 秒前'; }
+    if (diff < 3600) { return Math.floor(diff / 60) + ' 分钟前'; }
+    if (diff < 86400) { return Math.floor(diff / 3600) + ' 小时前'; }
+    return Math.floor(diff / 86400) + ' 天前';
   }
   function pct(v) { return (Number(v) || 0).toFixed(1) + '%'; }
   function showToast(msg, isError) {
@@ -290,6 +304,7 @@
     if (view === 'singbox') { loadSingbox(); }
     if (view === 'effect') { loadEffect(); }
     if (view === 'diagnostics') { loadDiagnostics(); }
+    if (view === 'cnmachines') { loadCnmachines(); }
     if (view === 'backups') { loadBackups(); }
     if (view === 'audit') { loadAudit(); }
     if (view === 'settings') { loadSettings(); }
@@ -1406,6 +1421,327 @@
     return p;
   }
 
+  // ---------- 国内机（cnmachines） ----------
+
+  var cnActionLabels = { 'sync-domains': '立即同步', 'self-check': '自检', 'self-upgrade': '升级' };
+  function cnActionLabel(action) { return cnActionLabels[action] || action; }
+  function cnMachineName(m) { return (m && (m.hostname || m.id)) || '未知机器'; }
+
+  // cnNormVersion collapses a version string to the bare form the gateway
+  // compares: strips a leading "v" and an old-style " (commit)" suffix
+  // ("v1.6.0 (abc1234)" → "1.6.0"). Recent agents already report the bare
+  // version; this keeps old reports and pinned targets comparable.
+  function cnNormVersion(v) {
+    var s = String(v == null ? '' : v).trim();
+    if (!s) { return ''; }
+    s = s.split(/\s+/)[0];
+    return s.replace(/^v/, '');
+  }
+
+  async function loadCnmachines(opts) {
+    opts = opts || {};
+    var silent = !!opts.silent;
+    if (refreshing.cnmachines) { return; }
+    refreshing.cnmachines = true;
+    var box = qs('#cnmachines-content');
+    if (!silent && !state.cnmachines) { clear(box); box.appendChild(el('div', 'skeleton')); }
+    try {
+      var data = await api('/api/cnmachines');
+      state.cnmachines = data;
+      lastRefresh.cnmachines = Date.now();
+      renderCnmachines(data, silent);
+      noteUpdated('#cnmachines-note', data.as_of, refreshSeconds.cnmachines, (data.machines || []).length + ' 台机器');
+    } catch (err) {
+      if (!silent || !state.cnmachines) {
+        clear(box);
+        box.appendChild(el('div', 'empty', err.message));
+        pageNote('#cnmachines-note', '加载失败');
+      }
+      if (!silent) { showToast(err.message, true); }
+    } finally {
+      refreshing.cnmachines = false;
+    }
+  }
+
+  function renderCnmachines(data, silent) {
+    var box = qs('#cnmachines-content');
+    clear(box);
+    box.appendChild(cnEnrollPanel());
+    var machines = (data && data.machines) || [];
+    if (!machines.length) {
+      box.appendChild(el('div', 'empty', '还没有已注册的国内机。先生成注册命令，在目标机器上执行即可接入。'));
+      return;
+    }
+    var grid = el('div', 'cn-machine-grid');
+    machines.forEach(function (m) { grid.appendChild(cnMachineCard(m)); });
+    box.appendChild(grid);
+  }
+
+  function cnEnrollPanel() {
+    var p = el('div', 'panel');
+    add(p, el('h3', 'section-title', '接入新机器'));
+    add(p, el('p', 'muted', '生成一次性注册命令（令牌 15 分钟内有效），复制到新的国内机上以 root 执行即可完成注册，无需手动登录目标机器。'));
+    var actions = el('div', 'form-actions');
+    var gen = el('button', 'btn primary', '生成注册命令');
+    gen.type = 'button';
+    gen.addEventListener('click', async function () {
+      setBusy(gen, true);
+      try {
+        var out = await api('/api/cnmachines/enroll-token', { method: 'POST', body: {} });
+        var token = (out && out.token) || '';
+        var origin = window.location.origin;
+        // The agent probes the gateway address, so the command must carry the
+        // gateway IP explicitly; without it bootstrap falls back to the CN
+        // machine's own egress IP and the probe can never succeed.
+        var gatewayIP = (state.cn && state.cn.gateway_ip) || '';
+        if (!gatewayIP) {
+          try {
+            var cn = await api('/api/cn');
+            state.cn = cn || {};
+            gatewayIP = cn.gateway_ip || '';
+          } catch (cnErr) { /* surfaced as the manual --gateway-ip warning below */ }
+        }
+        var cmd = 'curl -fsSL ' + origin + '/bootstrap.sh -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh cn-setup --origin ' + origin;
+        if (gatewayIP) { cmd += ' --gateway-ip ' + gatewayIP; }
+        cmd += ' --enroll-token ' + token + ' --yes';
+        state.cnEnroll = { command: cmd, expires_at: (out && out.expires_at) || '', gateway_missing: !gatewayIP };
+        renderCnmachines(state.cnmachines, true);
+        showToast(gatewayIP ? '注册命令已生成，令牌仅可使用一次' : '注册命令已生成，但缺少网关 IP，请手动补上 --gateway-ip', !gatewayIP);
+      } catch (err) {
+        showToast(err.message, true);
+      } finally {
+        setBusy(gen, false);
+      }
+    });
+    actions.appendChild(gen);
+    p.appendChild(actions);
+    if (state.cnEnroll && state.cnEnroll.command) {
+      p.appendChild(commandRow('在国内机上执行（一次性）', state.cnEnroll.command));
+      var parts = ['命令只在生成后的 15 分钟内有效'];
+      if (state.cnEnroll.expires_at) { parts.push('令牌到期时间 ' + fmtTime(state.cnEnroll.expires_at)); }
+      add(p, el('p', 'muted cn-enroll-note', parts.join(' · ') + '。'));
+      if (state.cnEnroll.gateway_missing) {
+        var gwWarn = el('div', 'alert');
+        add(gwWarn, el('span', '', '未能获取网关地址'));
+        add(gwWarn, el('span', '', '上面的命令缺少 --gateway-ip，bootstrap 会回退到国内机自己的出口 IP，导致 agent 探测永远不通过。请先手动在 cn-setup 后补上 --gateway-ip <网关 IPv4> 再执行。'));
+        p.appendChild(gwWarn);
+      }
+    }
+    return p;
+  }
+
+  function cnMachineCard(m) {
+    var card = el('div', 'cn-machine');
+    var head = el('div', 'cn-machine-head');
+    var left = el('div');
+    add(left, el('h3', '', cnMachineName(m)));
+    var runningVersion = cnNormVersion(m.version);
+    var desiredVersion = cnNormVersion(m.desired_version);
+    var meta = [runningVersion ? 'agent ' + runningVersion : '版本未知'];
+    if (desiredVersion) { meta.push('目标版本 ' + desiredVersion); }
+    add(left, el('div', 'cn-machine-meta', meta.join(' · ')));
+    add(head, left);
+    var badges = el('div', 'cn-machine-badges');
+    badges.appendChild(statusPill(m.online ? '在线' : '离线', m.online ? 'ok' : ''));
+    var probe = m.probe || null;
+    if (probe && probe.result) {
+      // The wire value is uppercase ("OK", "LINK_443_BLOCKED", ...); compare
+      // case-insensitively so the healthy pill actually lights up.
+      var probeOK = (probe.result || '').toUpperCase() === 'OK';
+      badges.appendChild(statusPill(probeOK ? '探测正常' : '探测 ' + probe.result, probeOK ? 'ok' : 'warn'));
+    } else {
+      badges.appendChild(statusPill('探测 —', ''));
+    }
+    if (Number(m.pending) > 0) { badges.appendChild(statusPill('待执行 ' + m.pending, 'warn')); }
+    // A machine whose running version differs from its target has work pending:
+    // either an upgrade the panel queued, or a rollback the operator pinned.
+    // Compare normalized forms so "v1.6.0 (sha)" and "1.6.0" are equal.
+    var gatewayVersion = cnNormVersion(state.cnmachines && state.cnmachines.gateway_version);
+    if (desiredVersion && runningVersion && desiredVersion !== runningVersion) {
+      var rollback = gatewayVersion && desiredVersion !== gatewayVersion;
+      badges.appendChild(statusPill((rollback ? '已钉版本 ' : '待升级 ') + desiredVersion, 'warn'));
+    }
+    head.appendChild(badges);
+    card.appendChild(head);
+
+    var sys = m.system || null;
+    var workloads = m.workloads || null;
+    card.appendChild(infoList([
+      ['磁盘 / 内存', sys ? (pct(sys.disk_used_pct) + ' / ' + pct(sys.mem_used_pct)) : '—'],
+      ['负载', sys ? fmtLoad(sys.load1) : '—'],
+      ['容器', workloads && typeof workloads.length === 'number' ? workloads.length + ' 个' : '—'],
+      ['最后心跳', m.last_seen ? fmtRel(m.last_seen) : '—'],
+      ['注册于', fmtTime(m.enrolled_at)]
+    ]));
+
+    var foot = el('div', 'cn-machine-foot');
+    foot.appendChild(cnAutoFollowToggle(m));
+    foot.appendChild(cnEventsBlock(m));
+    card.appendChild(foot);
+
+    var actions = el('div', 'cn-machine-actions');
+    var sync = el('button', 'btn small', '立即同步');
+    sync.type = 'button';
+    sync.addEventListener('click', function () {
+      confirmDialog('立即同步', '将向 ' + cnMachineName(m) + ' 下发同步分流域名命令，机器在下次心跳时执行。确认继续？').then(function (yes) {
+        if (yes) { cnMachineCommand(m, 'sync-domains', sync); }
+      });
+    });
+    actions.appendChild(sync);
+    var check = el('button', 'btn small', '自检');
+    check.type = 'button';
+    check.addEventListener('click', function () {
+      confirmDialog('自检', '将向 ' + cnMachineName(m) + ' 下发自检命令，检查本机 DNS 与探测状态，结果随下次心跳回报。确认继续？').then(function (yes) {
+        if (yes) { cnMachineCommand(m, 'self-check', check); }
+      });
+    });
+    actions.appendChild(check);
+    var upgrade = el('button', 'btn small', '升级');
+    upgrade.type = 'button';
+    upgrade.addEventListener('click', function () {
+      var cached = (state.cnmachines && state.cnmachines.cached_versions) || [];
+      var current = cnNormVersion(state.cnmachines && state.cnmachines.gateway_version);
+      // Only cached builds can be served, so the choices are the cache menu:
+      // the gateway's own version by default, any older one is a rollback.
+      var options = cached.length ? cached : (current ? [current] : []);
+      var chosen = cnNormVersion(m.desired_version) || current || (options[0] || '');
+      var body = el('div');
+      if (!options.length) {
+        body.appendChild(el('p', 'muted', '本网关没有缓存的 agent 构建，请先在网关重新执行一次安装/升级以填充缓存。'));
+        confirmDialog('升级 agent', body).then(function () {});
+        return;
+      }
+      body.appendChild(el('p', null, '选择 ' + cnMachineName(m) + ' 要安装的 agent 版本。低于网关版本即为回退；机器会下载、校验并重启。'));
+      var select = el('select', 'input');
+      options.forEach(function (v) {
+        var opt = el('option', null, v + (v === current ? '（网关当前）' : (v === runningVersion ? '（正在运行）' : '')));
+        opt.value = v;
+        if (v === chosen) { opt.selected = true; }
+        select.appendChild(opt);
+      });
+      // Empty value clears the pin and keeps the machine on its current build;
+      // turning AutoFollow on is a separate switch, so the label must not
+      // promise it.
+      var follow = el('option', null, '清除钉选（保持当前版本）');
+      follow.value = '';
+      select.appendChild(follow);
+      body.appendChild(select);
+      confirmDialog('升级 agent', body).then(function (yes) {
+        if (!yes) { return; }
+        if (select.value === '') {
+          cnMachinePinClear(m, upgrade);
+        } else {
+          cnMachineCommand(m, 'self-upgrade', upgrade, select.value);
+        }
+      });
+    });
+    actions.appendChild(upgrade);
+    var softRemove = el('button', 'btn small danger', '注销');
+    softRemove.type = 'button';
+    softRemove.addEventListener('click', function () {
+      confirmDialog('注销机器', '将向 ' + cnMachineName(m) + ' 下发注销命令，agent 停止上报并自动从列表移除。确认继续？').then(function (yes) {
+        if (yes) { cnMachineRemove(m, false, softRemove); }
+      });
+    });
+    actions.appendChild(softRemove);
+    var forceRemove = el('button', 'btn small danger', '强制移除');
+    forceRemove.type = 'button';
+    forceRemove.addEventListener('click', async function () {
+      var yes = await confirmDialog('强制移除', '将立即删除 ' + cnMachineName(m) + ' 的注册记录，其 agent 将无法再连接网关。确认继续？');
+      if (!yes) { return; }
+      var again = await confirmDialog('再次确认强制移除', '强制移除不可撤销，机器需要重新执行注册命令才能恢复管理。确认移除 ' + cnMachineName(m) + '？');
+      if (again) { cnMachineRemove(m, true, forceRemove); }
+    });
+    actions.appendChild(forceRemove);
+    card.appendChild(actions);
+    return card;
+  }
+
+  function cnAutoFollowToggle(m) {
+    var label = el('label', 'switch');
+    label.title = '开启后机器自动跟随网关版本升级';
+    var input = el('input');
+    input.type = 'checkbox';
+    input.checked = !!m.auto_follow;
+    add(label, input);
+    add(label, el('span', 'switch-track'));
+    add(label, el('span', 'switch-label', '自动跟随升级'));
+    input.addEventListener('change', async function () {
+      var next = input.checked;
+      input.disabled = true;
+      try {
+        await api('/api/cnmachines/' + encodeURIComponent(m.id) + '/auto-follow', { method: 'POST', body: { enabled: next } });
+        showToast(cnMachineName(m) + (next ? ' 已开启自动跟随' : ' 已关闭自动跟随'));
+        loadCnmachines({ silent: true });
+      } catch (err) {
+        input.checked = !next;
+        showToast(err.message, true);
+      } finally {
+        input.disabled = false;
+      }
+    });
+    return label;
+  }
+
+  function cnEventsBlock(m) {
+    var events = (m.events || []);
+    var box = el('details', 'cn-events');
+    box.appendChild(el('summary', '', '最近事件（' + events.length + '）'));
+    if (!events.length) {
+      add(box, el('p', 'muted', '暂无事件'));
+    } else {
+      events.forEach(function (ev) {
+        var row = el('div', 'cn-event-row');
+        add(row, el('span', 'cn-event-time', fmtClock(ev.at)));
+        add(row, el('span', 'cn-event-kind', ev.kind || ''));
+        add(row, el('span', 'cn-event-detail', ev.detail || ''));
+        box.appendChild(row);
+      });
+    }
+    return box;
+  }
+
+  async function cnMachineCommand(m, action, button, version) {
+    setBusy(button, true);
+    try {
+      var body = { action: action };
+      if (version) { body.version = version; }
+      await api('/api/cnmachines/' + encodeURIComponent(m.id) + '/command', { method: 'POST', body: body });
+      showToast('已下发' + cnActionLabel(action) + '命令，等待 ' + cnMachineName(m) + ' 心跳执行');
+      loadCnmachines({ silent: true });
+    } catch (err) {
+      showToast(err.message, true);
+    } finally {
+      setBusy(button, false);
+    }
+  }
+
+  async function cnMachinePinClear(m, button) {
+    setBusy(button, true);
+    try {
+      await api('/api/cnmachines/' + encodeURIComponent(m.id) + '/pin', { method: 'POST', body: { version: '' } });
+      showToast('已清除 ' + cnMachineName(m) + ' 的钉选版本，机器将按自动跟随设置运行');
+      loadCnmachines({ silent: true });
+    } catch (err) {
+      showToast(err.message, true);
+    } finally {
+      setBusy(button, false);
+    }
+  }
+
+  async function cnMachineRemove(m, force, button) {
+    setBusy(button, true);
+    try {
+      await api('/api/cnmachines/' + encodeURIComponent(m.id) + '/remove', { method: 'POST', body: { force: force } });
+      showToast(force ? (cnMachineName(m) + ' 已强制移除') : ('已向 ' + cnMachineName(m) + ' 下发注销命令'));
+      loadCnmachines({ silent: true });
+    } catch (err) {
+      showToast(err.message, true);
+    } finally {
+      setBusy(button, false);
+    }
+  }
+
   function commandRow(label, command) {
     var wrap = el('div', 'command-row');
     add(wrap, el('div', 'command-label', label));
@@ -1691,6 +2027,118 @@
     return panel;
   }
 
+  function dnsDomainsPanel() {
+    var p = el('div', 'panel span-2');
+    add(p, el('h3', '', '分流域名'));
+    add(p, el('p', 'muted', '命中的域名由网关 DNS 直接应答，其余查询转发上游；保存后自动补进 SNI 透传并重启网关。输入域名后按回车或逗号添加，点击 × 删除。'));
+    var domains = [];
+    var current = { enabled: false, gateway_ip: '', listen: '', upstream: '' };
+
+    var editor = el('div', 'tag-editor');
+    var input = el('input', 'tag-input');
+    input.type = 'text';
+    input.placeholder = '输入域名后回车添加，例如 download.docker.com';
+    input.spellcheck = false;
+    editor.appendChild(input);
+    p.appendChild(editor);
+    var count = el('p', 'muted cn-tag-count', '尚未加载，正在读取当前分流域名…');
+    p.appendChild(count);
+
+    function normalizeDomain(raw) {
+      return String(raw || '').trim().replace(/\.+$/, '').toLowerCase();
+    }
+    function renderTags() {
+      Array.prototype.slice.call(editor.querySelectorAll('.tag-chip')).forEach(function (chip) { editor.removeChild(chip); });
+      domains.forEach(function (d, i) {
+        var chip = el('span', 'tag-chip');
+        add(chip, el('span', 'tag-chip-text', d));
+        var x = el('button', 'tag-chip-remove', '×');
+        x.type = 'button';
+        x.setAttribute('aria-label', '删除 ' + d);
+        x.addEventListener('click', function () {
+          domains.splice(i, 1);
+          renderTags();
+          input.focus();
+        });
+        chip.appendChild(x);
+        editor.insertBefore(chip, input);
+      });
+      count.textContent = '共 ' + domains.length + ' 个域名，保存后立即下发到所有在线国内机';
+    }
+    function addDomain(raw) {
+      var d = normalizeDomain(raw);
+      if (!d) { return; }
+      if (domains.indexOf(d) >= 0) { showToast(d + ' 已在列表中', true); return; }
+      domains.push(d);
+      renderTags();
+    }
+    input.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ',' || ev.key === '，') {
+        ev.preventDefault();
+        addDomain(input.value);
+        input.value = '';
+      } else if (ev.key === 'Backspace' && !input.value && domains.length) {
+        domains.pop();
+        renderTags();
+      }
+    });
+
+    var errBox = el('p', 'form-error');
+    errBox.hidden = true;
+    p.appendChild(errBox);
+    var actions = el('div', 'form-actions');
+    var save = el('button', 'btn primary', '保存分流域名');
+    save.type = 'button';
+    save.disabled = true;
+    save.addEventListener('click', async function () {
+      errBox.hidden = true;
+      var seen = {};
+      var payload = [];
+      domains.forEach(function (d) {
+        var n = normalizeDomain(d);
+        if (n && !seen[n]) { seen[n] = true; payload.push(n); }
+      });
+      setBusy(save, true);
+      try {
+        var out = await api('/api/dns/config', {
+          method: 'POST',
+          body: {
+            enabled: !!current.enabled,
+            gateway_ip: current.gateway_ip || '',
+            listen: current.listen || '',
+            upstream: current.upstream || '',
+            domains: payload
+          }
+        });
+        showToast(out.note || '分流域名已保存，网关正在重启…', !!out.note);
+        setTimeout(function () { window.location.reload(); }, 3500);
+      } catch (err) {
+        errBox.textContent = err.message;
+        errBox.hidden = false;
+      } finally {
+        setBusy(save, false);
+      }
+    });
+    actions.appendChild(save);
+    p.appendChild(actions);
+
+    api('/api/dns').then(function (data) {
+      var dns = data.dns || {};
+      current.enabled = !!dns.enabled;
+      current.gateway_ip = dns.gateway_ip || '';
+      current.listen = dns.listen || '';
+      current.upstream = dns.upstream || '';
+      domains = (data.domains || []).map(normalizeDomain).filter(function (d, i, arr) { return d && arr.indexOf(d) === i; });
+      renderTags();
+      save.disabled = false;
+    }).catch(function (err) {
+      count.textContent = '加载当前分流域名失败';
+      errBox.textContent = '加载当前分流域名失败：' + err.message;
+      errBox.hidden = false;
+    });
+    return p;
+  }
+
   function renderSettings(data, silent) {
     var box = qs('#settings-content');
     clear(box);
@@ -1770,6 +2218,8 @@
 
     grid.appendChild(dnsPanel());
 
+    grid.appendChild(dnsDomainsPanel());
+
     var configPanel = el('div', 'panel span-2');
     add(configPanel, el('h3', '', '运行配置'));
     var cv = el('div', 'config-view');
@@ -1799,7 +2249,14 @@
       var body = qs('#modal-body');
       clear(body);
       titleEl.textContent = title;
-      add(body, el('p', '', message));
+      // A string gets wrapped in a paragraph; a DOM node is appended as-is so
+      // dialogs can host controls (e.g. the agent version picker). Nodes are
+      // only ever built by our own el() helper, never from machine data.
+      if (typeof message === 'string') {
+        add(body, el('p', '', message));
+      } else if (message) {
+        body.appendChild(message);
+      }
       var actions = el('div', 'form-actions');
       var cancel = el('button', 'btn', '取消');
       cancel.type = 'button';
@@ -2467,6 +2924,7 @@
     bindRefresh('#refresh-singbox', loadSingbox, 'singbox');
     bindRefresh('#refresh-effect', loadEffect, 'effect');
     bindRefresh('#refresh-diagnostics', loadDiagnostics, 'diagnostics');
+    bindRefresh('#refresh-cnmachines', loadCnmachines, 'cnmachines');
     qs('#create-backup').addEventListener('click', function () { createBackup(this); });
     qs('#theme-toggle').addEventListener('click', toggleTheme);
     var themeLogin = qs('#theme-toggle-login');

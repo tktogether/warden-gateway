@@ -120,11 +120,24 @@ func New(opts Options) (*App, error) {
 			return nil, err
 		}
 	}
+	// Seed the CN split domain list (spec §9.2): a configuration written before
+	// dns.domains existed must still serve the default split list, and the
+	// seeded value is persisted so the panel shows the same list afterwards.
+	if config.SeedSplitDomains(cfg) {
+		if err := cfg.Save(opts.Paths.ConfigPath); err != nil {
+			logger.Warnf("seed dns.domains: %v", err)
+		}
+	}
+	cnReg, err := panel.LoadCNRegistry(opts.Paths.DataDir)
+	if err != nil {
+		return nil, err
+	}
 	panelSrv, err := panel.New(panel.Options{
 		Config: cfg, ConfigPath: opts.Paths.ConfigPath, DataDir: opts.Paths.DataDir,
 		ScriptDir:   opts.Paths.ScriptDir,
 		ServiceName: "warden-gateway.service", Auth: authMgr, Backups: backups,
 		Stats: stats, Log: logger, Started: time.Now(), DNS: dnsProxy, SingBox: singboxMgr,
+		CNReg: cnReg,
 	})
 	if err != nil {
 		return nil, err
@@ -163,6 +176,13 @@ func (a *App) Handler() http.Handler {
 		case p == "/healthz":
 			a.serveHealthz(w, r)
 		case strings.HasPrefix(p, a.cfg.PanelPath):
+			a.panel.ServeHTTP(w, r)
+		case strings.HasPrefix(p, "/api/agent/"), p == "/api/health":
+			// The CN agent control plane lives at the origin root: enroll and
+			// heartbeat post to {Origin}/api/agent/..., bootstrap.sh probes
+			// {Origin}/api/health, and the binary downloader uses
+			// /api/agent/binary/. The panel serves all of them and also
+			// handles its own prefixed forms.
 			a.panel.ServeHTTP(w, r)
 		case strings.HasPrefix(p, "/v2/"):
 			if a.docker == nil {

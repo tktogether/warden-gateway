@@ -1,0 +1,615 @@
+package panel
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/tktogether/warden-gateway/internal/auth"
+	"github.com/tktogether/warden-gateway/internal/cnagent"
+	"github.com/tktogether/warden-gateway/internal/config"
+)
+
+// cnBeatMinInterval is the minimum gap between two heartbeats of the same
+// machine; faster repeats get 429. The agent beats every 10s (±20% jitter),
+// so 8s leaves headroom for probe time and clock skew.
+const cnBeatMinInterval = 8 * time.Second
+
+// cnMaxDispatchCommands caps how many queued commands an agent receives per
+// heartbeat so a burst never inflates one reply beyond control.
+const cnMaxDispatchCommands = 5
+
+// cnCmdSelfUpgrade is the command action that carries an agent upgrade; when
+// one is dispatched the reply names the gateway version as target.
+const cnCmdSelfUpgrade = "self-upgrade"
+
+// cnCmdDeregister is the command that tells an agent this gateway no longer
+// manages it; when it is dispatched (the agent's ack beat) the machine is
+// removed from the registry and its token stops working.
+const cnCmdDeregister = "deregister"
+
+// cnAgentBodyMax bounds enroll and heartbeat request bodies.
+const cnAgentBodyMax = 1 << 20
+
+// cnEnrollRateMax / cnEnrollRateWindow bound anonymous enroll attempts per
+// client IP (10/min, same LoginLimiter mechanism as the login endpoint but a
+// separate bucket). Enroll is unauthenticated and audited per attempt, so
+// without this gate an anonymous flood inflates audit.log without bound.
+const (
+	cnEnrollRateMax    = 10
+	cnEnrollRateWindow = time.Minute
+)
+
+// hashDomains derives the split-domain list hash the gateway compares and
+// pushes: SHA-256 over the newline-joined list (nil treated as empty, so the
+// empty hash stays deterministic). Agents adopt the pushed hash verbatim,
+// which is what makes the exchange converge after one push.
+func hashDomains(list []string) string {
+	sum := sha256.Sum256([]byte(strings.Join(list, "\n")))
+	return hex.EncodeToString(sum[:])
+}
+
+// bearerToken extracts the machine token from the Authorization header.
+func bearerToken(r *http.Request) string {
+	const prefix = "Bearer "
+	h := r.Header.Get("Authorization")
+	if len(h) < len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(h[len(prefix):])
+}
+
+// readAgentJSON decodes an agent request body bounded by cnAgentBodyMax.
+// Unknown fields are kept: previous protocol versions may send fields this
+// gateway does not know (spec §9.6 accepts the previous protocol).
+func readAgentJSON(w http.ResponseWriter, r *http.Request, v interface{}) error {
+	r.Body = http.MaxBytesReader(w, r.Body, cnAgentBodyMax)
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		return fmt.Errorf("invalid JSON: %w", err)
+	}
+	return nil
+}
+
+// allowBeat reports whether a beat from the given token hash may proceed.
+// It is called before the registry is consulted; recordBeat stores the time
+// only after the beat has been handled successfully, so a failed request can
+// be retried immediately.
+func (s *Server) allowBeat(tokenHash string) bool {
+	s.beatMu.Lock()
+	defer s.beatMu.Unlock()
+	last, ok := s.lastBeat[tokenHash]
+	return !ok || time.Since(last) >= s.minBeatInterval
+}
+
+func (s *Server) recordBeat(tokenHash string) {
+	s.beatMu.Lock()
+	defer s.beatMu.Unlock()
+	if s.lastBeat == nil {
+		s.lastBeat = make(map[string]time.Time)
+	}
+	s.lastBeat[tokenHash] = time.Now()
+}
+
+// forgetBeat drops the rate-limit record of a machine token so removed
+// machines leave no stale limiter state behind.
+func (s *Server) forgetBeat(tokenHash string) {
+	if tokenHash == "" {
+		return
+	}
+	s.beatMu.Lock()
+	delete(s.lastBeat, tokenHash)
+	s.beatMu.Unlock()
+}
+
+// allowEnroll reports whether an anonymous enroll attempt from ip may proceed
+// and records it in the per-IP window. Unlike the login limiter (which counts
+// failures only), every allowed attempt consumes budget: the endpoint is
+// unauthenticated and each attempt writes one audit line, so the flood being
+// bounded is the attempts themselves. Over-limit attempts are rejected before
+// the registry is touched and write no audit line.
+func (s *Server) allowEnroll(ip string) bool {
+	if !s.enrollLimiter.Allow(ip) {
+		return false
+	}
+	// LoginLimiter counts recorded attempts within the window; record this
+	// one regardless of how the request ends (Fail is its record operation).
+	s.enrollLimiter.Fail(ip)
+	return true
+}
+
+type cnEnrollRequest struct {
+	EnrollToken string `json:"enroll_token"`
+	Hostname    string `json:"hostname"`
+}
+
+// handleAgentEnroll exchanges a one-time enroll token for machine
+// credentials. Agents hold no panel session, so this endpoint performs no
+// CSRF/session checks; the short-lived single-use token is the credential.
+// The endpoint is reachable anonymously, so it is rate limited per client IP
+// (cnEnrollRateMax attempts per cnEnrollRateWindow) before the registry is
+// touched; over-limit requests get 429 and are deliberately not audited —
+// bounding the audit lines is the point of the limiter.
+func (s *Server) handleAgentEnroll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ip := auth.ClientIP(r)
+	if !s.allowEnroll(ip) {
+		w.Header().Set("Retry-After", "60")
+		writeError(w, http.StatusTooManyRequests, "too many enroll attempts, try again later")
+		return
+	}
+	if s.cnReg == nil {
+		writeError(w, http.StatusInternalServerError, "agent registry unavailable")
+		return
+	}
+	var body cnEnrollRequest
+	if err := readAgentJSON(w, r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	m, token, err := s.cnReg.Enroll(body.EnrollToken, body.Hostname, time.Now())
+	if errors.Is(err, ErrInvalidEnroll) {
+		// The raw token never reaches the audit log, only the outcome.
+		s.audit("cn.enroll", "invalid enroll token", "fail", ip)
+		writeError(w, http.StatusForbidden, "invalid or expired enroll token")
+		return
+	}
+	if err != nil {
+		s.audit("cn.enroll", body.Hostname, "fail", ip)
+		writeError(w, http.StatusInternalServerError, "enroll failed")
+		return
+	}
+	s.audit("cn.enroll", body.Hostname, "ok", ip)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"machine_id": m.ID, "token": token})
+}
+
+// handleAgentHeartbeat authenticates a CN machine by its Bearer token,
+// records the report, hands out queued commands and pushes the split-domain
+// list when the agent's hash is stale. No session/CSRF: the machine token is
+// the credential.
+func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.cnReg == nil {
+		writeError(w, http.StatusInternalServerError, "agent registry unavailable")
+		return
+	}
+	token := bearerToken(r)
+	if token == "" {
+		writeError(w, http.StatusUnauthorized, "missing bearer token")
+		return
+	}
+	tokenHash := config.HashAccessKey(token)
+	if !s.allowBeat(tokenHash) {
+		writeError(w, http.StatusTooManyRequests, "heartbeat too frequent")
+		return
+	}
+	machine, err := s.cnReg.Beat(tokenHash, time.Now())
+	if err != nil {
+		if errors.Is(err, ErrUnknownMachine) {
+			writeError(w, http.StatusUnauthorized, "unknown machine token")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "heartbeat failed")
+		return
+	}
+
+	var report cnagent.Report
+	if err := readAgentJSON(w, r, &report); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Spec §9.6: accept the current and the previous protocol version;
+	// anything else is a client bug worth a 400.
+	if report.Protocol != 0 && report.Protocol != cnagent.ProtocolVersion {
+		writeError(w, http.StatusBadRequest, "unsupported protocol version")
+		return
+	}
+
+	// machine is a live registry pointer; only its immutable ID is read here.
+	// The effective target version is computed inside UpdateReport (F2/F10):
+	// pin > AutoFollow > empty, all under the registry lock.
+	reportMap := map[string]interface{}{}
+	if raw, err := json.Marshal(&report); err == nil {
+		_ = json.Unmarshal(raw, &reportMap)
+	}
+	targetVersion, err := s.cnReg.UpdateReport(machine.ID, reportMap, AgentBinaryVersion())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "persist report failed")
+		return
+	}
+
+	dispatched := s.cnReg.PopCommands(machine.ID, cnMaxDispatchCommands)
+	commands := make([]cnagent.Command, len(dispatched))
+	deregistered := false
+	for i, cmd := range dispatched {
+		commands[i] = cnagent.Command{ID: cmd.ID, Action: cmd.Action, Params: cmd.Params}
+		if cmd.Action == cnCmdSelfUpgrade {
+			// An explicit upgrade command names its own target (default: this
+			// gateway's version), so the operator can also roll a machine back
+			// to a cached older build. The choice persists as the pin, so the
+			// next routine heartbeat cannot silently revert it.
+			v := normalizeAgentVersion(cmd.Params["version"])
+			if v == "" {
+				v = AgentBinaryVersion()
+			}
+			targetVersion = v
+			if err := s.cnReg.SetPinnedVersion(machine.ID, v); err != nil {
+				s.audit("cn.pin", machine.ID+" "+v, "fail: "+err.Error(), auth.ClientIP(r))
+			}
+		}
+		if cmd.Action == cnCmdDeregister {
+			deregistered = true
+		}
+	}
+
+	reply := cnagent.HeartbeatReply{
+		Commands:      commands,
+		TargetVersion: targetVersion,
+	}
+	currentHash := hashDomains(s.cfg.DNS.Domains)
+	if report.DomainsHash != currentHash {
+		reply.Domains = &cnagent.DomainPayload{Hash: currentHash, Domains: append([]string(nil), s.cfg.DNS.Domains...)}
+	}
+	s.recordBeat(tokenHash)
+	if deregistered {
+		// The agent picked up the deregister command: revoke the machine now
+		// so its token stops beating. The pop itself was already persisted, so
+		// if this Remove fails the soft removal is silently dropped until the
+		// operator re-queues it — the audit line below records the failure.
+		if err := s.cnReg.Remove(machine.ID); err == nil {
+			s.forgetBeat(tokenHash)
+		} else {
+			s.audit("cn.remove", machine.ID, "fail: "+err.Error(), auth.ClientIP(r))
+		}
+	}
+	writeJSON(w, http.StatusOK, &reply)
+}
+
+// cnOnlineWindow is how fresh a machine's last heartbeat must be for the
+// management list to call it online.
+const cnOnlineWindow = 30 * time.Second
+
+// cnListEventLimit caps the events echoed per machine in the list reply.
+const cnListEventLimit = 20
+
+// cnMachineActions is the allowlist of commands the panel may queue for a
+// machine; anything else is rejected before touching the registry.
+var cnMachineActions = map[string]bool{"sync-domains": true, "self-check": true, "self-upgrade": true}
+
+// cnMachineRow is one machine entry of the GET /api/cnmachines reply.
+type cnMachineRow struct {
+	ID             string                 `json:"id"`
+	Hostname       string                 `json:"hostname"`
+	Online         bool                   `json:"online"`
+	LastSeen       string                 `json:"last_seen"`
+	EnrolledAt     string                 `json:"enrolled_at"`
+	Version        string                 `json:"version"`
+	DesiredVersion string                 `json:"desired_version"`
+	AutoFollow     bool                   `json:"auto_follow"`
+	Probe          map[string]interface{} `json:"probe"`
+	System         map[string]interface{} `json:"system"`
+	Workloads      interface{}            `json:"workloads"`
+	Events         []map[string]string    `json:"events"`
+	Pending        int                    `json:"pending"`
+}
+
+// newCNMachineRow builds a list row from a machine value copy (see
+// CNRegistry.Snapshot): nothing here shares memory with the registry, so the
+// read cannot race the heartbeat path and the report maps pass through
+// verbatim from the copy.
+func newCNMachineRow(m CNMachine, now time.Time) cnMachineRow {
+	online := false
+	if seen, err := time.Parse(time.RFC3339, m.LastSeen); err == nil {
+		online = now.Sub(seen) < cnOnlineWindow
+	}
+	reportVersion := ""
+	if v, ok := m.Report["agent_version"].(string); ok {
+		reportVersion = normalizeReportedAgentVersion(v)
+	}
+	probe, _ := m.Report["probe"].(map[string]interface{})
+	system, _ := m.Report["system"].(map[string]interface{})
+	events := make([]map[string]string, 0, len(m.Events))
+	for i, ev := range m.Events {
+		if i >= cnListEventLimit {
+			break
+		}
+		events = append(events, map[string]string{"at": ev.At, "kind": ev.Kind, "detail": ev.Detail})
+	}
+	return cnMachineRow{
+		ID: m.ID, Hostname: m.Hostname,
+		Online: online, LastSeen: m.LastSeen, EnrolledAt: m.EnrolledAt,
+		Version: reportVersion, DesiredVersion: m.DesiredVersion, AutoFollow: m.AutoFollow,
+		Probe: probe, System: system, Workloads: m.Report["workloads"],
+		Events: events, Pending: len(m.Pending),
+	}
+}
+
+// handleCNMachines serves the session-guarded management list of CN machines.
+func (s *Server) handleCNMachines(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.guard(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.cnReg == nil {
+		writeError(w, http.StatusInternalServerError, "agent registry unavailable")
+		return
+	}
+	now := time.Now()
+	machines := s.cnReg.Snapshot()
+	rows := make([]cnMachineRow, 0, len(machines))
+	for _, m := range machines {
+		rows = append(rows, newCNMachineRow(m, now))
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"as_of":    config.NowUTC(),
+		"machines": rows,
+		// Cached builds the operator may pin a machine to (upgrade or roll
+		// back), newest first, plus the version this gateway runs.
+		"cached_versions": s.CachedAgentVersions(),
+		"gateway_version": AgentBinaryVersion(),
+	})
+}
+
+// handleCNMachineItem dispatches /api/cnmachines/… sub-paths: the enroll-token
+// mint and the per-machine command, auto-follow and remove actions. Machine
+// IDs are hex without slashes, so a plain split is safe.
+func (s *Server) handleCNMachineItem(w http.ResponseWriter, r *http.Request, rest string) {
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	if len(parts) == 1 && parts[0] == "enroll-token" {
+		s.handleCNEnrollToken(w, r)
+		return
+	}
+	if len(parts) != 2 {
+		http.NotFound(w, r)
+		return
+	}
+	id, err := url.PathUnescape(parts[0])
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid machine id")
+		return
+	}
+	switch parts[1] {
+	case "command":
+		s.handleCNMachineCommand(w, r, id)
+	case "auto-follow":
+		s.handleCNMachineAutoFollow(w, r, id)
+	case "pin":
+		s.handleCNMachinePin(w, r, id)
+	case "remove":
+		s.handleCNMachineRemove(w, r, id)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// handleCNEnrollToken mints a one-time enroll token for the panel user. Only
+// the token's hash is stored; the raw value is shown once.
+func (s *Server) handleCNEnrollToken(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.guard(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.cnReg == nil {
+		writeError(w, http.StatusInternalServerError, "agent registry unavailable")
+		return
+	}
+	now := time.Now()
+	raw, err := s.cnReg.NewEnrollToken(now)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "mint enroll token failed")
+		return
+	}
+	s.audit("cn.enroll_token", "", "ok", auth.ClientIP(r))
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"token":      raw,
+		"expires_at": now.UTC().Add(cnEnrollTokenTTL).Format(time.RFC3339),
+	})
+}
+
+// handleCNMachineCommand queues an allowlisted command for one machine.
+func (s *Server) handleCNMachineCommand(w http.ResponseWriter, r *http.Request, id string) {
+	if _, ok := s.guard(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Action  string `json:"action"`
+		Version string `json:"version"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !cnMachineActions[body.Action] {
+		writeError(w, http.StatusBadRequest, "action must be sync-domains, self-check or self-upgrade")
+		return
+	}
+	params := map[string]string{}
+	if body.Action == cnCmdSelfUpgrade {
+		// An operator may name a cached build (that is how a machine is rolled
+		// back); without a version the gateway pins its own.
+		want := normalizeAgentVersion(body.Version)
+		if want == "" {
+			want = AgentBinaryVersion()
+		}
+		if !s.CachedAgentVersion(want) {
+			writeError(w, http.StatusBadRequest, "version "+want+" is not cached on this gateway")
+			return
+		}
+		// Asking a machine to "upgrade" to the build it already reports is a
+		// no-op. Queueing it would also pin that version on dispatch, silently
+		// turning off AutoFollow for a machine that was already current.
+		reported, err := s.cnReg.ReportedAgentVersion(id)
+		if err != nil {
+			if errors.Is(err, ErrUnknownMachine) {
+				writeError(w, http.StatusNotFound, "unknown machine")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "read machine report failed")
+			return
+		}
+		if reported != "" && reported == want {
+			s.audit("cn.command", id+" self-upgrade "+want, "noop: already running", auth.ClientIP(r))
+			writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "note": "already running " + want})
+			return
+		}
+		params["version"] = want
+	}
+	if err := s.cnReg.QueueCommand(id, body.Action, params); err != nil {
+		if errors.Is(err, ErrUnknownMachine) {
+			writeError(w, http.StatusNotFound, "unknown machine")
+			return
+		}
+		s.audit("cn.command", id+" "+body.Action, "fail", auth.ClientIP(r))
+		writeError(w, http.StatusInternalServerError, "queue command failed")
+		return
+	}
+	s.audit("cn.command", id+" "+body.Action, "ok", auth.ClientIP(r))
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "queued": true, "action": body.Action})
+}
+
+// handleCNMachineAutoFollow toggles a machine's auto-follow flag.
+func (s *Server) handleCNMachineAutoFollow(w http.ResponseWriter, r *http.Request, id string) {
+	if _, ok := s.guard(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.cnReg.SetAutoFollow(id, body.Enabled); err != nil {
+		if errors.Is(err, ErrUnknownMachine) {
+			writeError(w, http.StatusNotFound, "unknown machine")
+			return
+		}
+		s.audit("cn.auto_follow", id, "fail", auth.ClientIP(r))
+		writeError(w, http.StatusInternalServerError, "update auto-follow failed")
+		return
+	}
+	state := "disabled"
+	if body.Enabled {
+		state = "enabled"
+	}
+	s.audit("cn.auto_follow", id+" "+state, "ok", auth.ClientIP(r))
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "auto_follow": body.Enabled})
+}
+
+// handleCNMachinePin sets or clears a machine's explicit version pin. An empty
+// version clears it (the panel's "follow gateway" choice): the next heartbeat
+// recomputes the target from AutoFollow. A non-empty version must be cached on
+// this gateway, because the machine would otherwise retry a 404 forever.
+func (s *Server) handleCNMachinePin(w http.ResponseWriter, r *http.Request, id string) {
+	if _, ok := s.guard(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Version string `json:"version"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ver := normalizeAgentVersion(body.Version)
+	if ver != "" && !s.CachedAgentVersion(ver) {
+		writeError(w, http.StatusBadRequest, "version "+ver+" is not cached on this gateway")
+		return
+	}
+	if err := s.cnReg.SetPinnedVersion(id, ver); err != nil {
+		if errors.Is(err, ErrUnknownMachine) {
+			writeError(w, http.StatusNotFound, "unknown machine")
+			return
+		}
+		s.audit("cn.pin", id+" "+pinDetail(ver), "fail", auth.ClientIP(r))
+		writeError(w, http.StatusInternalServerError, "update pin failed")
+		return
+	}
+	s.audit("cn.pin", id+" "+pinDetail(ver), "ok", auth.ClientIP(r))
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "pinned_version": ver})
+}
+
+func pinDetail(ver string) string {
+	if ver == "" {
+		return "cleared"
+	}
+	return ver
+}
+
+// handleCNMachineRemove revokes a machine outright (force) or queues a
+// deregister command whose dispatch (the agent's ack beat) removes it.
+func (s *Server) handleCNMachineRemove(w http.ResponseWriter, r *http.Request, id string) {
+	if _, ok := s.guard(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Force bool `json:"force"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if body.Force {
+		tokenHash := ""
+		if m := s.cnReg.MachineByID(id); m != nil {
+			tokenHash = m.TokenHash
+		}
+		if err := s.cnReg.Remove(id); err != nil {
+			if errors.Is(err, ErrUnknownMachine) {
+				writeError(w, http.StatusNotFound, "unknown machine")
+				return
+			}
+			s.audit("cn.remove", id+" force", "fail", auth.ClientIP(r))
+			writeError(w, http.StatusInternalServerError, "remove machine failed")
+			return
+		}
+		s.forgetBeat(tokenHash)
+		s.audit("cn.remove", id+" force", "ok", auth.ClientIP(r))
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "removed": true})
+		return
+	}
+	if err := s.cnReg.QueueCommand(id, cnCmdDeregister, nil); err != nil {
+		if errors.Is(err, ErrUnknownMachine) {
+			writeError(w, http.StatusNotFound, "unknown machine")
+			return
+		}
+		s.audit("cn.remove", id+" deregister queued", "fail", auth.ClientIP(r))
+		writeError(w, http.StatusInternalServerError, "queue deregister failed")
+		return
+	}
+	s.audit("cn.remove", id+" deregister queued", "ok", auth.ClientIP(r))
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "queued": true})
+}

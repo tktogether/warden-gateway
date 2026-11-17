@@ -59,6 +59,10 @@ INTERACTIVE_SETUP=1
 CN_BACKUP_DIR=""
 CN_CREATED_FILES=""
 CN_CHANGED=0
+# 仅当 cn_docker_cache_agent 在本次运行中从运行中的容器解析出真实版本并写入
+# $SCRIPT_DIR/VERSION 后置 1。缓存选版本时只认本次写入的文件，避免上次运行
+# 或旧二进制留下的版本号污染缓存。
+CN_DOCKER_VERSION_FRESH=0
 
 CN_ORIGIN=""
 TLS_MODE="auto"
@@ -84,6 +88,11 @@ CN_DNSMASQ_CONF="$CN_SPLIT_DIR/dnsmasq.conf"
 CN_DNS_UNIT="/etc/systemd/system/warden-gateway-cn-dns.service"
 CN_DNS_UNIT_NAME="warden-gateway-cn-dns"
 CN_NM_CONF="/etc/NetworkManager/conf.d/90-warden-gateway-cn.conf"
+# systemd-resolved 主机上 /etc/resolv.conf 是 stub 符号链接（127.0.0.53），
+# 直接改 resolv.conf 会被 resolved 重新生成覆盖（实测：迁移后 getent 绕过
+# agent 走上游）。drop-in 把 resolved 的上游指向 agent，注销/回滚时删除。
+CN_RESOLVED_CONF_DIR="/etc/systemd/resolved.conf.d"
+CN_RESOLVED_CONF="$CN_RESOLVED_CONF_DIR/99-warden-gateway-cn.conf"
 CN_WATCH_SCRIPT="/usr/local/lib/warden-gateway-cn/watchdog.sh"
 CN_WATCH_ENV="$CN_SPLIT_DIR/cn.env"
 CN_WATCH_UNIT="/etc/systemd/system/warden-gateway-cn-watchdog.service"
@@ -105,6 +114,25 @@ CN_BACKUP_ROOT="/var/backups/warden-gateway-cn"
 CN_RESTORE_ID="latest"
 CN_HOSTS_BEGIN="# >>> warden-gateway cn >>>"
 CN_HOSTS_END="# <<< warden-gateway cn <<<"
+
+# agent 模式（--enroll-token）：本机由 warden-cn-agent 接管分流，见 cn_setup_agent。
+# agent 固定监听 198.18.0.1:53（internal/cnagent DefaultDNSListen），不提供改监听的选项。
+CN_AGENT_UNIT="/etc/systemd/system/warden-cn-agent.service"
+CN_AGENT_UNIT_NAME="warden-cn-agent"
+CN_AGENT_BIN="/usr/local/lib/warden-gateway-cn/warden-cn-agent"
+CN_AGENT_CONFIG="$CN_SPLIT_DIR/agent.json"
+CN_AGENT_STATE_DIR="/var/lib/warden-gateway-cn"
+CN_AGENT_ROLLBACK_GUARD="/usr/local/lib/warden-gateway-cn/agent-rollback-guard.sh"
+CN_AGENT_GUARD_LOG="/var/log/warden-gateway-cn-agent-guard.log"
+CN_AGENT_UPSTREAM="223.5.5.5:53"
+CN_AGENT_FALLBACK_DNS="119.29.29.29"
+CN_AGENT_HEARTBEAT=10
+CN_AGENT_ENROLL_TOKEN=""
+CN_AGENT_NO_AGENT=0
+CN_AGENT_ORIGIN=""
+CN_AGENT_MACHINE_ID=""
+CN_AGENT_TOKEN=""
+CN_AGENT_INSECURE_TLS=0
 CN_DEFAULT_DOMAINS="github.com,api.github.com,codeload.github.com,raw.githubusercontent.com,objects.githubusercontent.com,gist.githubusercontent.com,ghcr.io,pkg-containers.githubusercontent.com,registry-1.docker.io,auth.docker.io,production.cloudfront.docker.com"
 
 C_RESET=""
@@ -256,13 +284,20 @@ Warden Gateway 一键安装脚本
   --id ID                恢复指定备份，默认 latest
 
 国内机设置选项（仅 cn-setup / cn-check / cn-status / cn-restore 使用）：
+  --enroll-token TOKEN   用面板签发的一次性注册令牌执行 agent 模式迁移（推荐）
+  --insecure-tls         面板为自签名证书或仅 IP 访问时关闭 agent 的证书校验
+                         （默认自动探测：仅当校验失败而 -k 可访问时启用）
+  --no-agent             强制使用 legacy 模式（dnsmasq + 看门狗，已弃用）
+  --origin URL           面板源地址，例如 https://panel.example.com（agent 模式必填，
+                         或用 --public-url / 交互输入）
   --gateway-ip IP        国内机指向的网关地址
-  --no-hosts             不写 /etc/hosts 托管块
-  --no-local-dns         不安装本地 dnsmasq（容器将拿不到网关地址，不建议）
-  --local-dns-addr IP    本地 dnsmasq 监听地址，默认 198.18.0.1
+  --upstream ADDR        agent 上游 DNS，host:port，默认 223.5.5.5:53
+  --no-hosts             不写 /etc/hosts 托管块（仅 legacy 模式）
+  --no-local-dns         不安装本地 dnsmasq（容器将拿不到网关地址，不建议；仅 legacy）
+  --local-dns-addr IP    本地 dnsmasq 监听地址，默认 198.18.0.1（仅 legacy 模式）
   --local-dns-upstream A 本地 dnsmasq 上游，逗号分隔，默认沿用本机现有 DNS 与 223.5.5.5
   --no-nm-guard          不写 NetworkManager dns=none（resolv.conf 可能被重写）
-  --no-watchdog          不安装看门狗定时器
+  --no-watchdog          不安装看门狗定时器（仅 legacy 模式）
   --watch-interval SEC   看门狗探测周期，默认 60
   --no-apt               不修改 APT 镜像
   --no-bbr               不启用 BBR
@@ -272,8 +307,8 @@ Warden Gateway 一键安装脚本
   --apt-mirror URL       APT 镜像地址，默认 https://mirrors.aliyun.com
   --docker-mirror URL    Docker 镜像地址，默认使用网关地址
   --git-mirror URL       Git 镜像地址，默认使用网关地址
-  --cn-domains LIST      参与分流的域名，逗号分隔
-  --cn-mode MODE         auto（默认，本地 DNS + hosts）或 none（不启用分流）
+  --cn-domains LIST      参与分流的域名（agent 模式由面板下发，此选项仅 legacy 生效）
+  --cn-mode MODE         auto（默认，本地 DNS + hosts）或 none（不启用分流；仅 legacy）
   --cn-id ID             恢复的国内机设置备份
 
 不带参数运行且处于终端时进入交互安装向导。
@@ -293,15 +328,20 @@ warden-cn - Warden Gateway 国内机维护命令
   warden-cn -h | --help          显示本帮助
 
 cn-setup 选项：
+  --enroll-token TOKEN     面板签发的一次性注册令牌，执行 agent 模式迁移（推荐）
+  --insecure-tls           面板为自签名证书或仅 IP 访问时关闭 agent 证书校验
+  --no-agent               强制 legacy 模式（dnsmasq + 看门狗，已弃用）
+  --origin URL             面板源地址（agent 模式必填，或用 --public-url / 交互输入）
   --gateway-ip IP          代理机地址（必填或自动探测本机出口 IP）
-  --cn-domains LIST        参与分流的域名，逗号分隔
-  --cn-mode MODE           auto（默认）或 none
-  --no-hosts               不写 /etc/hosts 托管块
-  --no-local-dns           不装本地 dnsmasq（容器将无法解析分流域名）
-  --local-dns-addr IP      本地 DNS 监听地址，默认 198.18.0.1
+  --upstream ADDR          agent 上游 DNS，host:port，默认 223.5.5.5:53
+  --cn-domains LIST        参与分流的域名（agent 模式由面板下发，仅 legacy 生效）
+  --cn-mode MODE           auto（默认）或 none（仅 legacy）
+  --no-hosts               不写 /etc/hosts 托管块（仅 legacy）
+  --no-local-dns           不装本地 dnsmasq（容器将无法解析分流域名；仅 legacy）
+  --local-dns-addr IP      本地 DNS 监听地址，默认 198.18.0.1（仅 legacy）
   --local-dns-upstream LIST 本地 DNS 上游，逗号分隔，默认沿用本机 resolver
   --no-nm-guard            不写 NetworkManager 的 dns=none 配置
-  --no-watchdog            不安装看门狗
+  --no-watchdog            不安装看门狗（仅 legacy）
   --watch-interval SEC     看门狗探测周期，默认 60，最小 15
   --no-apt / --apt-mirror URL
   --no-bbr
@@ -365,6 +405,11 @@ parse_args() {
       --cn-domains) CN_DOMAINS="$2"; EXPLICIT_CN=1; shift 2;;
       --cn-mode) CN_SPLIT_MODE="$2"; EXPLICIT_CN=1; shift 2;;
       --cn-id) CN_RESTORE_ID="$2"; shift 2;;
+      --enroll-token) CN_AGENT_ENROLL_TOKEN="$2"; shift 2;;
+      --insecure-tls) CN_AGENT_INSECURE_TLS=1; shift;;
+      --no-agent) CN_AGENT_NO_AGENT=1; shift;;
+      --upstream) CN_AGENT_UPSTREAM="$2"; shift 2;;
+      --origin) CN_AGENT_ORIGIN="$2"; shift 2;;
       --yes|-y) ASSUME_YES=1; shift;;
       --non-interactive) NON_INTERACTIVE=1; INTERACTIVE_SETUP=0; shift;;
       --dry-run) DRY_RUN=1; shift;;
@@ -464,6 +509,229 @@ install_binary() {
   mv -f "$BIN_PATH.new" "$BIN_PATH"
 }
 
+# cache_agent_version 解析本次要缓存的具体版本（裸版本，无 v 前缀）。
+# VERSION=latest 时必须先读已安装二进制的版本（write_version_from_binary 在
+# 缓存之后才跑），再退回 $SCRIPT_DIR/VERSION；都拿不到就返回非零，由调用方
+# 跳过缓存——绝不能建出 $SCRIPT_DIR/agent/latest/ 这种永远匹配不上的目录。
+# Docker 模式例外：宿主机上的 $BIN_PATH 可能是不再运行的旧二进制，脚本版本
+# 文件由 cn_docker_cache_agent 在本次运行中从运行中的容器刷新并置位
+# CN_DOCKER_VERSION_FRESH；只有本次写入的版本文件才可信（旧文件可能是上次
+# 运行或旧版本留下的）。
+cache_agent_version() {
+  local ver=""
+  if [ "$VERSION" != "latest" ]; then
+    ver="${VERSION#v}"
+  elif [ "$MODE" = "docker" ]; then
+    # 只认本次运行从容器解析后写入的版本文件；宿主机旧二进制和上次运行留下
+    # 的 VERSION 文件都不可信（缓存缺失可恢复，缓存错版本不可恢复）。
+    if [ "${CN_DOCKER_VERSION_FRESH:-0}" != "1" ] || [ ! -f "$SCRIPT_DIR/VERSION" ]; then
+      return 1
+    fi
+    ver="$(tr -d ' \r\n' < "$SCRIPT_DIR/VERSION" | sed 's/^v//')"
+  else
+    if [ -x "$BIN_PATH" ]; then
+      ver="$("$BIN_PATH" version 2>/dev/null | awk 'NR == 1 {print $1}' | sed 's/^v//')"
+    fi
+    if [ -z "$ver" ] || [ "$ver" = "latest" ]; then
+      if [ -f "$SCRIPT_DIR/VERSION" ]; then
+        ver="$(tr -d ' \r\n' < "$SCRIPT_DIR/VERSION" | sed 's/^v//')"
+      fi
+    fi
+  fi
+  case "$ver" in
+    ''|latest|*[!0-9A-Za-z._-]*) return 1;;
+  esac
+  printf '%s\n' "$ver"
+}
+
+# cache_agent_binaries 把本版本的 agent 构建（三种架构 + CI 发布的 sha256
+# 侧车）预取到 $SCRIPT_DIR/agent/<version>/，由面板
+# /api/agent/binary/{version}/{arch} 对外提供。国内机的安装与自升级因此只连
+# 本网关，不必访问 GitHub；预取失败不阻塞网关安装（面板会返回 404 并提示重跑
+# 安装器），但会在输出里明确告警。
+# 侧车必须来自 CI（同一 release 的 $asset.sha256），不能用刚下载的字节现算：
+# 现算只能发现损坏，发现不了网关侧被替换；校验不过/缺侧车就跳过该架构。
+cache_agent_binaries() {
+  local arch asset tmp sidecar expected actual ok_flag=0 ver ver_dir
+  if ! ver="$(cache_agent_version)"; then
+    warn "无法解析具体 agent 版本（VERSION=$VERSION），跳过 agent 构建预取"
+    return 1
+  fi
+  [ "$DRY_RUN" -eq 1 ] && { printf '  + 预取 agent 构建到 %s/agent/%s/\n' "$SCRIPT_DIR" "$ver"; return 0; }
+  # 每个版本一个目录：/agent/<version>/<asset>[.sha256]。多版本才能支持灰度与
+  # 回退——把某台机器钉在旧构建上，或回滚到已缓存的版本。
+  ver_dir="$SCRIPT_DIR/agent/$ver"
+  mkdir -p "$ver_dir" 2>/dev/null || { warn "创建 agent 缓存目录失败：$ver_dir"; return 1; }
+  local base
+  # 目录名是解析后的裸版本，下载源必须指向同一个具体 tag（v<ver>），不能再用
+  # releases/latest/download：--binary 时 ver 读自本地二进制的版本，与 latest
+  # 可能不是同一个 release，会让目录和来源不一致。
+  base="https://github.com/$REPO/releases/download/v$ver"
+  for arch in amd64 arm64 arm; do
+    asset="warden-cn-agent-linux-$arch"
+    tmp="$ver_dir/.$asset.$$"
+    sidecar="$tmp.sha256"
+    if ! download "$base/$asset" "$tmp"; then
+      rm -f "$tmp" "$sidecar"
+      warn "预取 agent 构建失败：$asset（面板将无法分发该架构的 agent）"
+      continue
+    fi
+    if [ ! -s "$tmp" ]; then
+      rm -f "$tmp" "$sidecar"
+      warn "预取的 agent 构建为空：$asset"
+      continue
+    fi
+    if ! download "$base/$asset.sha256" "$sidecar"; then
+      rm -f "$tmp" "$sidecar"
+      warn "预取 agent 校验和失败：$asset.sha256（跳过该架构，面板不会分发未经 CI 签发的构建）"
+      continue
+    fi
+    expected="$(awk 'NR == 1 {print $1}' "$sidecar" 2>/dev/null | tr 'A-F' 'a-f')"
+    case "$expected" in
+      ''|*[!0-9a-f]*)
+        rm -f "$tmp" "$sidecar"
+        warn "agent 校验和格式无效：$asset.sha256"
+        continue;;
+    esac
+    actual="$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}' | tr 'A-F' 'a-f' || true)"
+    if [ "${#expected}" -ne 64 ] || [ "$actual" != "$expected" ]; then
+      rm -f "$tmp" "$sidecar"
+      warn "agent 构建校验和不匹配：$asset（期望 $expected，实际 ${actual:-空}），已跳过"
+      continue
+    fi
+    mv -f "$tmp" "$ver_dir/$asset"
+    # 缓存 CI 发布的侧车（只留裸 hex 一行），而不是从下载字节现算。
+    printf '%s\n' "$expected" > "$ver_dir/$asset.sha256"
+    rm -f "$sidecar"
+    chmod 0755 "$ver_dir/$asset"
+    chmod 0644 "$ver_dir/$asset.sha256"
+    ok_flag=1
+  done
+  if [ "$ok_flag" -eq 1 ]; then
+    ok "agent 构建已缓存到 $ver_dir（国内机只连本网关下载）"
+    cn_prune_agent_cache
+  fi
+  return 0
+}
+
+# cn_prune_agent_cache 只保留最近 3 个 agent 版本目录（含本次刚缓存的）。
+# 更旧的删除，避免网关磁盘随发版无限增长；正在被机器钉住的版本若被清掉，
+# 该机器的心跳仍会指向它，下载会 404 并保持旧二进制运行（安全网第 6 条）。
+cn_prune_agent_cache() {
+  local root="$SCRIPT_DIR/agent" keep=3
+  [ -d "$root" ] || return 0
+  # 按版本号排序（sort -V 可用时用它，否则退化为字典序），删除第 keep 个之后的。
+  # 先显式探测 find 是否支持 -printf：把探测结果当 if 条件，BusyBox find 不
+  # 支持时会安静地走 else，而不是让 sort 的空输出假装成功。
+  local dirs
+  if find "$root" -maxdepth 0 -printf '' >/dev/null 2>&1; then
+    dirs="$(find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V)"
+  else
+    dirs="$(find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sed 's#.*/##' | sort)"
+  fi
+  [ -n "$dirs" ] || return 0
+  local total idx name
+  total="$(printf '%s\n' "$dirs" | wc -l)"
+  idx=0
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    idx=$((idx + 1))
+    if [ "$idx" -le $((total - keep)) ]; then
+      rm -rf "$root/$name" 2>/dev/null || true
+    fi
+  done <<< "$dirs"
+  return 0
+}
+
+# cn_version_ok 校验裸版本号（已去掉 v 前缀）：只允许数字和点，且必须以
+# 数字开头/结尾、不含连续的 ".."。dev/garbage/latest 一律拒绝。
+cn_version_ok() {
+  case "$1" in
+    ''|latest|*[!0-9.]*|.*|*.|*..*) return 1;;
+  esac
+  return 0
+}
+
+# cn_docker_container_version 读取正在运行的容器自报的版本（container-first）。
+# 单脚本 Docker 安装没有宿主机二进制，容器内的二进制是唯一权威来源；任何
+# HTTP 源（尤其是 PUBLIC_URL）都可能还指向升级前的旧网关，不能先于它使用。
+cn_docker_container_version() {
+  local raw
+  have docker || return 0
+  raw="$(docker exec "$SERVICE" /usr/local/bin/warden-gateway version 2>/dev/null | head -n 1 || true)"
+  raw="$(printf '%s' "$raw" | awk '{print $1}' | sed 's/^v//' | tr -d ' \r\n')"
+  cn_version_ok "$raw" && printf '%s\n' "$raw"
+}
+
+# cn_docker_wait_version 在容器启动窗口内重试容器自报版本（默认 30 次 x 2s
+# ≈ 60s）。返回裸版本；容器始终不报告就返回非零，由调用方决定后续来源。
+# 测试可用 CN_DOCKER_VERSION_ATTEMPTS / CN_DOCKER_VERSION_DELAY 缩短等待。
+cn_docker_wait_version() {
+  local i v="" attempts="${CN_DOCKER_VERSION_ATTEMPTS:-30}" delay="${CN_DOCKER_VERSION_DELAY:-2}"
+  # 没有 docker CLI 就没有容器自报来源，不必空转 60 秒。
+  have docker || return 1
+  for i in $(seq 1 "$attempts"); do
+    v="$(cn_docker_container_version || true)"
+    if [ -n "$v" ]; then
+      printf '%s\n' "$v"
+      return 0
+    fi
+    if [ "$i" -lt "$attempts" ]; then sleep "$delay"; fi
+  done
+  return 1
+}
+
+# cn_docker_http_version 从容器发布到宿主机的明文 HTTP 监听读取版本。
+# 该监听上 /api/health 是 301 跳转（只有 /healthz 返回 {"ok":true,"version":...}），
+# 所以必须用 /healthz；地址取自配置的 listen.http，其次本脚本的 HTTP_LISTEN。
+cn_docker_http_version() {
+  local addr="$1" v
+  [ -n "$addr" ] || return 1
+  v="$(curl -fsS --connect-timeout 3 --max-time 8 "http://$addr/healthz" 2>/dev/null \
+    | sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' | head -n 1 || true)"
+  v="$(printf '%s' "$v" | tr -d ' \r\n')"
+  v="${v#v}"
+  cn_version_ok "$v" && printf '%s\n' "$v"
+}
+
+# cn_docker_cache_agent Docker 安装/升级后的 agent 构建预取。单脚本 Docker
+# 安装既没有 $BIN_PATH version，也没有可信的 $SCRIPT_DIR/VERSION，版本只能
+# 从正在运行的网关解析：
+#   1. 容器自报（docker exec ... version，启动窗口内重试约 60s）；
+#   2. 容器发布到宿主机的明文 HTTP /healthz。
+# PUBLIC_URL 不再是来源：升级窗口内它可能仍指向旧网关，把它写进缓存会把
+# agent 钉在错误版本上——缓存缺失可恢复，缓存错版本不可恢复。两者都拿不到
+# 就告警并跳过预取。解析成功后先写 $SCRIPT_DIR/VERSION 并置位
+# CN_DOCKER_VERSION_FRESH（cache_agent_version 只认本次写入的文件），再走
+# 统一的 cache_agent_binaries；任何失败只告警，不影响安装/升级。
+cn_docker_cache_agent() {
+  local v="" http_addr
+  if [ -f "$CONFIG_FILE" ]; then
+    http_addr="$(sed -n '/"listen"[[:space:]]*:[[:space:]]*{/,/}/p' "$CONFIG_FILE" \
+      | sed -n 's/.*"http"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  fi
+  [ -n "$http_addr" ] || http_addr="$HTTP_LISTEN"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  + 从运行中的网关解析版本并预取 agent 构建（预览不下载）\n'
+    return 0
+  fi
+  v="$(cn_docker_wait_version || true)"
+  if [ -z "$v" ]; then
+    v="$(cn_docker_http_version "$http_addr" || true)"
+  fi
+  if [ -z "$v" ]; then
+    warn "无法从运行中的 Docker 网关解析具体版本（容器未报告，本地 http://$http_addr/healthz 也无应答），跳过 agent 构建预取；网关就绪后可重跑 install/update"
+    return 1
+  fi
+  if ! printf '%s\n' "$v" > "$SCRIPT_DIR/VERSION"; then
+    warn "写入 $SCRIPT_DIR/VERSION 失败，跳过 agent 构建预取"
+    return 1
+  fi
+  CN_DOCKER_VERSION_FRESH=1
+  cache_agent_binaries || true
+  return 0
+}
+
 is_cn_mirror() {
   case "$1" in
     *://mirrors.aliyun.com*|*://mirrors.cloud.aliyuncs.com*|*://mirrors.tuna.tsinghua.edu.cn*|*://mirrors.ustc.edu.cn*|*://mirrors.cloud.tencent.com*|*://mirrors.huaweicloud.com*|*://mirrors.163.com*|*://mirrors.bfsu.edu.cn*|*://mirrors.nju.edu.cn*|*cmecloud.cn*|*://mirrors.zju.edu.cn*|*://mirrors.sjtug.sjtu.edu.cn*) return 0;;
@@ -526,6 +794,21 @@ validate_options() {
   esac
   if [ "$CN_WATCH_INTERVAL" -lt 15 ]; then
     die "看门狗周期不能小于 15 秒：$CN_WATCH_INTERVAL"
+  fi
+  case "$CN_AGENT_UPSTREAM" in
+    *:*) ;;
+    *) die "agent 上游 DNS 需为 host:port：$CN_AGENT_UPSTREAM";;
+  esac
+  if [ -n "$CN_AGENT_ENROLL_TOKEN" ]; then
+    case "$CN_AGENT_ENROLL_TOKEN" in
+      ""|*[!0-9a-fA-F]*) warn "enroll token 不是 64 位十六进制，面板签发的令牌应为该格式";;
+    esac
+    if [ "${#CN_AGENT_ENROLL_TOKEN}" -ne 64 ]; then
+      warn "enroll token 长度不是 64：${#CN_AGENT_ENROLL_TOKEN}"
+    fi
+  fi
+  if [ -n "$CN_AGENT_ENROLL_TOKEN" ] && [ "$CN_AGENT_NO_AGENT" -eq 0 ] && [ "$CN_LOCAL_DNS_ADDR" != "198.18.0.1" ]; then
+    warn "agent 模式固定监听 198.18.0.1:53，--local-dns-addr 仅 legacy 模式有效"
   fi
   if [ "$CN_DO_HOSTS" -eq 0 ] && [ "$CN_LOCAL_DNS" -eq 1 ]; then
     warn "已用 --no-hosts 关闭 hosts 托管块，本地 DNS 将没有分流域名数据，实际不会生效"
@@ -1769,10 +2052,850 @@ cn_verify_split() {
   return "$bad"
 }
 
+# ---------------------------------------------------------------------------
+# agent 模式（--enroll-token 触发，spec §9.4 顺序锁死）
+# ---------------------------------------------------------------------------
+
+# cn_agent_arch agent 二进制的构建目标（对齐 Task 15 发布的 asset 名）。
+# 与 detect_arch 的网关 tar 命名（armv7）不同：agent 是 arm。
+cn_agent_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'amd64\n';;
+    aarch64|arm64) printf 'arm64\n';;
+    armv7l) printf 'arm\n';;
+    *) die "不支持的架构（agent 仅提供 amd64/arm64/arm）：$(uname -m)";;
+  esac
+}
+
+# cn_agent_origin_ok 探测候选面板源：/api/health 可达即认为可用。
+cn_agent_origin_ok() {
+  [ -n "$1" ] || return 1
+  curl -kfsS --connect-timeout 3 --max-time 8 "$1/api/health" >/dev/null 2>&1
+}
+
+# cn_agent_resolve_origin 确定面板源地址（下载 agent、enroll、心跳共用）。
+# 候选依次为：--origin → --public-url 的源 → 交互输入 → 网关地址直连
+# （仅对无 SNI 的 IP 面板有效）。候选必须通过 /api/health 探测。
+cn_agent_resolve_origin() {
+  local candidate gateway_host
+  if [ -n "$CN_AGENT_ORIGIN" ]; then
+    case "$CN_AGENT_ORIGIN" in
+      http://*|https://*) ;;
+      *) die "--origin 必须以 http:// 或 https:// 开头：$CN_AGENT_ORIGIN";;
+    esac
+    CN_AGENT_ORIGIN="${CN_AGENT_ORIGIN%/}"
+    if cn_agent_origin_ok "$CN_AGENT_ORIGIN"; then return 0; fi
+    warn "--origin 健康检查未通过：$CN_AGENT_ORIGIN/api/health"
+    return 1
+  fi
+  candidate="$(printf '%s' "$PUBLIC_URL" | sed -n 's#^\([a-zA-Z][a-zA-Z0-9+.-]*://[^/]*\).*#\1#p')"
+  if [ -n "$candidate" ] && cn_agent_origin_ok "$candidate"; then
+    CN_AGENT_ORIGIN="$candidate"
+    return 0
+  fi
+  if is_tty && [ "$NON_INTERACTIVE" -eq 0 ]; then
+    say "agent 模式需要面板源地址（用于下载 agent 二进制和注册本机）。"
+    candidate="$(ask "面板源地址（例如 https://panel.example.com）" "$candidate")"
+    [ -n "$candidate" ] || return 1
+    case "$candidate" in
+      http://*|https://*) ;;
+      *) candidate="https://$candidate";;
+    esac
+    candidate="$(printf '%s' "$candidate" | sed -n 's#^\([a-zA-Z][a-zA-Z0-9+.-]*://[^/]*\).*#\1#p')"
+    if [ -n "$candidate" ] && cn_agent_origin_ok "$candidate"; then
+      CN_AGENT_ORIGIN="$candidate"
+      return 0
+    fi
+    warn "面板源地址健康检查未通过：$candidate/api/health"
+    return 1
+  fi
+  gateway_host="${CN_GATEWAY:-${GATEWAY_IP:-}}"
+  if [ -n "$gateway_host" ]; then
+    for candidate in "https://$gateway_host" "http://$gateway_host"; do
+      if cn_agent_origin_ok "$candidate"; then
+        CN_AGENT_ORIGIN="$candidate"
+        return 0
+      fi
+    done
+  fi
+  warn "无法确定面板源地址：请加 --origin https://面板域名（或 --public-url）重试"
+  return 1
+}
+
+# cn_agent_apply_insecure_tls 处理自签名/IP 面板的证书校验（spec §8.2）：
+# 安装器的探测一直用 curl -k，但 agent 默认校验证书，tls.mode=self 时每次
+# 心跳都会 x509 失败。判据是"普通（校验证书）请求失败、-k 请求成功"——
+# 只有这种情况下才认为网关证书不可验证（自签名或仅 IP 访问），为本次机器
+# 启用 insecure_tls 并明确告警；ACME 正常路径不写该字段、保持校验。
+cn_agent_apply_insecure_tls() {
+  if [ "$CN_AGENT_INSECURE_TLS" -eq 1 ]; then
+    warn "已启用 --insecure-tls：agent 跳过面板证书校验（仅适用于自签名/IP 面板）"
+    return 0
+  fi
+  if curl -fsS --connect-timeout 3 --max-time 8 "$CN_AGENT_ORIGIN/api/health" >/dev/null 2>&1; then
+    return 0
+  fi
+  if curl -kfsS --connect-timeout 3 --max-time 8 "$CN_AGENT_ORIGIN/api/health" >/dev/null 2>&1; then
+    CN_AGENT_INSECURE_TLS=1
+    warn "证书校验失败但 -k 可访问：判定为自签名/IP 面板，已为本机 agent 关闭证书校验（insecure_tls）"
+    return 0
+  fi
+  return 0
+}
+
+# cn_agent_version 确定要下载的 agent 版本（release tag = v<版本>）。
+# 依次取：--version 显式值 → 脚本安装目录的 VERSION 文件 → 面板 /api/health
+# 的 version 字段（agent 与网关同版本，对齐面板 agent_binary_url 的语义）。
+# VERSION 文件与 /api/health 的 version 都是 release tag 形态（v1.6.0），
+# 校验前先剥掉前导 v，否则 release 构建会误判成"无法确定版本"；输出始终裸版本。
+cn_agent_version() {
+  local v=""
+  if [ "$VERSION" != "latest" ]; then
+    printf '%s\n' "${VERSION#v}"
+    return 0
+  fi
+  if [ -f "$SCRIPT_DIR/VERSION" ]; then
+    v="$(tr -d ' \r\n' < "$SCRIPT_DIR/VERSION")"
+    v="${v#v}"
+    case "$v" in ""|*[!0-9.]*) v="";; esac
+  fi
+  if [ -z "$v" ]; then
+    v="$(curl -kfsS --connect-timeout 3 --max-time 8 "$CN_AGENT_ORIGIN/api/health" 2>/dev/null \
+      | sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' | head -n 1 || true)"
+    v="${v#v}"
+    case "$v" in ""|*[!0-9.]*) v="";; esac
+  fi
+  [ -n "$v" ] || die "无法确定 agent 版本：请用 --version 指定（例如 --version 1.6.0）"
+  printf '%s\n' "${v#v}"
+}
+
+# cn_agent_hostname_safe 输出可安全放进 JSON 的主机名。
+cn_agent_hostname_safe() {
+  local h
+  h="$(hostname 2>/dev/null || true)"
+  h="$(printf '%s' "$h" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//' || true)"
+  [ -n "$h" ] || h="cn-machine"
+  printf '%s\n' "$h"
+}
+
+# cn_agent_ensure_machine_id 保证 /etc/machine-id 存在且非空：缺失或空白时
+# 先生成（systemd 机器一般自带；bootstrap 起的容器可能没有），否则机器身份
+# 每次重装都会漂移（Task 2 注记：cnagent.NewMachineID 的随机回退不稳定）。
+cn_agent_ensure_machine_id() {
+  local mid=""
+  if [ -f /etc/machine-id ]; then
+    mid="$(tr -d ' \r\n\t' < /etc/machine-id 2>/dev/null || true)"
+  fi
+  if [ -n "$mid" ]; then return 0; fi
+  cn_snapshot_file /etc/machine-id
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  + 生成 /etc/machine-id\n'
+    return 0
+  fi
+  if have systemd-machine-id-setup; then
+    systemd-machine-id-setup >/dev/null 2>&1 || true
+  fi
+  if [ ! -s /etc/machine-id ]; then
+    if ! head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > /etc/machine-id; then
+      warn "生成 /etc/machine-id 失败"
+      return 1
+    fi
+  fi
+  if [ ! -s /etc/machine-id ]; then
+    warn "无法生成 /etc/machine-id"
+    return 1
+  fi
+  chmod 0444 /etc/machine-id 2>/dev/null || true
+  ok "已生成 /etc/machine-id"
+  return 0
+}
+
+# cn_agent_write_config 写 agent.json（0600）。字段与 internal/cnagent Config
+# 的 snake_case JSON 标签一一对应；token 先留空，enroll 成功后由
+# cn_setup_agent 用 machine token 重写（ruling：文件创建时 token 为空）。
+cn_agent_write_config() {
+  local token="$1" machine_id="$2" hostname insecure=""
+  hostname="$(cn_agent_hostname_safe)"
+  # 正常 ACME 路径不写 insecure_tls（保持 agent.json 最小）；只有自签名/IP
+  # 面板才追加该字段，Config.InsecureTLS 据此决定心跳/升级是否校验证书。
+  if [ "$CN_AGENT_INSECURE_TLS" -eq 1 ]; then
+    insecure=',
+  "insecure_tls": true'
+  fi
+  cn_snapshot_file "$CN_AGENT_CONFIG"
+  cn_put_file "$CN_AGENT_CONFIG" 0600 <<EOF
+{
+  "origin": "$CN_AGENT_ORIGIN",
+  "token": "$token",
+  "gateway_ip": "$CN_GATEWAY",
+  "upstream": "$CN_AGENT_UPSTREAM",
+  "repo": "$REPO",
+  "machine_id": "$machine_id",
+  "hostname": "$hostname",
+  "heartbeat_seconds": $CN_AGENT_HEARTBEAT,
+  "dns_listen": "198.18.0.1:53"$insecure
+}
+EOF
+}
+
+# cn_agent_download 经代理机的 GitHub 代理短路径下载 agent 二进制
+# （spec §9.3：一律不直连 GitHub）。systemd 会以 root 运行这个二进制，
+# 安装前必须用 .sha256 侧车校验（与 agent 自升级同严格：侧车只允许裸 hex，
+# 两列 sha256sum 输出视为格式错误；缺侧车即失败，不静默跳过），
+# 校验通过才原子替换到 $CN_AGENT_BIN。
+cn_agent_download() {
+  local version="$1" arch="$2" url tmp sidecar expected actual
+  # 网关自托管：面板把与自身同版本的 agent 构建缓存在本地，国内机只连网关，
+  # 安装与升级都不必再访问 GitHub（agent 自升级走同一条路径）。
+  url="$CN_AGENT_ORIGIN/api/agent/binary/${version#v}/warden-cn-agent-linux-$arch"
+  step "下载" "$url"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  + curl -fsSL %s -o %s\n' "$url" "$CN_AGENT_BIN"
+    return 0
+  fi
+  if ! mkdir -p "$(dirname "$CN_AGENT_BIN")"; then
+    warn "创建 agent 安装目录失败：$(dirname "$CN_AGENT_BIN")"
+    return 1
+  fi
+  tmp="$CN_AGENT_BIN.new.$$"
+  # 注意不用 --retry：Windows mingw curl 在重试后失败时错误地返回 0，
+  # 会让下面的失败分支失效（下载是否成功由非空检查 + sha256 校验兜底）。
+  if ! curl -kfsS --connect-timeout 10 --max-time 300 -o "$tmp" "$url"; then
+    rm -f "$tmp"
+    warn "下载 agent 二进制失败"
+    return 1
+  fi
+  if [ ! -s "$tmp" ]; then
+    rm -f "$tmp"
+    warn "下载的 agent 二进制为空"
+    return 1
+  fi
+  # .sha256 侧车校验（缺侧车或格式不符都算失败）。
+  local sidecar="$CN_AGENT_ORIGIN/api/agent/binary/${version#v}/warden-cn-agent-linux-$arch.sha256"
+  if ! curl -kfsS --connect-timeout 10 --max-time 60 \
+      -o "$tmp.sha" "$sidecar"; then
+    rm -f "$tmp" "$tmp.sha"
+    warn "下载 agent sha256 侧车失败：$sidecar"
+    return 1
+  fi
+  expected="$(tr -d ' \r\n\t' < "$tmp.sha")"
+  rm -f "$tmp.sha"
+  case "$expected" in
+    ''|*[!0-9a-fA-F]*)
+      rm -f "$tmp"
+      warn "agent sha256 侧车不是裸 hex（须与 sha256sum 单列输出一致）"
+      return 1;;
+  esac
+  if [ "${#expected}" -ne 64 ]; then
+    rm -f "$tmp"
+    warn "agent sha256 侧车长度不是 64：${#expected}"
+    return 1
+  fi
+  actual="$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}' || true)"
+  case "$actual" in
+    ''|*[!0-9a-fA-F]*) rm -f "$tmp"; warn "无法计算二进制 sha256"; return 1;;
+  esac
+  if [ "$actual" != "$(printf '%s' "$expected" | tr 'A-F' 'a-f')" ]; then
+    rm -f "$tmp"
+    warn "agent 二进制 sha256 校验失败：期望 $expected，实际 $actual"
+    return 1
+  fi
+  ok "agent 二进制 sha256 校验通过"
+  if ! install -m 0755 "$tmp" "$CN_AGENT_BIN.new"; then
+    rm -f "$tmp"
+    warn "安装 agent 二进制失败"
+    return 1
+  fi
+  rm -f "$tmp"
+  mv -f "$CN_AGENT_BIN.new" "$CN_AGENT_BIN" || return 1
+  return 0
+}
+
+# cn_agent_write_guard 生成 agent-rollback-guard.sh（unit 的 ExecStartPre）：
+# upgrade-pending 存在且当前 NRestarts 比写入基线多 >= 3（升级自身的干净
+# 重启占 1 次，之后又连续崩了 2 次）时，若有自升级备份 .prev 就换回旧二进制
+# 并清掉失败计数（spec §8 安全网：新版本连续 2 次崩溃自动回退），结果记入
+# 日志文件。
+# 基线来自 agent 退出前写入的 "<version> <nrestarts>"：升级自身的干净
+# exit-0 重启也会 +1，绝不能把这次算成崩溃（旧版按绝对 NRestarts>=2 判断，
+# 第二次升级在还没跑起来前就被回滚）。agent 读不到 NRestarts 时基线写 -1，
+# 表示"未知"：只有当前计数已 >= 3（足以证明反复启动失败）才回退，避免把升级
+# 前就有的重启历史误判成新版本崩溃。没有 pending 标记时一律不动。
+cn_agent_write_guard() {
+  cn_snapshot_file "$CN_AGENT_ROLLBACK_GUARD"
+  cn_put_file "$CN_AGENT_ROLLBACK_GUARD" 0755 <<GUARDEOF
+#!/bin/bash
+# 由 warden-gateway bootstrap 生成，请勿手工编辑。
+set -u
+BIN="$CN_AGENT_BIN"
+LOG="$CN_AGENT_GUARD_LOG"
+STATE_DIR="$CN_AGENT_STATE_DIR"
+PENDING="\$STATE_DIR/upgrade-pending"
+nrestarts="\$(systemctl show warden-cn-agent -p NRestarts --value 2>/dev/null || printf '0')"
+case "\$nrestarts" in ''|*[!0-9]*) nrestarts=0;; esac
+[ -f "\$PENDING" ] || exit 0
+baseline="\$(awk '{print \$2; exit}' "\$PENDING" 2>/dev/null || printf '%s' '-1')"
+# 基线 -1（或缺失/损坏）表示升级前读不到重启计数，不能做差值判断。
+unknown_baseline=0
+case "\$baseline" in
+  -1|''|*[!0-9]*) unknown_baseline=1; baseline=0;;
+esac
+delta=\$((nrestarts - baseline))
+if [ "\$unknown_baseline" -eq 1 ]; then
+  # 未知基线：只有当前计数已 >= 3 才足以证明反复启动失败。
+  [ "\$nrestarts" -ge 3 ] || exit 0
+else
+  # 已知基线：干净升级重启占 1 次，delta >= 3 即新版本之后又崩了 2 次。
+  [ "\$delta" -ge 3 ] || exit 0
+fi
+[ -e "\$BIN.prev" ] || exit 0
+# 回滚前先把「待验证版本」转成「已阻止版本」：恢复后的旧 agent 下次心跳会
+# 看到同一个 target_version，没有这个标记就会再装一次、再崩一次（升级回滚
+# 循环）。只有面板显式下发的 self-upgrade 命令才会清掉它。
+pending_version="\$(awk '{print \$1; exit}' "\$PENDING" 2>/dev/null || true)"
+if [ -f "\$PENDING" ]; then
+  if [ -n "\$pending_version" ]; then
+    printf '%s\n' "\$pending_version" > "\$STATE_DIR/upgrade-blocked" 2>/dev/null || true
+  fi
+  rm -f "\$PENDING"
+fi
+if mv -f "\$BIN.prev" "\$BIN"; then
+  printf '%s warden-cn-agent 升级后重启 %s 次未成功，已回退到上一个二进制\n' "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" "\$delta" >> "\$LOG" 2>/dev/null || true
+  if [ -s "\$STATE_DIR/upgrade-blocked" ]; then
+    printf '%s 已阻止版本 %s 的自动升级（需面板手动升级）\n' "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" "\$(cat "\$STATE_DIR/upgrade-blocked")" >> "\$LOG" 2>/dev/null || true
+  fi
+  systemctl reset-failed warden-cn-agent >/dev/null 2>&1 || true
+fi
+exit 0
+GUARDEOF
+}
+
+# cn_agent_write_unit 写 warden-cn-agent.service。WatchdogSec=60（裁定 R7：
+# 最坏探测周期约 39s，30s 会被误杀）；第一个 ExecStartPre 确保 198.18.0.1
+# 存在（agent 不自建 dummy 接口，与 legacy dnsmasq 单元同款），第二个跑
+# 崩溃回退守卫。
+cn_agent_write_unit() {
+  cn_snapshot_file "$CN_AGENT_UNIT"
+  cn_put_file "$CN_AGENT_UNIT" 0644 <<UNITEOF
+[Unit]
+Description=Warden Gateway CN agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -c 'ip link show wg-dns0 >/dev/null 2>&1 || ip link add wg-dns0 type dummy; ip addr replace 198.18.0.1/32 dev wg-dns0; ip link set wg-dns0 up'
+ExecStartPre=$CN_AGENT_ROLLBACK_GUARD
+ExecStart=$CN_AGENT_BIN run --config $CN_AGENT_CONFIG
+Restart=always
+RestartSec=2
+WatchdogSec=60
+MemoryMax=64M
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+}
+
+# cn_agent_resolv_write 重写本机 resolver。
+#   public：纯公网兜底（迁移安全网 = spec §9.4 第 2/3 步形态，也是回滚后
+#           保留的形态；与 agent 注销时 restoreResolvConfCmd 同构）。
+#   final ：agent DNS 在前 + 公网兜底在后（spec §9.4 第 6 步定型形态）。
+# resolv.conf 只写一次原始快照（cn_snapshot_file 自动去重），原始内容始终
+# 可由 cn-restore 还原。
+cn_agent_resolv_write() {
+  local mode="$1" target="/etc/resolv.conf"
+  if [ -L "$target" ]; then
+    target="$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")"
+  fi
+  cn_snapshot_file /etc/resolv.conf
+  cn_snapshot_file "$target"
+  {
+    if [ "$mode" = "final" ]; then
+      printf 'nameserver 198.18.0.1\n'
+    fi
+    # 公网兜底取 --upstream 的主机部分（默认 223.5.5.5），再补 119.29.29.29
+    # 第二兜底（与 agent 内 fallbackPublicDNS 一致）。
+    if [ "${CN_AGENT_UPSTREAM%%:*}" = "223.5.5.5" ]; then
+      printf 'nameserver 223.5.5.5\n'
+    else
+      printf 'nameserver %s\n' "${CN_AGENT_UPSTREAM%%:*}"
+    fi
+    printf 'nameserver %s\n' "$CN_AGENT_FALLBACK_DNS"
+    printf 'options timeout:1 attempts:1\n'
+  } | cn_put_file "$target" 0644
+}
+
+# cn_agent_resolved_active：本机是否由 systemd-resolved 托管解析。
+cn_agent_resolved_active() {
+  grep -qs '127\.0\.0\.53' /etc/resolv.conf && return 0
+  have systemctl && systemctl is-active systemd-resolved >/dev/null 2>&1 && return 0
+  return 1
+}
+
+# cn_agent_resolved_guard 让 systemd-resolved 把查询转给本机 agent。
+#
+# 只有在 resolved 托管 resolv.conf 时才需要：那种主机上写 /etc/resolv.conf
+# 无效（stub 会被重新生成），libc 走 127.0.0.53 → resolved 自己的上游，
+# 分流被完全绕过。Domains=~. 让这份 DNS 成为所有域名的默认路由；
+# FallbackDNS 保留公网兜底（agent 挂掉时 resolved 仍能直连）。
+cn_agent_resolved_guard() {
+  cn_agent_resolved_active || return 0
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  + 写入 %s（resolved 上游 -> 198.18.0.1）并重启 systemd-resolved\n' "$CN_RESOLVED_CONF"
+    return 0
+  fi
+  cn_snapshot_file "$CN_RESOLVED_CONF"
+  mkdir -p "$CN_RESOLVED_CONF_DIR" 2>/dev/null || {
+    warn "创建 $CN_RESOLVED_CONF_DIR 失败，跳过 resolved 守卫"
+    return 1
+  }
+  cn_put_file "$CN_RESOLVED_CONF" 0644 <<RESOLVEDEOF
+# 由 warden-gateway cn-setup 生成，请勿手工编辑。
+# 本机 resolv.conf 由 systemd-resolved 托管；这里把 resolved 的上游指向
+# agent（198.18.0.1），否则 resolved 用它自己的上游并绕过分流。
+[Resolve]
+DNS=198.18.0.1
+FallbackDNS=${CN_AGENT_UPSTREAM%%:*} $CN_AGENT_FALLBACK_DNS
+Domains=~.
+RESOLVEDEOF
+  CN_AGENT_RESOLVED_GUARDED=1
+  systemctl restart systemd-resolved >/dev/null 2>&1 || {
+    warn "重启 systemd-resolved 失败，resolved 守卫可能未生效"
+    return 1
+  }
+  return 0
+}
+
+# cn_agent_resolved_guard_remove 撤掉 resolved 守卫并让它恢复自动上游。
+cn_agent_resolved_guard_remove() {
+  [ -f "$CN_RESOLVED_CONF" ] || return 0
+  rm -f "$CN_RESOLVED_CONF" 2>/dev/null || true
+  if have systemctl; then
+    systemctl restart systemd-resolved >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# cn_agent_stop_legacy 停止并禁用旧 dnsmasq 单元与看门狗 service+timer，
+# resolv.conf 暂置纯公网直连（spec §9.4 第 3 步：此刻机器回到装 warden 前
+# 的"无分流直连"老状态，业务不中断）。
+cn_agent_stop_legacy() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  + systemctl disable --now %s %s.timer %s.service\n' \
+      "$CN_DNS_UNIT_NAME" "$CN_WATCH_UNIT_NAME" "$CN_WATCH_UNIT_NAME"
+    return 0
+  fi
+  if have systemctl; then
+    systemctl disable --now "$CN_DNS_UNIT_NAME" >/dev/null 2>&1 || true
+    systemctl disable --now "$CN_WATCH_UNIT_NAME.timer" >/dev/null 2>&1 || true
+    systemctl disable --now "$CN_WATCH_UNIT_NAME.service" >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  cn_agent_resolv_write public || return 1
+  return 0
+}
+
+# cn_agent_enroll 用一次性注册令牌换 machine token：
+# POST {origin}/api/agent/enroll，body {"enroll_token":...,"hostname":...}，
+# 响应 {"machine_id":"...","token":"..."}。jq 不可用时按脚本既有风格用
+# sed 提取（同 config_public_url / domain 的解析方式）。
+cn_agent_enroll() {
+  local resp payload hostname machine token
+  hostname="$(cn_agent_hostname_safe)"
+  payload="{\"enroll_token\":\"$CN_AGENT_ENROLL_TOKEN\",\"hostname\":\"$hostname\"}"
+  step "注册" "$CN_AGENT_ORIGIN/api/agent/enroll"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  + curl -d %s %s/api/agent/enroll\n' "$payload" "$CN_AGENT_ORIGIN"
+    return 0
+  fi
+  resp="$(curl -kfsS --connect-timeout 5 --max-time 15 -H 'Content-Type: application/json' \
+    -d "$payload" "$CN_AGENT_ORIGIN/api/agent/enroll" 2>/dev/null)" || {
+    warn "注册请求失败（enroll token 一次性且 15 分钟有效，需在面板重新生成）"
+    return 1
+  }
+  machine="$(printf '%s' "$resp" | sed -n 's/.*"machine_id" *: *"\([^"]*\)".*/\1/p' | head -n 1)"
+  token="$(printf '%s' "$resp" | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p' | head -n 1)"
+  if [ -z "$machine" ] || [ -z "$token" ]; then
+    warn "注册响应缺少 machine_id/token"
+    return 1
+  fi
+  CN_AGENT_MACHINE_ID="$machine"
+  CN_AGENT_TOKEN="$token"
+  ok "注册成功：machine_id=$machine"
+}
+
+# cn_agent_start_and_wait 启动 agent 并等待 state.json 出现且 probe_result=OK。
+# 状态文件只在心跳成功后落盘（Task 8 ruling 7），probe=OK 即"接入成功"。
+# 启动前先删除旧 state.json：重跑 cn-setup 时旧文件会让等待逻辑把"上次的
+# 成功状态"误当成这次启动成功（F8）。先 enable 再 restart，确保对已在运行的
+# 单元也真正换成新配置/新二进制。
+# 超时 60s 视为迁移失败（spec §9.4：超时 → 回滚）。
+cn_agent_start_and_wait() {
+  local i
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  + systemctl daemon-reload && systemctl enable %s && rm -f %s && systemctl restart %s\n' \
+      "$CN_AGENT_UNIT_NAME" "$CN_AGENT_STATE_DIR/state.json" "$CN_AGENT_UNIT_NAME"
+    return 0
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if ! systemctl enable "$CN_AGENT_UNIT_NAME" >/dev/null 2>&1; then
+    warn "agent 服务启用失败：journalctl -u $CN_AGENT_UNIT_NAME -n 30"
+    return 1
+  fi
+  rm -f "$CN_AGENT_STATE_DIR/state.json"
+  if ! systemctl restart "$CN_AGENT_UNIT_NAME" >/dev/null 2>&1; then
+    warn "agent 服务启动失败：journalctl -u $CN_AGENT_UNIT_NAME -n 30"
+    return 1
+  fi
+  step "等待" "等待 agent 首次心跳成功（最长 60s）"
+  for i in $(seq 1 60); do
+    if [ -f "$CN_AGENT_STATE_DIR/state.json" ] \
+      && grep -qE '"probe_result" *: *"OK"' "$CN_AGENT_STATE_DIR/state.json" 2>/dev/null; then
+      ok "agent 已接入（第 ${i}s 心跳成功）"
+      return 0
+    fi
+    sleep 1
+  done
+  if [ -f "$CN_AGENT_STATE_DIR/state.json" ]; then
+    warn "最新状态：$(tr -d '\n' < "$CN_AGENT_STATE_DIR/state.json" | head -c 300)"
+  fi
+  warn "等待超时：journalctl -u $CN_AGENT_UNIT_NAME -n 30"
+  return 1
+}
+
+# cn_agent_cleanup_legacy 删除 legacy 部署的脚本/状态/配置/单元文件
+# （全部已在第 1 步快照，cn-restore 可还原）；agent.json 仍在
+# $CN_SPLIT_DIR，目录保留。NetworkManager dns=none 守卫按 spec §9.4 第 6 步保留。
+cn_agent_cleanup_legacy() {
+  local path
+  for path in "$CN_WATCH_SCRIPT" "$CN_WATCH_ENV" "$CN_WATCH_STATE" "$CN_WATCH_LOG" \
+    "$CN_DNSMASQ_CONF" "$CN_WATCH_UNIT" "$CN_WATCH_TIMER" "$CN_DNS_UNIT"; do
+    if [ -e "$path" ]; then
+      if [ "$DRY_RUN" -eq 1 ]; then
+        printf '  + rm -f %s\n' "$path"
+      else
+        rm -f "$path"
+      fi
+    fi
+  done
+  if [ "$DRY_RUN" -eq 0 ] && have systemctl; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# cn_agent_rollback 迁移失败回滚（spec §9.4 失败中止语义）：恢复第 1 步
+# 快照、重新启用旧单元、resolv.conf 还原为纯公网兜底——第 2 步写入的公网
+# DNS 保留（无害且有益）。resolv.conf 的原始内容不在回滚中还原，而是留在
+# 快照归档里，供 cn-restore 完整回退到迁移前。
+# 例外（重复迁移，裁定于最终评审修复 5）：机器在本次 cn-setup 之前就已是
+# agent 模式（快照记录 warden-cn-agent.service existed=1）时，失败重跑不能
+# 把此前正常工作的 agent 留在停用状态——按快照还原迁移前的 agent 态
+# resolv.conf（198.18.0.1 在前 + 公网兜底），并重新 enable --now
+# warden-cn-agent。原本就是 legacy 的机器保持原样：纯公网 + 旧单元。
+cn_agent_rollback() {
+  local path existed size stored agent_was=0
+  warn "agent 迁移失败，回滚到迁移前状态（保留公网兜底 DNS）"
+  if [ "$DRY_RUN" -eq 0 ] && have systemctl; then
+    systemctl disable --now "$CN_AGENT_UNIT_NAME" >/dev/null 2>&1 || true
+  fi
+  if [ -f "$CN_BACKUP_DIR/records.tsv" ]; then
+    # records.tsv 行格式与 cn_finish_backup 相同：path \t existed \t size，
+    # 三个变量都必须接收，否则 existed 会吞进 size 导致误删而非还原。
+    while IFS="$(printf '\t')" read -r path existed size; do
+      [ -n "$path" ] || continue
+      # 重复迁移探测：迁移前 agent 单元已存在（existed=1）→ 本次是在已有
+      # agent 的机器上重跑 cn-setup --enroll-token，回滚要恢复 agent 模式。
+      if [ "$path" = "$CN_AGENT_UNIT" ] && [ "$existed" = "1" ]; then
+        agent_was=1
+      fi
+      case "$path" in
+        *resolv.conf) continue;;
+      esac
+      if [ "$existed" = "1" ]; then
+        stored="$CN_BACKUP_DIR/files/$(cn_path_hash "$path")"
+        if [ -f "$stored" ]; then
+          mkdir -p "$(dirname "$path")" 2>/dev/null || true
+          cp -p "$stored" "$path" || warn "回滚恢复失败：$path"
+        fi
+      else
+        rm -f "$path"
+      fi
+    done < "$CN_BACKUP_DIR/records.tsv"
+  fi
+  if [ "$agent_was" = "1" ]; then
+    # 迁移前 agent 就在本机运行：resolv.conf 按快照还原（快照里的正是迁移
+    # 前的 agent 定型形态），而不是改写为纯公网。
+    if [ -f "$CN_BACKUP_DIR/records.tsv" ]; then
+      while IFS="$(printf '\t')" read -r path existed size; do
+        [ -n "$path" ] || continue
+        case "$path" in
+          *resolv.conf) ;;
+          *) continue;;
+        esac
+        if [ "$existed" = "1" ]; then
+          stored="$CN_BACKUP_DIR/files/$(cn_path_hash "$path")"
+          if [ -f "$stored" ]; then
+            mkdir -p "$(dirname "$path")" 2>/dev/null || true
+            cp -p "$stored" "$path" || warn "回滚恢复失败：$path"
+          fi
+        fi
+      done < "$CN_BACKUP_DIR/records.tsv"
+    fi
+  else
+    cn_agent_resolv_write public || true
+  fi
+  # 撤掉 resolved 守卫：留着会把 libc 的解析指向一个即将停掉的 agent。
+  cn_agent_resolved_guard_remove
+  if [ "$DRY_RUN" -eq 0 ] && have systemctl; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable --now "$CN_DNS_UNIT_NAME" >/dev/null 2>&1 || true
+    systemctl enable --now "$CN_WATCH_UNIT_NAME.timer" >/dev/null 2>&1 || true
+    if [ "$agent_was" = "1" ]; then
+      # 单元文件与二进制已按快照还原，把此前正常工作的 agent 重新拉起。
+      if ! systemctl enable --now "$CN_AGENT_UNIT_NAME" >/dev/null 2>&1; then
+        warn "warden-cn-agent 重新启动失败：journalctl -u $CN_AGENT_UNIT_NAME -n 30"
+      fi
+    fi
+  elif [ "$DRY_RUN" -eq 1 ] && [ "$agent_was" = "1" ]; then
+    printf '  + systemctl enable --now %s\n' "$CN_AGENT_UNIT_NAME"
+  fi
+  return 0
+}
+
+# cn_agent_fail 迁移任一步失败的统一出口：回滚 + 快照归档（供 cn-restore
+# 完整回退，含 resolv.conf 原始内容）。总是返回 0，由调用方 return 1。
+cn_agent_fail() {
+  cn_agent_rollback || true
+  cn_finish_backup || true
+  cn_prune_backups || true
+  return 0
+}
+
+# cn_agent_teardown 停用并清理 agent（cn-restore 在检测到 agent 配置时调用）。
+cn_agent_teardown() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  + systemctl disable --now %s\n' "$CN_AGENT_UNIT_NAME"
+    printf '  + rm -f %s %s %s\n' "$CN_AGENT_UNIT" "$CN_AGENT_BIN" "$CN_AGENT_CONFIG"
+    return 0
+  fi
+  if have systemctl; then
+    systemctl disable --now "$CN_AGENT_UNIT_NAME" >/dev/null 2>&1 || true
+  fi
+  rm -f "$CN_AGENT_UNIT" "$CN_AGENT_BIN" "$CN_AGENT_BIN.prev" "$CN_AGENT_ROLLBACK_GUARD" \
+    "$CN_AGENT_CONFIG" "$CN_AGENT_STATE_DIR/state.json" "$CN_AGENT_GUARD_LOG" \
+    >/dev/null 2>&1 || true
+  # agent 停止后必须撤掉 resolved 守卫，否则 libc 仍被指向已停掉的监听。
+  cn_agent_resolved_guard_remove
+  if have systemctl; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  rmdir "$CN_AGENT_STATE_DIR" >/dev/null 2>&1 || true
+  return 0
+}
+
+# cn_setup_agent agent 模式迁移，顺序 = spec §9.4 的 8 步（顺序即验收标准）：
+#   1 快照全部将改动的文件与单元；
+#   2 resolv.conf 写公网兜底（安全网）；
+#   3 停止禁用旧 dnsmasq 与看门狗 service+timer，resolv.conf 暂置纯公网；
+#   4 下载 agent（经代理机 GitHub 代理短路径）+ machine-id 守卫 + agent.json
+#     （0600，token 先空）+ 崩溃回退守卫 + systemd 单元；
+#   5 enroll 换 machine token 回填 agent.json → 启动 → 等 state.json
+#     probe=OK（60s 超时即失败）；
+#   6 resolv.conf 定型（198.18.0.1 在前 + 公网兜底在后）+ NetworkManager
+#     dns=none 守卫保留；随后 getent 抽查分流域名解析到网关（第 5 步收尾）；
+#   7 摘除 /etc/hosts 托管块（CN_HOSTS_BEGIN/END 段整体删除）；
+#   8 清理 watchdog 脚本/env/state/日志、dnsmasq conf 与旧单元文件，快照归档。
+# 任何一步失败 → cn_agent_fail（回滚 + 归档）。
+cn_setup_agent() {
+  local version arch machine_id probe_rc=0 probe_out got
+  title "国内机 agent 模式迁移"
+  say "本机将由 warden-cn-agent 接管分流：下载 agent、注册到面板、本地 DNS 由 agent 托管。"
+  # agent 模式必须有真实网关地址：没有 --gateway-ip 时 detect_ip 给出的是本机
+  # 出口 IP，agent 会探测自身，心跳 probe 永远到不了 OK，白白烧掉一次性
+  # enroll token。在快照之前快速失败（此刻还没有任何可回滚的改动）。
+  if [ -z "$GATEWAY_IP" ]; then
+    die "agent 模式必须提供 --gateway-ip（面板生成的命令已包含）；回退到本机出口 IP 会让 agent 探测自身"
+  fi
+  CN_GATEWAY="$GATEWAY_IP"
+  is_ipv4 "$CN_GATEWAY" || die "网关地址不是 IPv4：$CN_GATEWAY"
+  cn_agent_resolve_origin || return 1
+  cn_agent_apply_insecure_tls
+  step "面板" "$CN_AGENT_ORIGIN"
+  version="$(cn_agent_version)"
+  arch="$(cn_agent_arch)"
+  kv "agent 版本" "v$version（$arch）"
+  kv "上游 DNS" "$CN_AGENT_UPSTREAM"
+  step "探测" "检查本机网络与代理机 $CN_GATEWAY"
+  probe_out="$(cn_probe_gateway "$CN_GATEWAY")" || probe_rc=$?
+  kv "探测结果" "$(cn_probe_label "$probe_out")"
+  if [ "$probe_rc" -eq 4 ]; then
+    die "本机无法访问外部网络（对照点全部失败），未做任何修改"
+  fi
+  if [ "$probe_rc" -ne 0 ]; then
+    warn "代理机当前未就绪，迁移仍会继续；探测恢复后 agent 会自动回到网关路径"
+  fi
+  confirm "确认迁移到 agent 模式？" || { say "已取消"; return 1; }
+
+  CN_CHANGED=0
+  cn_begin_backup
+
+  # 第 1 步：快照全部将改动的文件与单元（新文件记录 existed=0，cn-restore 会删除）。
+  step "快照" "备份将被改动的文件到 $(cn_backup_root)"
+  cn_snapshot_file /etc/resolv.conf
+  cn_snapshot_file /etc/hosts
+  cn_snapshot_file "$CN_DNSMASQ_CONF"
+  cn_snapshot_file "$CN_DNS_UNIT"
+  cn_snapshot_file "$CN_WATCH_SCRIPT"
+  cn_snapshot_file "$CN_WATCH_ENV"
+  cn_snapshot_file "$CN_WATCH_UNIT"
+  cn_snapshot_file "$CN_WATCH_TIMER"
+  cn_snapshot_file "$CN_WATCH_STATE"
+  cn_snapshot_file "$CN_WATCH_LOG"
+  cn_snapshot_file "$CN_AGENT_BIN"
+  cn_snapshot_file "$CN_AGENT_UNIT"
+  cn_snapshot_file "$CN_AGENT_CONFIG"
+  cn_snapshot_file "$CN_AGENT_ROLLBACK_GUARD"
+  cn_snapshot_file "$CN_RESOLVED_CONF"
+
+  # 第 2 步：resolv.conf 写公网兜底 DNS（先建立安全网再动任何服务）。
+  step "安全网" "写入公网兜底 DNS（${CN_AGENT_UPSTREAM%%:*}）"
+  if ! cn_agent_resolv_write public; then
+    cn_agent_fail
+    return 1
+  fi
+
+  # 第 3 步：停止禁用旧单元，resolv.conf 暂置纯公网。
+  step "停旧" "停止 warden-gateway-cn-dns 与看门狗 service+timer"
+  if ! cn_agent_stop_legacy; then
+    cn_agent_fail
+    return 1
+  fi
+
+  # 第 4 步：下载 agent + machine-id 守卫 + agent.json + 守卫脚本 + unit。
+  step "装新" "下载 warden-cn-agent 并安装单元"
+  if ! cn_agent_download "$version" "$arch"; then
+    cn_agent_fail
+    return 1
+  fi
+  if ! cn_agent_ensure_machine_id; then
+    cn_agent_fail
+    return 1
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    machine_id="(dry-run)"
+  else
+    machine_id="$(tr -d ' \r\n' < /etc/machine-id)"
+  fi
+  # 重跑 cn-setup 的机器上旧 agent 可能仍在运行：先停掉再写新配置/装新单元，
+  # 否则后面的 restart 还没到、旧进程已经用旧 token 继续心跳（F8）。
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  + systemctl stop %s（若在运行）\n' "$CN_AGENT_UNIT_NAME"
+  elif have systemctl && systemctl is-active --quiet "$CN_AGENT_UNIT_NAME"; then
+    systemctl stop "$CN_AGENT_UNIT_NAME" >/dev/null 2>&1 || true
+  fi
+  if ! cn_agent_write_config "" "$machine_id"; then
+    cn_agent_fail
+    return 1
+  fi
+  if ! cn_agent_write_guard; then
+    cn_agent_fail
+    return 1
+  fi
+  if ! cn_agent_write_unit; then
+    cn_agent_fail
+    return 1
+  fi
+
+  # 第 5 步：enroll 换 machine token 回填 agent.json，启动并等待 probe=OK。
+  if ! cn_agent_enroll; then
+    cn_agent_fail
+    return 1
+  fi
+  if ! cn_agent_write_config "$CN_AGENT_TOKEN" "$machine_id"; then
+    cn_agent_fail
+    return 1
+  fi
+  if ! cn_agent_start_and_wait; then
+    cn_agent_fail
+    return 1
+  fi
+
+  # 第 6 步：resolv.conf 定型（agent 在前 + 公网兜底在后），NM 守卫保留。
+  # systemd-resolved 托管 resolv.conf 的主机上，静态 resolv.conf 会被重新
+  # 生成覆盖——先装 resolved 守卫（上游 -> 198.18.0.1），让 libc 经 resolved
+  # 的查询也走分流；写 resolv.conf 对这类主机只是无害的尽力而为。
+  step "定型" "resolv.conf 指向 agent 本地 DNS（198.18.0.1 在前 + 公网兜底）"
+  if cn_agent_resolved_active; then
+    kv "resolved 守卫" "$CN_RESOLVED_CONF"
+    cn_agent_resolved_guard || warn "resolved 守卫未完全生效，后续抽查会暴露问题"
+  fi
+  if ! cn_agent_resolv_write final; then
+    cn_agent_fail
+    return 1
+  fi
+  if ! cn_apply_nm_guard; then
+    cn_agent_fail
+    return 1
+  fi
+  # 第 5 步收尾：getent 抽查分流域名解析到网关（须在定型之后才能走 agent DNS）。
+  # 管道带 || true：getent 解析失败不能让 set -e 直接退出——下面的回滚守卫必须可达。
+  if [ "$DRY_RUN" -eq 0 ]; then
+    got="$(getent ahostsv4 github.com 2>/dev/null | awk 'NR == 1 {print $1}' || true)"
+    if [ "$got" != "$CN_GATEWAY" ]; then
+      warn "分流域名抽查未通过：github.com 解析到 ${got:-空}，期望 $CN_GATEWAY"
+      cn_agent_fail
+      return 1
+    fi
+    kv "github.com" "$got"
+  fi
+
+  # 第 7 步：摘除 /etc/hosts 托管块——不摘的话 agent 降级直连时 hosts 仍把
+  # 分流域名钉在网关 IP，止损路径失效（spec §9.4 第 7 步）。
+  step "摘除" "删除 /etc/hosts 中的 warden-gateway 托管块"
+  if ! cn_remove_hosts; then
+    cn_agent_fail
+    return 1
+  fi
+
+  # 第 8 步：清理 legacy 文件与单元，快照归档。
+  step "清理" "删除 watchdog 脚本/env/state、dnsmasq conf 与旧单元文件"
+  cn_agent_cleanup_legacy
+  cn_finish_backup
+  cn_prune_backups
+
+  title "agent 模式迁移完成"
+  kv "面板" "$CN_AGENT_ORIGIN"
+  kv "网关地址" "$CN_GATEWAY"
+  kv "agent 服务" "$CN_AGENT_UNIT_NAME（systemd 托管）"
+  kv "配置" "$CN_AGENT_CONFIG"
+  kv "状态" "$CN_AGENT_STATE_DIR/state.json"
+  if [ -n "$CN_BACKUP_DIR" ]; then
+    kv "备份" "$CN_BACKUP_DIR"
+    if install_cn_cli; then
+      kv "体检命令" "sudo $CN_CLI_PATH cn-check"
+      kv "恢复命令" "sudo $CN_CLI_PATH cn-restore"
+    fi
+  fi
+  return 0
+}
+
 cn_setup() {
   need_root
   title "国内机设置"
   validate_options
+  # agent 模式分派：--enroll-token 且未 --no-agent → 按 spec §9.4 迁移。
+  if [ -n "$CN_AGENT_ENROLL_TOKEN" ] && [ "$CN_AGENT_NO_AGENT" -eq 0 ]; then
+    cn_setup_agent
+    return $?
+  fi
+  if [ -n "$CN_AGENT_ENROLL_TOKEN" ] && [ "$CN_AGENT_NO_AGENT" -eq 1 ]; then
+    warn "已指定 --no-agent，忽略 --enroll-token，按 legacy 模式执行"
+  fi
+  # legacy 弃用提示：legacy 路径保持完全可用，但 agent 模式是未来默认。
+  warn "legacy 模式已弃用（dnsmasq + 看门狗）：请在面板「国内机」页生成带 --enroll-token 的新命令，迁移到 agent 模式。"
   interactive_cn_options
   if [ -z "$CN_GATEWAY" ]; then
     CN_GATEWAY="${GATEWAY_IP:-$(detect_ip)}"
@@ -1907,8 +3030,75 @@ cn_restore_one() {
   fi
 }
 
+# cn_check_agent agent 模式只读体检：state.json 摘要 + agent 服务状态 +
+# getent 抽查（spec §9.5：与 legacy 输出格式一致，shell 只读，不驱动 agent）。
+cn_check_agent() {
+  local rc=0 got state_file="$CN_AGENT_STATE_DIR/state.json"
+  local ip state_updated state_probe state_detail state_count
+  title "国内机分流体检（agent 模式）"
+  ip="$(sed -n 's/.*"gateway_ip" *: *"\([^"]*\)".*/\1/p' "$CN_AGENT_CONFIG" 2>/dev/null | head -n 1)"
+  kv "网关地址" "${ip:-未知}"
+  if [ -z "$ip" ]; then
+    warn "无法从 $CN_AGENT_CONFIG 读取网关地址"
+    rc=1
+  fi
+  step "agent" "检查 warden-cn-agent 服务与状态文件"
+  if have systemctl && systemctl is-active --quiet "$CN_AGENT_UNIT_NAME" 2>/dev/null; then
+    kv "$CN_AGENT_UNIT_NAME" "active"
+  else
+    kv "$CN_AGENT_UNIT_NAME" "未运行"
+    rc=1
+  fi
+  if [ -f "$state_file" ]; then
+    state_updated="$(sed -n 's/.*"updated_at" *: *"\([^"]*\)".*/\1/p' "$state_file" | head -n 1)"
+    state_probe="$(sed -n 's/.*"probe_result" *: *"\([^"]*\)".*/\1/p' "$state_file" | head -n 1)"
+    state_detail="$(sed -n 's/.*"probe_detail" *: *"\([^"]*\)".*/\1/p' "$state_file" | head -n 1)"
+    state_count="$(sed -n 's/.*"domains_count" *: *\([0-9][0-9]*\).*/\1/p' "$state_file" | head -n 1)"
+    kv "状态更新" "${state_updated:-未知}"
+    kv "探测结果" "$(cn_probe_label "${state_probe:-UNKNOWN}")"
+    if [ -n "$state_detail" ]; then kv "探测明细" "$state_detail"; fi
+    kv "分流域名" "${state_count:-0} 条"
+    if [ "${state_probe:-UNKNOWN}" != "OK" ]; then
+      rc=1
+    fi
+  else
+    kv "状态文件" "缺失（$state_file）"
+    rc=1
+  fi
+  step "hosts" "检查 /etc/hosts 托管块"
+  if grep -qxF "$CN_HOSTS_BEGIN" /etc/hosts 2>/dev/null; then
+    kv "托管块" "仍存在（agent 模式应已摘除，会覆盖降级止损）"
+  else
+    kv "托管块" "不存在（agent 模式正常）"
+  fi
+  step "本地 DNS" "检查本机 resolver 与解析抽查"
+  if [ -f /etc/resolv.conf ]; then
+    kv "resolv.conf" "$(awk '$1 == "nameserver" {printf "%s ", $2}' /etc/resolv.conf | sed 's/ $//')"
+  fi
+  if [ -n "$ip" ] && [ "$DRY_RUN" -eq 0 ]; then
+    # || true：cn-check 只读，解析失败应报告"未命中"，不应让 set -e 静默退出。
+    got="$(getent ahostsv4 github.com 2>/dev/null | awk 'NR == 1 {print $1}' || true)"
+    if [ "$got" = "$ip" ]; then
+      kv "github.com" "$got（命中网关）"
+    else
+      kv "github.com" "${got:-解析失败}（期望 $ip）"
+      rc=1
+    fi
+  fi
+  if [ "$rc" -eq 0 ]; then
+    ok "agent 分流路径正常"
+  else
+    warn "agent 分流存在问题，详见上方各项；journalctl -u $CN_AGENT_UNIT_NAME -n 30"
+  fi
+  return "$rc"
+}
+
 # cn_check 只读体检：探测代理机、检查 hosts 块 / 本地 DNS / 看门狗状态，不改任何文件。
 cn_check() {
+  if [ -f "$CN_AGENT_CONFIG" ]; then
+    cn_check_agent
+    return $?
+  fi
   local ip="$1" domains="$2" rc=0 out got
   if [ -f "$CN_WATCH_ENV" ]; then
     # shellcheck disable=SC1090
@@ -1964,8 +3154,49 @@ cn_check() {
 say_ok_text() { printf '正常'; }
 say_bad_text() { printf '异常'; }
 
+# cn_status_agent agent 模式配置快照（只读，输出风格与 legacy 一致）。
+cn_status_agent() {
+  local origin ip state_file="$CN_AGENT_STATE_DIR/state.json"
+  local state_updated state_probe state_count
+  title "国内机分流状态（agent 模式）"
+  origin="$(sed -n 's/.*"origin" *: *"\([^"]*\)".*/\1/p' "$CN_AGENT_CONFIG" 2>/dev/null | head -n 1)"
+  ip="$(sed -n 's/.*"gateway_ip" *: *"\([^"]*\)".*/\1/p' "$CN_AGENT_CONFIG" 2>/dev/null | head -n 1)"
+  kv "面板" "${origin:-未知}"
+  kv "网关地址" "${ip:-未知}"
+  if have systemctl; then
+    kv "agent 服务" "$(systemctl is-active "$CN_AGENT_UNIT_NAME" 2>/dev/null || true)"
+  fi
+  if [ -f "$state_file" ]; then
+    state_updated="$(sed -n 's/.*"updated_at" *: *"\([^"]*\)".*/\1/p' "$state_file" | head -n 1)"
+    state_probe="$(sed -n 's/.*"probe_result" *: *"\([^"]*\)".*/\1/p' "$state_file" | head -n 1)"
+    state_count="$(sed -n 's/.*"domains_count" *: *\([0-9][0-9]*\).*/\1/p' "$state_file" | head -n 1)"
+    kv "状态更新" "${state_updated:-未知}"
+    kv "探测结果" "$(cn_probe_label "${state_probe:-UNKNOWN}")"
+    kv "分流域名" "${state_count:-0} 条"
+  else
+    kv "状态文件" "缺失"
+  fi
+  if grep -qxF "$CN_HOSTS_BEGIN" /etc/hosts 2>/dev/null; then
+    kv "hosts 托管块" "仍存在（agent 模式应已摘除）"
+  else
+    kv "hosts 托管块" "不存在（agent 模式已摘除）"
+  fi
+  if [ -f /etc/resolv.conf ]; then
+    kv "resolv.conf" "$(awk '$1 == "nameserver" {printf "%s ", $2}' /etc/resolv.conf | sed 's/ $//')"
+  fi
+  kv "agent 配置" "$CN_AGENT_CONFIG"
+  if [ -d "$(cn_backup_root)" ]; then
+    kv "备份数量" "$(cn_backup_count)"
+  fi
+  kv "恢复命令" "sudo warden-cn cn-restore"
+}
+
 # cn_status 打印当前分流配置快照（只读）。
 cn_status() {
+  if [ -f "$CN_AGENT_CONFIG" ]; then
+    cn_status_agent
+    return 0
+  fi
   local ip domains
   if [ -f "$CN_WATCH_ENV" ]; then
     # shellcheck disable=SC1090
@@ -2019,6 +3250,12 @@ cn_restore() {
   kv "备份" "$id"
   kv "位置" "$dir"
   confirm "确认恢复该备份？" || { say "已取消"; return 1; }
+  # agent 模式先停用并清理 agent（停止本地 DNS、删除 agent 文件），再走
+  # 快照还原（含 resolv.conf / hosts 的迁移前内容），完整回到迁移前状态。
+  if [ -f "$CN_AGENT_CONFIG" ]; then
+    step "agent" "停用并清理 warden-cn-agent"
+    cn_agent_teardown
+  fi
   cn_restore_one "$dir"
   ok "恢复完成"
   say "如需重启面板服务，请执行 systemctl restart warden-gateway。"
@@ -2247,12 +3484,20 @@ cmd_install() {
     install_unit
     install_logrotate
     install_service
+    cache_agent_binaries || true
   fi
   if wait_health "$PUBLIC_URL"; then
     ok "健康检查通过"
   else
     journalctl -u "$SERVICE" -n 40 --no-pager || true
     die "健康检查未通过"
+  fi
+  if [ "$MODE" = "docker" ]; then
+    # Resolve+cache only after the container passed its health check: during
+    # the startup window neither the container nor the local listener can
+    # report a version yet (R2). The prefetch downloads must also stay outside
+    # the install/upgrade downtime window (F7).
+    cn_docker_cache_agent || true
   fi
   ensure_certificate "$DOMAIN" "$PUBLIC_URL" || true
   title "安装完成"
@@ -2309,9 +3554,17 @@ cmd_update() {
     install_logrotate
     systemctl daemon-reload
     systemctl start "$SERVICE"
+    # Prefetch only after the gateway is back up: the cache downloads must not
+    # sit inside the stopped-service window (F7).
+    cache_agent_binaries || true
   fi
   sleep 2
   if [ -n "$PUBLIC_URL" ] && wait_health "$PUBLIC_URL" 1; then ok "升级完成"; else warn "升级后健康检查未通过"; fi
+  if [ "$MODE" = "docker" ]; then
+    # Same as install: only the running container knows its version, so resolve
+    # and prefetch after the health check, never before/during the restart (R2).
+    cn_docker_cache_agent || true
+  fi
 }
 
 cmd_uninstall() {

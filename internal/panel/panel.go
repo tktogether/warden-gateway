@@ -55,6 +55,7 @@ type Options struct {
 	Started     time.Time
 	DNS         *dnsproxy.Proxy
 	SingBox     *singbox.Manager
+	CNReg       *CNRegistry
 }
 
 type Server struct {
@@ -72,8 +73,19 @@ type Server struct {
 	dns         *dnsproxy.Proxy
 	singbox     *singbox.Manager
 	auditPath   string
-	sampleMu    sync.Mutex
-	restartMu   sync.Mutex
+	cnReg       *CNRegistry
+	beatMu      sync.Mutex
+	lastBeat    map[string]time.Time
+	// minBeatInterval is the heartbeat rate limit window; tests set it to 0
+	// to disable limiting.
+	minBeatInterval time.Duration
+	// enrollLimiter bounds anonymous enroll attempts per client IP with the
+	// same LoginLimiter mechanism the login endpoint uses (own bucket: the
+	// endpoint is unauthenticated and audited per attempt, so an anonymous
+	// flood would otherwise inflate audit.log without bound).
+	enrollLimiter *auth.LoginLimiter
+	sampleMu      sync.Mutex
+	restartMu     sync.Mutex
 }
 
 func New(opts Options) (*Server, error) {
@@ -109,7 +121,11 @@ func New(opts Options) (*Server, error) {
 		serviceName: opts.ServiceName, auth: opts.Auth, backups: opts.Backups,
 		stats: opts.Stats, log: opts.Log, started: opts.Started,
 		host: newHostMetrics(hostSampleCapacity), dns: opts.DNS, singbox: opts.SingBox,
-		auditPath: filepath.Join(opts.DataDir, "audit.log"),
+		auditPath:       filepath.Join(opts.DataDir, "audit.log"),
+		cnReg:           opts.CNReg,
+		lastBeat:        make(map[string]time.Time),
+		minBeatInterval: cnBeatMinInterval,
+		enrollLimiter:   auth.NewLoginLimiter(cnEnrollRateMax, cnEnrollRateWindow),
 	}
 	s.host.Sample()
 	return s, nil
@@ -204,6 +220,18 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, p string) {
 	case "/api/logout":
 		s.handleLogout(w, r)
 		return
+	case "/api/agent/enroll":
+		s.handleAgentEnroll(w, r)
+		return
+	case "/api/agent/heartbeat":
+		s.handleAgentHeartbeat(w, r)
+		return
+	}
+	if strings.HasPrefix(p, "/api/agent/binary/") {
+		s.handleAgentBinary(w, r, p)
+		return
+	}
+	switch p {
 	case "/api/overview":
 		s.handleOverview(w, r)
 		return
@@ -246,6 +274,9 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, p string) {
 	case "/api/cn":
 		s.handleCNCommands(w, r)
 		return
+	case "/api/cnmachines":
+		s.handleCNMachines(w, r)
+		return
 	case "/api/dns":
 		s.handleDNSStatus(w, r)
 		return
@@ -283,6 +314,10 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, p string) {
 	}
 	if strings.HasPrefix(p, "/api/backups/") {
 		s.handleBackupItem(w, r, strings.TrimPrefix(p, "/api/backups/"))
+		return
+	}
+	if strings.HasPrefix(p, "/api/cnmachines/") {
+		s.handleCNMachineItem(w, r, strings.TrimPrefix(p, "/api/cnmachines/"))
 		return
 	}
 	http.NotFound(w, r)
