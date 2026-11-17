@@ -134,6 +134,12 @@ func TestBootstrapAgentMode(t *testing.T) {
 		"agent-rollback-guard",  // ExecStartPre crash-rollback guard script
 		"heartbeat_seconds",     // agent.json field, written >= 10
 		"已弃用",                   // legacy path deprecation hint
+		// Fix round 1 locks: the root binary is installed only after its bare-hex
+		// .sha256 sidecar verifies, and agent mode refuses to fall back to the
+		// machine's own egress IP as the gateway.
+		"warden-cn-agent-linux-$arch.sha256",
+		"sha256sum",
+		"agent 模式必须提供 --gateway-ip",
 	}
 	script := string(raw)
 	for _, want := range required {

@@ -1971,9 +1971,12 @@ EOF
 }
 
 # cn_agent_download 经代理机的 GitHub 代理短路径下载 agent 二进制
-# （spec §9.3：一律不直连 GitHub），校验非空后原子替换到 $CN_AGENT_BIN。
+# （spec §9.3：一律不直连 GitHub）。systemd 会以 root 运行这个二进制，
+# 安装前必须用 .sha256 侧车校验（与 agent 自升级同严格：侧车只允许裸 hex，
+# 两列 sha256sum 输出视为格式错误；缺侧车即失败，不静默跳过），
+# 校验通过才原子替换到 $CN_AGENT_BIN。
 cn_agent_download() {
-  local version="$1" arch="$2" url tmp
+  local version="$1" arch="$2" url tmp sidecar expected actual
   url="$CN_AGENT_ORIGIN/github.com/$REPO/releases/download/v$version/warden-cn-agent-linux-$arch"
   step "下载" "$url"
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -1985,7 +1988,9 @@ cn_agent_download() {
     return 1
   fi
   tmp="$CN_AGENT_BIN.new.$$"
-  if ! curl -kfsS --connect-timeout 10 --max-time 300 --retry 2 --retry-delay 2 -o "$tmp" "$url"; then
+  # 注意不用 --retry：Windows mingw curl 在重试后失败时错误地返回 0，
+  # 会让下面的失败分支失效（下载是否成功由非空检查 + sha256 校验兜底）。
+  if ! curl -kfsS --connect-timeout 10 --max-time 300 -o "$tmp" "$url"; then
     rm -f "$tmp"
     warn "下载 agent 二进制失败"
     return 1
@@ -1995,6 +2000,37 @@ cn_agent_download() {
     warn "下载的 agent 二进制为空"
     return 1
   fi
+  # .sha256 侧车校验（缺侧车或格式不符都算失败）。
+  local sidecar="$CN_AGENT_ORIGIN/github.com/$REPO/releases/download/v$version/warden-cn-agent-linux-$arch.sha256"
+  if ! curl -kfsS --connect-timeout 10 --max-time 60 \
+      -o "$tmp.sha" "$sidecar"; then
+    rm -f "$tmp" "$tmp.sha"
+    warn "下载 agent sha256 侧车失败：$sidecar"
+    return 1
+  fi
+  expected="$(tr -d ' \r\n\t' < "$tmp.sha")"
+  rm -f "$tmp.sha"
+  case "$expected" in
+    ''|*[!0-9a-fA-F]*)
+      rm -f "$tmp"
+      warn "agent sha256 侧车不是裸 hex（须与 sha256sum 单列输出一致）"
+      return 1;;
+  esac
+  if [ "${#expected}" -ne 64 ]; then
+    rm -f "$tmp"
+    warn "agent sha256 侧车长度不是 64：${#expected}"
+    return 1
+  fi
+  actual="$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}' || true)"
+  case "$actual" in
+    ''|*[!0-9a-fA-F]*) rm -f "$tmp"; warn "无法计算二进制 sha256"; return 1;;
+  esac
+  if [ "$actual" != "$(printf '%s' "$expected" | tr 'A-F' 'a-f')" ]; then
+    rm -f "$tmp"
+    warn "agent 二进制 sha256 校验失败：期望 $expected，实际 $actual"
+    return 1
+  fi
+  ok "agent 二进制 sha256 校验通过"
   if ! install -m 0755 "$tmp" "$CN_AGENT_BIN.new"; then
     rm -f "$tmp"
     warn "安装 agent 二进制失败"
@@ -2268,8 +2304,13 @@ cn_setup_agent() {
   local version arch machine_id probe_rc=0 probe_out got
   title "国内机 agent 模式迁移"
   say "本机将由 warden-cn-agent 接管分流：下载 agent、注册到面板、本地 DNS 由 agent 托管。"
-  CN_GATEWAY="${GATEWAY_IP:-$(detect_ip)}"
-  [ -n "$CN_GATEWAY" ] || die "无法确定网关地址，请指定 --gateway-ip"
+  # agent 模式必须有真实网关地址：没有 --gateway-ip 时 detect_ip 给出的是本机
+  # 出口 IP，agent 会探测自身，心跳 probe 永远到不了 OK，白白烧掉一次性
+  # enroll token。在快照之前快速失败（此刻还没有任何可回滚的改动）。
+  if [ -z "$GATEWAY_IP" ]; then
+    die "agent 模式必须提供 --gateway-ip（面板生成的命令已包含）；回退到本机出口 IP 会让 agent 探测自身"
+  fi
+  CN_GATEWAY="$GATEWAY_IP"
   is_ipv4 "$CN_GATEWAY" || die "网关地址不是 IPv4：$CN_GATEWAY"
   cn_agent_resolve_origin || return 1
   step "面板" "$CN_AGENT_ORIGIN"
@@ -2375,8 +2416,9 @@ cn_setup_agent() {
     return 1
   fi
   # 第 5 步收尾：getent 抽查分流域名解析到网关（须在定型之后才能走 agent DNS）。
+  # 管道带 || true：getent 解析失败不能让 set -e 直接退出——下面的回滚守卫必须可达。
   if [ "$DRY_RUN" -eq 0 ]; then
-    got="$(getent ahostsv4 github.com 2>/dev/null | awk 'NR == 1 {print $1}')"
+    got="$(getent ahostsv4 github.com 2>/dev/null | awk 'NR == 1 {print $1}' || true)"
     if [ "$got" != "$CN_GATEWAY" ]; then
       warn "分流域名抽查未通过：github.com 解析到 ${got:-空}，期望 $CN_GATEWAY"
       cn_agent_fail
@@ -2609,7 +2651,8 @@ cn_check_agent() {
     kv "resolv.conf" "$(awk '$1 == "nameserver" {printf "%s ", $2}' /etc/resolv.conf | sed 's/ $//')"
   fi
   if [ -n "$ip" ] && [ "$DRY_RUN" -eq 0 ]; then
-    got="$(getent ahostsv4 github.com 2>/dev/null | awk 'NR == 1 {print $1}')"
+    # || true：cn-check 只读，解析失败应报告"未命中"，不应让 set -e 静默退出。
+    got="$(getent ahostsv4 github.com 2>/dev/null | awk 'NR == 1 {print $1}' || true)"
     if [ "$got" = "$ip" ]; then
       kv "github.com" "$got（命中网关）"
     else
