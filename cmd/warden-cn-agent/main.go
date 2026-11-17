@@ -103,8 +103,9 @@ func runRun(args []string) error {
 }
 
 // runOnce executes exactly one cycle and prints a one-line result. A queued
-// deregister that completed successfully is a clean exit (exit 0), not an
-// error.
+// deregister or a completed self-upgrade is a clean exit (exit 0), not an
+// error: after an upgrade the binary is already swapped on disk, so exiting 0
+// lets systemd Restart=always bring the new version up.
 func runOnce(args []string) error {
 	fs := flag.NewFlagSet("once", flag.ExitOnError)
 	cfgPath := fs.String("config", defaultAgentConfigPath, "agent configuration file")
@@ -128,6 +129,9 @@ func runOnce(args []string) error {
 		return nil
 	case cnagent.IsDeregistered(err):
 		fmt.Println("once: agent deregistered")
+		return nil
+	case cnagent.IsUpgraded(err):
+		fmt.Println("once: agent upgraded, exiting for restart")
 		return nil
 	default:
 		return err

@@ -38,6 +38,15 @@ const cnCmdDeregister = "deregister"
 // cnAgentBodyMax bounds enroll and heartbeat request bodies.
 const cnAgentBodyMax = 1 << 20
 
+// cnEnrollRateMax / cnEnrollRateWindow bound anonymous enroll attempts per
+// client IP (5/min, same LoginLimiter mechanism as the login endpoint but a
+// separate bucket). Enroll is unauthenticated and audited per attempt, so
+// without this gate an anonymous flood inflates audit.log without bound.
+const (
+	cnEnrollRateMax    = 5
+	cnEnrollRateWindow = time.Minute
+)
+
 // hashDomains derives the split-domain list hash the gateway compares and
 // pushes: SHA-256 over the newline-joined list (nil treated as empty, so the
 // empty hash stays deterministic). Agents adopt the pushed hash verbatim,
@@ -99,6 +108,25 @@ func (s *Server) forgetBeat(tokenHash string) {
 	s.beatMu.Unlock()
 }
 
+// allowEnroll reports whether an anonymous enroll attempt from ip may proceed
+// and records it in the per-IP window. Unlike the login limiter (which counts
+// failures only), every allowed attempt consumes budget: the endpoint is
+// unauthenticated and each attempt writes one audit line, so the flood being
+// bounded is the attempts themselves. Over-limit attempts are rejected before
+// the registry is touched and write no audit line.
+func (s *Server) allowEnroll(ip string) bool {
+	if s.enrollLimiter == nil {
+		s.enrollLimiter = auth.NewLoginLimiter(cnEnrollRateMax, cnEnrollRateWindow)
+	}
+	if !s.enrollLimiter.Allow(ip) {
+		return false
+	}
+	// LoginLimiter counts recorded attempts within the window; record this
+	// one regardless of how the request ends (Fail is its record operation).
+	s.enrollLimiter.Fail(ip)
+	return true
+}
+
 type cnEnrollRequest struct {
 	EnrollToken string `json:"enroll_token"`
 	Hostname    string `json:"hostname"`
@@ -107,9 +135,18 @@ type cnEnrollRequest struct {
 // handleAgentEnroll exchanges a one-time enroll token for machine
 // credentials. Agents hold no panel session, so this endpoint performs no
 // CSRF/session checks; the short-lived single-use token is the credential.
+// The endpoint is reachable anonymously, so it is rate limited per client IP
+// (cnEnrollRateMax attempts per cnEnrollRateWindow) before the registry is
+// touched; over-limit requests get 429 and are deliberately not audited —
+// bounding the audit lines is the point of the limiter.
 func (s *Server) handleAgentEnroll(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ip := auth.ClientIP(r)
+	if !s.allowEnroll(ip) {
+		writeError(w, http.StatusTooManyRequests, "too many enroll attempts, try again later")
 		return
 	}
 	if s.cnReg == nil {
@@ -121,7 +158,6 @@ func (s *Server) handleAgentEnroll(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	ip := auth.ClientIP(r)
 	m, token, err := s.cnReg.Enroll(body.EnrollToken, body.Hostname, time.Now())
 	if errors.Is(err, ErrInvalidEnroll) {
 		// The raw token never reaches the audit log, only the outcome.

@@ -74,3 +74,42 @@ func TestDefaultValues(t *testing.T) {
 		t.Fatalf("Repo = %q, want %q", cfg.Repo, "tktogether/warden-gateway")
 	}
 }
+
+// TestValidateUpstream pins the ip:port upstream contract: the host part
+// lands verbatim in resolv.conf nameserver lines (bootstrap) and is dialed
+// directly by the DNS proxy, so only an IPv4 host with a numeric port
+// passes; an empty Upstream falls back to DefaultUpstream.
+func TestValidateUpstream(t *testing.T) {
+	cfg := testConfig(t)
+
+	// The default and a plain override both pass.
+	for _, good := range []string{"", " ", "223.5.5.5:53", "119.29.29.29:5353"} {
+		cfg.Upstream = good
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate with upstream %q = %v, want nil", good, err)
+		}
+	}
+
+	for _, bad := range []string{
+		"dns.example.com:53", // hostname host part: resolv.conf needs an IPv4 literal
+		"223.5.5.5",          // missing port
+		"223.5.5.5:",         // empty port
+		"223.5.5.5:53:99",    // malformed pair
+		"999.9.9.9:53",       // not an IP
+		"2001:db8::1:53",     // IPv6 host (ambiguous without brackets, not an IPv4 literal)
+		"[2001:db8::1]:53",   // bracketed IPv6: resolv.conf nameserver would break the agent form
+		"223.5.5.5:0",        // port 0 is not dialable
+		"223.5.5.5:70000",    // out of range
+		"223.5.5.5:dns",      // non-numeric port
+	} {
+		cfg.Upstream = bad
+		err := cfg.Validate()
+		if err == nil {
+			t.Errorf("Validate with upstream %q = nil, want an error", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "upstream") {
+			t.Errorf("Validate with upstream %q = %v, want the error to mention upstream", bad, err)
+		}
+	}
+}

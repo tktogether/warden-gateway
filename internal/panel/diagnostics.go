@@ -125,10 +125,12 @@ func (s *Server) handleCNCommands(w http.ResponseWriter, r *http.Request) {
 	}
 	// agent_binary_url points the CN machine at the self-hosted agent binary so
 	// the download never touches GitHub directly; without an origin the panel
-	// cannot host it and the URL stays empty.
+	// cannot host it and the URL stays empty. The release tag carries exactly
+	// one "v" prefix: CI stamps version.Version as "v1.6.0", dev builds as
+	// "1.6.0" — TrimPrefix normalizes both to the single-v tag form.
 	agentBinaryURL := ""
 	if origin != "" {
-		agentBinaryURL = origin + "/github.com/tktogether/warden-gateway/releases/download/v" + version.Version + "/warden-cn-agent-linux-amd64"
+		agentBinaryURL = origin + "/github.com/tktogether/warden-gateway/releases/download/v" + strings.TrimPrefix(version.Version, "v") + "/warden-cn-agent-linux-amd64"
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"as_of":            config.NowUTC(),

@@ -1532,7 +1532,10 @@
     badges.appendChild(statusPill(m.online ? '在线' : '离线', m.online ? 'ok' : ''));
     var probe = m.probe || null;
     if (probe && probe.result) {
-      badges.appendChild(statusPill(probe.result === 'ok' ? '探测正常' : '探测 ' + probe.result, probe.result === 'ok' ? 'ok' : 'warn'));
+      // The wire value is uppercase ("OK", "LINK_443_BLOCKED", ...); compare
+      // case-insensitively so the healthy pill actually lights up.
+      var probeOK = (probe.result || '').toUpperCase() === 'OK';
+      badges.appendChild(statusPill(probeOK ? '探测正常' : '探测 ' + probe.result, probeOK ? 'ok' : 'warn'));
     } else {
       badges.appendChild(statusPill('探测 —', ''));
     }

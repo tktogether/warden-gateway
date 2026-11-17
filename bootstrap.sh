@@ -2224,8 +2224,13 @@ cn_agent_cleanup_legacy() {
 # 快照、重新启用旧单元、resolv.conf 还原为纯公网兜底——第 2 步写入的公网
 # DNS 保留（无害且有益）。resolv.conf 的原始内容不在回滚中还原，而是留在
 # 快照归档里，供 cn-restore 完整回退到迁移前。
+# 例外（重复迁移，裁定于最终评审修复 5）：机器在本次 cn-setup 之前就已是
+# agent 模式（快照记录 warden-cn-agent.service existed=1）时，失败重跑不能
+# 把此前正常工作的 agent 留在停用状态——按快照还原迁移前的 agent 态
+# resolv.conf（198.18.0.1 在前 + 公网兜底），并重新 enable --now
+# warden-cn-agent。原本就是 legacy 的机器保持原样：纯公网 + 旧单元。
 cn_agent_rollback() {
-  local path existed size stored
+  local path existed size stored agent_was=0
   warn "agent 迁移失败，回滚到迁移前状态（保留公网兜底 DNS）"
   if [ "$DRY_RUN" -eq 0 ] && have systemctl; then
     systemctl disable --now "$CN_AGENT_UNIT_NAME" >/dev/null 2>&1 || true
@@ -2235,6 +2240,11 @@ cn_agent_rollback() {
     # 三个变量都必须接收，否则 existed 会吞进 size 导致误删而非还原。
     while IFS="$(printf '\t')" read -r path existed size; do
       [ -n "$path" ] || continue
+      # 重复迁移探测：迁移前 agent 单元已存在（existed=1）→ 本次是在已有
+      # agent 的机器上重跑 cn-setup --enroll-token，回滚要恢复 agent 模式。
+      if [ "$path" = "$CN_AGENT_UNIT" ] && [ "$existed" = "1" ]; then
+        agent_was=1
+      fi
       case "$path" in
         *resolv.conf) continue;;
       esac
@@ -2249,11 +2259,40 @@ cn_agent_rollback() {
       fi
     done < "$CN_BACKUP_DIR/records.tsv"
   fi
-  cn_agent_resolv_write public || true
+  if [ "$agent_was" = "1" ]; then
+    # 迁移前 agent 就在本机运行：resolv.conf 按快照还原（快照里的正是迁移
+    # 前的 agent 定型形态），而不是改写为纯公网。
+    if [ -f "$CN_BACKUP_DIR/records.tsv" ]; then
+      while IFS="$(printf '\t')" read -r path existed size; do
+        [ -n "$path" ] || continue
+        case "$path" in
+          *resolv.conf) ;;
+          *) continue;;
+        esac
+        if [ "$existed" = "1" ]; then
+          stored="$CN_BACKUP_DIR/files/$(cn_path_hash "$path")"
+          if [ -f "$stored" ]; then
+            mkdir -p "$(dirname "$path")" 2>/dev/null || true
+            cp -p "$stored" "$path" || warn "回滚恢复失败：$path"
+          fi
+        fi
+      done < "$CN_BACKUP_DIR/records.tsv"
+    fi
+  else
+    cn_agent_resolv_write public || true
+  fi
   if [ "$DRY_RUN" -eq 0 ] && have systemctl; then
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable --now "$CN_DNS_UNIT_NAME" >/dev/null 2>&1 || true
     systemctl enable --now "$CN_WATCH_UNIT_NAME.timer" >/dev/null 2>&1 || true
+    if [ "$agent_was" = "1" ]; then
+      # 单元文件与二进制已按快照还原，把此前正常工作的 agent 重新拉起。
+      if ! systemctl enable --now "$CN_AGENT_UNIT_NAME" >/dev/null 2>&1; then
+        warn "warden-cn-agent 重新启动失败：journalctl -u $CN_AGENT_UNIT_NAME -n 30"
+      fi
+    fi
+  elif [ "$DRY_RUN" -eq 1 ] && [ "$agent_was" = "1" ]; then
+    printf '  + systemctl enable --now %s\n' "$CN_AGENT_UNIT_NAME"
   fi
   return 0
 }

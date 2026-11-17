@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -75,7 +77,12 @@ func Save(path string, cfg *Config) error {
 }
 
 // Validate requires the gateway-issued fields and a full-length hex token.
-// DNSListen is optional: empty means "use DefaultDNSListen".
+// DNSListen is optional: empty means "use DefaultDNSListen". Upstream is
+// optional too (empty means "use DefaultUpstream"), but when set it must be
+// ip:port with an IPv4 host part — bootstrap writes that host verbatim into
+// resolv.conf nameserver lines and the DNS proxy dials it directly, so a
+// hostname or malformed pair must fail validation instead of breaking the
+// machine's resolver at runtime.
 func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Origin) == "" {
 		return errors.New("origin is required")
@@ -88,6 +95,20 @@ func (c *Config) Validate() error {
 	}
 	if !tokenPattern.MatchString(c.Token) {
 		return errors.New("token must be a 64 character hex string")
+	}
+	upstream := strings.TrimSpace(c.Upstream)
+	if upstream == "" {
+		upstream = DefaultUpstream
+	}
+	host, port, err := net.SplitHostPort(upstream)
+	if err != nil {
+		return fmt.Errorf("upstream must be ip:port, got %q", c.Upstream)
+	}
+	if ip := net.ParseIP(host); ip == nil || ip.To4() == nil {
+		return fmt.Errorf("upstream host must be an IPv4 address, got %q", host)
+	}
+	if n, perr := strconv.Atoi(port); perr != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("upstream port must be numeric 1-65535, got %q", port)
 	}
 	return nil
 }

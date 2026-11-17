@@ -12,10 +12,13 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/miekg/dns"
+
+	"github.com/tktogether/warden-gateway/internal/version"
 )
 
 // fakeGateway is a scripted heartbeat endpoint: it records every request body
@@ -613,6 +616,197 @@ func TestRunExitsCleanlyAfterDeregister(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not exit after deregister within 5s")
+	}
+}
+
+// startUpgradeGateway serves the heartbeat endpoint and the Task 7 release
+// fixture layout (binary + bare-hex .sha256 sidecar) on one test server, so a
+// RunOnce cycle can heartbeat, read target_version and download the "new
+// binary" from the same origin — exactly how production self-upgrade flows.
+func startUpgradeGateway(t *testing.T, reply func(body map[string]any) (int, any), relVersion string, fix releaseFixture) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	var hits atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/agent/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode heartbeat body: %v", err)
+		}
+		status, payload := reply(body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(payload)
+	})
+	base := "/github.com/" + DefaultRepo + "/releases/download/" + relVersion + "/"
+	mux.HandleFunc(base+"warden-cn-agent-linux-amd64", func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write(fix.binary)
+	})
+	mux.HandleFunc(base+"warden-cn-agent-linux-amd64.sha256", func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(fix.sidecar))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, &hits
+}
+
+// TestRunOnceUpgradesAndExits pins the actuated self-upgrade path (final
+// review fix 1a): a queued self-upgrade command whose swap completes makes
+// RunOnce return the errAgentUpgraded sentinel and Run exit cleanly, so
+// systemd Restart=always starts the freshly installed binary. SelfUpgrade
+// returning nil means the on-disk swap is already done, so the exit happens
+// strictly after the binary file was replaced.
+func TestRunOnceUpgradesAndExits(t *testing.T) {
+	upstream := startFakeUpstream(t, "192.0.2.1")
+	oldBinary := []byte("old warden-cn-agent binary v1.5.0")
+	newBinary := []byte("new warden-cn-agent binary v999, a different payload")
+	srv, hits := startUpgradeGateway(t,
+		func(body map[string]any) (int, any) {
+			return http.StatusOK, HeartbeatReply{
+				TargetVersion: "v999",
+				Commands:      []Command{{ID: "up1", Action: "self-upgrade", Params: map[string]string{"version": "v999"}}},
+			}
+		},
+		"v999", releaseFixture{binary: newBinary, sidecar: hexOf(newBinary) + "\n"})
+	cfg := testConfig(t)
+	cfg.Origin = srv.URL
+	cfg.Upstream = upstream
+	ta := newTestAgent(t, cfg)
+	// Same self-path injection pattern as the Task 7 SelfUpgrade tests: the
+	// hook runs the real swap against a fake "currently running binary".
+	selfPath := filepath.Join(t.TempDir(), "warden-cn-agent")
+	writeSelf(t, selfPath, oldBinary)
+	a := ta.agent
+	a.upgradeFn = func(ctx context.Context, ver string) error {
+		return SelfUpgrade(ctx, cfg, ver, "amd64", selfPath, nil)
+	}
+
+	if err := a.RunOnce(context.Background()); !errors.Is(err, errAgentUpgraded) {
+		t.Fatalf("RunOnce err = %v, want errAgentUpgraded (swap done, process must exit for systemd)", err)
+	}
+	got, err := os.ReadFile(selfPath)
+	if err != nil {
+		t.Fatalf("read self binary: %v", err)
+	}
+	if string(got) != string(newBinary) {
+		t.Errorf("self binary after upgrade = %q, want the downloaded fixture %q", got, newBinary)
+	}
+	assertNoNewFile(t, selfPath)
+	if n := hits.Load(); n != 2 {
+		t.Errorf("release requests = %d, want 2 (binary + sidecar, exactly one upgrade)", n)
+	}
+
+	// Run converts the sentinel into a clean nil exit. The gateway keeps
+	// naming the same target version, so the very next cycle completes the
+	// (idempotent) swap again and Run returns nil right away.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run after upgrade = %v, want nil (clean exit for the systemd restart)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not exit after the upgrade within 5s")
+	}
+}
+
+// TestAutoFollowTriggersUpgrade pins the auto-follow ruling (spec §6.1: agent
+// 仅在目标版本与本地不一致时执行自升级): a heartbeat reply whose target_version
+// differs from the running version runs the upgrade path exactly once (and a
+// completed swap trips the exit sentinel); a matching target_version never
+// touches the upgrade path.
+func TestAutoFollowTriggersUpgrade(t *testing.T) {
+	upstream := startFakeUpstream(t, "192.0.2.1")
+
+	// target_version differs from the running version → one upgrade attempt.
+	gw := &fakeGateway{reply: func(n int, body map[string]any) (int, any) {
+		return http.StatusOK, HeartbeatReply{TargetVersion: "v999"}
+	}}
+	cfg := gw.start(t)
+	cfg.Upstream = upstream
+	ta := newTestAgent(t, cfg)
+	calls := 0
+	ta.agent.upgradeFn = func(ctx context.Context, ver string) error {
+		calls++
+		if ver != "v999" {
+			t.Errorf("upgradeFn ver = %q, want the reply's target_version v999", ver)
+		}
+		return nil
+	}
+	if err := ta.agent.RunOnce(context.Background()); !errors.Is(err, errAgentUpgraded) {
+		t.Fatalf("RunOnce err = %v, want errAgentUpgraded after the auto-follow upgrade", err)
+	}
+	if calls != 1 {
+		t.Errorf("upgradeFn calls = %d, want 1", calls)
+	}
+
+	// target_version equals the running version → no upgrade at all and a
+	// normal nil cycle.
+	gwSame := &fakeGateway{reply: func(n int, body map[string]any) (int, any) {
+		return http.StatusOK, HeartbeatReply{TargetVersion: version.Version}
+	}}
+	cfgSame := gwSame.start(t)
+	cfgSame.Upstream = upstream
+	taSame := newTestAgent(t, cfgSame)
+	sameCalls := 0
+	taSame.agent.upgradeFn = func(ctx context.Context, ver string) error {
+		sameCalls++
+		return nil
+	}
+	if err := taSame.agent.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce with matching target_version = %v, want nil", err)
+	}
+	if sameCalls != 0 {
+		t.Errorf("upgradeFn calls with matching target_version = %d, want 0 (no upgrade when versions match)", sameCalls)
+	}
+}
+
+// TestUpgradeFailureKeepsRunning pins the upgrade-loop guard (final review
+// fix 1): a failed self-upgrade is reported via last_command with ok=false
+// and must NOT trip the exit sentinel — the agent keeps running, the DNS
+// proxy keeps serving, and the next cycle retries (spec §6.1: 下载失败或校验
+// 不过 → 本次不动，下个心跳重试).
+func TestUpgradeFailureKeepsRunning(t *testing.T) {
+	upstream := startFakeUpstream(t, "192.0.2.1")
+	gw := &fakeGateway{reply: func(n int, body map[string]any) (int, any) {
+		return http.StatusOK, HeartbeatReply{TargetVersion: "v999"}
+	}}
+	cfg := gw.start(t)
+	cfg.Upstream = upstream
+	ta := newTestAgent(t, cfg)
+	calls := 0
+	ta.agent.upgradeFn = func(ctx context.Context, ver string) error {
+		calls++
+		return errors.New("download failed: connection reset")
+	}
+
+	for i := 1; i <= 2; i++ {
+		if err := ta.agent.RunOnce(context.Background()); err != nil {
+			t.Fatalf("cycle %d err = %v, want nil (a failed upgrade must not exit)", i, err)
+		}
+	}
+	if calls != 2 {
+		t.Errorf("upgradeFn calls = %d, want 2 (keeps running and retries every cycle)", calls)
+	}
+	listen := ta.agent.dnsListen
+	if got := queryA(t, listen, "public.example.com"); got != "192.0.2.1" {
+		t.Errorf("public query after failed upgrades = %q, want upstream 192.0.2.1 (DNS keeps serving)", got)
+	}
+
+	st := ta.readState(t)
+	last, ok := st["last_command"].(map[string]any)
+	if !ok {
+		t.Fatalf("state last_command = %v, want object", st["last_command"])
+	}
+	if last["ok"] != false {
+		t.Errorf("last_command.ok = %v, want false after the failed upgrade", last["ok"])
+	}
+	if detail, _ := last["detail"].(string); !strings.Contains(detail, "download failed") {
+		t.Errorf("last_command.detail = %q, want the upgrade failure recorded", detail)
 	}
 }
 

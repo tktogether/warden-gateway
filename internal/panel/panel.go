@@ -79,8 +79,13 @@ type Server struct {
 	// minBeatInterval is the heartbeat rate limit window; tests set it to 0
 	// to disable limiting.
 	minBeatInterval time.Duration
-	sampleMu        sync.Mutex
-	restartMu       sync.Mutex
+	// enrollLimiter bounds anonymous enroll attempts per client IP with the
+	// same LoginLimiter mechanism the login endpoint uses (own bucket: the
+	// endpoint is unauthenticated and audited per attempt, so an anonymous
+	// flood would otherwise inflate audit.log without bound).
+	enrollLimiter *auth.LoginLimiter
+	sampleMu      sync.Mutex
+	restartMu     sync.Mutex
 }
 
 func New(opts Options) (*Server, error) {
@@ -120,6 +125,7 @@ func New(opts Options) (*Server, error) {
 		cnReg:           opts.CNReg,
 		lastBeat:        make(map[string]time.Time),
 		minBeatInterval: cnBeatMinInterval,
+		enrollLimiter:   auth.NewLoginLimiter(cnEnrollRateMax, cnEnrollRateWindow),
 	}
 	s.host.Sample()
 	return s, nil

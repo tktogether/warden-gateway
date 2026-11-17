@@ -147,6 +147,40 @@ func TestBootstrapAgentMode(t *testing.T) {
 			t.Errorf("bootstrap.sh is missing %q", want)
 		}
 	}
+	// Fix round 2 lock: a failed re-run of cn-setup --enroll-token over an
+	// already-agent machine must not leave the previous agent dead — the
+	// rollback function detects the pre-existing agent unit in the snapshot
+	// records and re-enables warden-cn-agent (plus restoring the pre-
+	// migration agent-mode resolv.conf from the snapshot archive).
+	rollback := bootstrapFuncRegion(script, "cn_agent_rollback")
+	if rollback == "" {
+		t.Fatal("cn_agent_rollback function not found in bootstrap.sh")
+	}
+	for _, want := range []string{
+		`CN_AGENT_UNIT`, // re-migration detection reads the unit record
+		`systemctl enable --now "$CN_AGENT_UNIT_NAME"`, // the previously working agent is brought back up
+	} {
+		if !strings.Contains(rollback, want) {
+			t.Errorf("cn_agent_rollback is missing %q (re-migration rollback must restore the agent)", want)
+		}
+	}
+}
+
+// bootstrapFuncRegion returns the body of the named shell function, from its
+// `name() {` line up to the next top-level function definition, so
+// assertions can target one function instead of the whole script.
+func bootstrapFuncRegion(script, name string) string {
+	marker := name + "() {"
+	start := strings.Index(script, marker)
+	if start < 0 {
+		return ""
+	}
+	bodyStart := start + len(marker)
+	next := strings.Index(script[bodyStart:], "() {")
+	if next < 0 {
+		return script[start:]
+	}
+	return script[start : bodyStart+next]
 }
 
 // TestReleaseWorkflowAgentAssets locks the release pipeline contract that the

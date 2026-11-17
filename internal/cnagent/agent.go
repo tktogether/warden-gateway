@@ -30,10 +30,17 @@ import (
 // normal stop of the (just disabled) unit instead of a failure.
 var errAgentDeregistered = errors.New("cnagent: agent deregistered")
 
+// errAgentUpgraded is the sentinel returned by RunOnce after a successful
+// self-upgrade (the binary swap has already completed on disk at that point).
+// Run turns it into a clean nil exit so systemd Restart=always starts the
+// freshly installed binary (spec §6.1: 原子替换 → 退出交由 systemd 重启).
+var errAgentUpgraded = errors.New("cnagent: agent upgraded")
+
 const (
-	// DefaultStatePath is where the agent persists its per-cycle state file
-	// (0644, world-readable on purpose so cn-check can read it without
-	// privileges).
+	// DefaultStatePath is where the agent persists its per-cycle state file.
+	// The file itself is written 0644, but its parent directory is created
+	// 0700 (root-only), so only root can reach it in practice — warden-cn
+	// cn-check reads it through sudo.
 	DefaultStatePath = "/var/lib/warden-gateway-cn/state.json"
 
 	// defaultConfigPath is where cmd wiring loads agent.json from by default;
@@ -129,6 +136,7 @@ type Agent struct {
 	lastError     string          // last local failure (proxy build), surfaced in the state file
 	applies       int             // count of successful proxy builds (tests pin "no rebuild")
 	deregistered  bool            // set once deregister completed; RunOnce returns the sentinel
+	upgraded      bool            // set once a self-upgrade swapped the binary; RunOnce returns the sentinel
 }
 
 // New builds an agent from the loaded configuration. It never dials anything:
@@ -198,6 +206,15 @@ func IsDeregistered(err error) bool {
 	return errors.Is(err, errAgentDeregistered)
 }
 
+// IsUpgraded reports whether err is the sentinel RunOnce returns after a
+// successful self-upgrade (the new binary is already in place when it fires).
+// Run converts the sentinel into a clean nil exit itself; cmd/warden-cn-agent
+// once-mode uses this helper to exit 0 so systemd restarts into the new
+// binary.
+func IsUpgraded(err error) bool {
+	return errors.Is(err, errAgentUpgraded)
+}
+
 // Close releases the agent's local resources (the DNS proxy listener).
 // Run calls shutdown internally on ctx cancellation and deregister; one-shot
 // callers (cmd/warden-cn-agent once mode) call Close after RunOnce returns.
@@ -207,9 +224,10 @@ func (a *Agent) Close() {
 }
 
 // RunOnce executes one complete cycle: probe → dns sync → heartbeat → apply
-// reply → write state file. It returns nil unless the agent deregistered
-// (errAgentDeregistered); every other failure is logged and retried next cycle
-// by Run.
+// reply → write state file. It returns errAgentDeregistered after a completed
+// deregister and errAgentUpgraded after a completed self-upgrade (either the
+// command or the auto-follow target-version check); every other failure is
+// logged and retried next cycle by Run.
 func (a *Agent) RunOnce(ctx context.Context) error {
 	// systemd watchdog ping, once per cycle. Task 8 replaces the default
 	// no-op with SDNotify; keep this exactly once per cycle so the
@@ -264,8 +282,27 @@ func (a *Agent) RunOnce(ctx context.Context) error {
 		a.mu.Lock()
 		a.lastCommand = &res
 		a.mu.Unlock()
-		if res.OK && cmd.Action == cmdActionDeregister {
+		if res.OK && (cmd.Action == cmdActionDeregister || cmd.Action == cmdActionSelfUpgrade) {
 			break // the process is about to exit; nothing after teardown matters
+		}
+	}
+
+	// 5b. Auto-follow / target version (spec §6.1: agent 仅在目标版本与本地
+	// 不一致时执行自升级). Every heartbeat reply names the gateway's desired
+	// agent version; when it differs from the running binary, run the same
+	// upgrade path as the self-upgrade command and exit cleanly on success
+	// (systemd Restart=always picks up the new binary). A failed download or
+	// checksum must NOT exit (spec §8 安全网第 6 条: 本次不动，下个心跳重试) —
+	// only a completed swap trips the sentinel. Skipped when the command loop
+	// already upgraded (avoid a duplicate download) or deregistered (the
+	// machine is leaving; no more upgrades).
+	if !a.deregisteredSnapshot() && !a.upgradedSnapshot() {
+		if tv := strings.TrimSpace(reply.TargetVersion); tv != "" && tv != version.Version {
+			res := CommandResult{Action: cmdActionSelfUpgrade}
+			res.OK, res.Detail = a.doUpgrade(ctx, tv)
+			a.mu.Lock()
+			a.lastCommand = &res
+			a.mu.Unlock()
 		}
 	}
 
@@ -276,14 +313,18 @@ func (a *Agent) RunOnce(ctx context.Context) error {
 	if a.deregisteredSnapshot() {
 		return errAgentDeregistered
 	}
+	if a.upgradedSnapshot() {
+		return errAgentUpgraded
+	}
 	return nil
 }
 
 // Run drives cycles forever: the first cycle starts immediately (bootstrap
 // waits for state.json to appear), then every wait is HeartbeatSeconds scaled
 // by a ±20% jitter so fleets of CN machines do not hammer the gateway in
-// lockstep. It returns nil on ctx cancellation and after a deregister, and
-// keeps looping through any other cycle error.
+// lockstep. It returns nil on ctx cancellation, after a deregister and after
+// a completed self-upgrade (the clean exit lets systemd Restart=always start
+// the new binary), and keeps looping through any other cycle error.
 func (a *Agent) Run(ctx context.Context) error {
 	base := a.cfg.HeartbeatSeconds
 	if base <= 0 {
@@ -293,6 +334,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		err := a.RunOnce(ctx)
 		if errors.Is(err, errAgentDeregistered) {
 			a.log.Infof("agent deregistered, exiting")
+			a.shutdown()
+			return nil
+		}
+		if errors.Is(err, errAgentUpgraded) {
+			a.log.Infof("agent upgraded to %s, exiting for systemd restart", a.targetVersionSnapshot())
 			a.shutdown()
 			return nil
 		}
@@ -477,6 +523,35 @@ func (a *Agent) boundDNSListen() string {
 	return a.dnsListen
 }
 
+// doUpgrade dispatches one self-upgrade through the upgradeFn hook toward
+// target (empty falls back to the last heartbeat's target_version) and marks
+// the agent upgraded once the swap completed. The (ok, detail) pair feeds
+// CommandResult: ok=true means the binary on disk was replaced and the
+// process should exit for the systemd restart (RunOnce trips the sentinel);
+// ok=false leaves the agent running and the failure is reported via
+// last_command (the next cycle retries, spec §6.1).
+func (a *Agent) doUpgrade(ctx context.Context, target string) (bool, string) {
+	if a.upgradeFn == nil {
+		return false, "not wired yet" // Task 7 wires upgradeFn
+	}
+	target = strings.TrimSpace(target)
+	if target == "" {
+		a.mu.Lock()
+		target = a.targetVersion
+		a.mu.Unlock()
+	}
+	if err := a.upgradeFn(ctx, target); err != nil {
+		return false, err.Error()
+	}
+	// upgradeFn returning nil means SelfUpgrade finished the on-disk swap.
+	// From here the only sane move is to exit so systemd starts the new
+	// binary; RunOnce turns the flag into errAgentUpgraded.
+	a.mu.Lock()
+	a.upgraded = true
+	a.mu.Unlock()
+	return true, "upgrade to " + target + " installed, exiting for restart"
+}
+
 // runCommand executes one gateway command. sync-domains and deregister are
 // handled fully here; self-upgrade and self-check dispatch through the
 // upgradeFn/checkFn hooks that Tasks 7/8 wire (nil default reports
@@ -502,24 +577,8 @@ func (a *Agent) runCommand(ctx context.Context, cmd Command) CommandResult {
 		res.Detail = fmt.Sprintf("applied %d domains (hash %s)", len(domains), hash)
 
 	case cmdActionSelfUpgrade:
-		if a.upgradeFn == nil {
-			res.OK = false
-			res.Detail = "not wired yet" // Task 7 wires upgradeFn
-			return res
-		}
-		target := strings.TrimSpace(cmd.Params["version"])
-		if target == "" {
-			a.mu.Lock()
-			target = a.targetVersion
-			a.mu.Unlock()
-		}
-		if err := a.upgradeFn(ctx, target); err != nil {
-			res.OK = false
-			res.Detail = err.Error()
-			return res
-		}
-		res.OK = true
-		res.Detail = "upgrade to " + target + " started"
+		res.OK, res.Detail = a.doUpgrade(ctx, cmd.Params["version"])
+		return res
 
 	case cmdActionSelfCheck:
 		if a.checkFn == nil {
@@ -744,6 +803,12 @@ func (a *Agent) deregisteredSnapshot() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.deregistered
+}
+
+func (a *Agent) upgradedSnapshot() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.upgraded
 }
 
 func (a *Agent) proxyRunning() bool {

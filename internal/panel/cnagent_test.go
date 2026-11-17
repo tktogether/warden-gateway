@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -148,6 +149,47 @@ func TestAgentEnrollFlow(t *testing.T) {
 	if rec := postAgentJSON(t, srv, srv.cfg.PanelPath+"/api/agent/enroll", "", huge); rec.Code != http.StatusBadRequest {
 		t.Fatalf("oversized enroll body status %d, want 400", rec.Code)
 	}
+}
+
+// TestAgentEnrollRateLimited pins the per-IP enroll limiter (final review fix
+// 4): /api/agent/enroll is unauthenticated and audited per attempt, so an
+// anonymous flood must be capped — five rapid attempts from one IP are still
+// processed (403 for the bad token), the sixth gets 429 before the registry
+// is touched, and over-limit attempts write no audit line (bounding audit.log
+// is the point of the limiter).
+func TestAgentEnrollRateLimited(t *testing.T) {
+	srv, _ := newAgentPanel(t)
+	body := map[string]string{"enroll_token": "deadbeef", "hostname": "flood"}
+
+	for i := 1; i <= 5; i++ {
+		rec := do(t, srv, "POST", "/api/agent/enroll", body, nil, "")
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("attempt %d status %d, want 403 (still within the per-IP budget)", i, rec.Code)
+		}
+	}
+	rec := do(t, srv, "POST", "/api/agent/enroll", body, nil, "")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("6th rapid attempt status %d, want 429", rec.Code)
+	}
+
+	before := countAuditActions(t, srv, "cn.enroll")
+	rec = do(t, srv, "POST", "/api/agent/enroll", body, nil, "")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("7th rapid attempt status %d, want 429", rec.Code)
+	}
+	if after := countAuditActions(t, srv, "cn.enroll"); after != before {
+		t.Errorf("audit cn.enroll lines %d -> %d, want unchanged (over-limit attempts must not be audited)", before, after)
+	}
+}
+
+// countAuditActions counts audit log entries whose action field equals action.
+func countAuditActions(t *testing.T, srv *Server, action string) int {
+	t.Helper()
+	raw, err := os.ReadFile(srv.auditPath)
+	if err != nil {
+		return 0
+	}
+	return strings.Count(string(raw), `"action":"`+action+`"`)
 }
 
 func TestAgentHeartbeatRoundTrip(t *testing.T) {

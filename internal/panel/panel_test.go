@@ -506,10 +506,28 @@ func TestCNCommandsServesLiveDomains(t *testing.T) {
 	if slices.Contains(payload.Domains, "github.com") {
 		t.Fatalf("domains %v still contains a removed default", payload.Domains)
 	}
-	wantURL := "http://127.0.0.1:18080/github.com/tktogether/warden-gateway/releases/download/v" + version.Version + "/warden-cn-agent-linux-amd64"
-	if payload.AgentBinaryURL != wantURL {
-		t.Fatalf("agent_binary_url = %q, want %q", payload.AgentBinaryURL, wantURL)
+	// agent_binary_url must carry exactly one "v" prefix on the release tag:
+	// CI stamps version.Version with a "v" ("v1.6.0") while dev builds are
+	// unstamped ("1.6.0"), and both must land on the same single-v URL. Stamp
+	// a fixed test version and cover both forms (computing the expectation
+	// from version.Version itself would be circular).
+	stampedURL := "http://127.0.0.1:18080/github.com/tktogether/warden-gateway/releases/download/v9.9.9/warden-cn-agent-linux-amd64"
+	origVersion := version.Version
+	t.Cleanup(func() { version.Version = origVersion })
+	for _, stamp := range []string{"v9.9.9", "9.9.9"} {
+		version.Version = stamp
+		rec = do(t, srv, "GET", "/warden/api/cn", nil, cookie, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("cn status %d: %s", rec.Code, rec.Body)
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.AgentBinaryURL != stampedURL {
+			t.Fatalf("agent_binary_url with version.Version=%q = %q, want %q", stamp, payload.AgentBinaryURL, stampedURL)
+		}
 	}
+	version.Version = origVersion
 	// An empty configured list falls back to the built-in defaults.
 	srv.cfg.DNS.Domains = nil
 	rec = do(t, srv, "GET", "/warden/api/cn", nil, cookie, "")
