@@ -14,7 +14,6 @@ import (
 	"github.com/tktogether/warden-gateway/internal/auth"
 	"github.com/tktogether/warden-gateway/internal/cnagent"
 	"github.com/tktogether/warden-gateway/internal/config"
-	"github.com/tktogether/warden-gateway/internal/version"
 )
 
 // cnBeatMinInterval is the minimum gap between two heartbeats of the same
@@ -227,7 +226,12 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	desired := ""
 	if machine.AutoFollow {
-		desired = version.Version
+		desired = AgentBinaryVersion()
+	}
+	// An operator pin (rollback or explicit upgrade) outranks auto-follow: the
+	// machine stays on the requested build until the pin is cleared.
+	if pinned := normalizeAgentVersion(machine.DesiredVersion); pinned != "" {
+		desired = pinned
 	}
 	if err := s.cnReg.UpdateReport(machine.ID, reportMap, desired); err != nil {
 		writeError(w, http.StatusInternalServerError, "persist report failed")
@@ -241,7 +245,14 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 	for i, cmd := range dispatched {
 		commands[i] = cnagent.Command{ID: cmd.ID, Action: cmd.Action, Params: cmd.Params}
 		if cmd.Action == cnCmdSelfUpgrade {
-			targetVersion = version.Version
+			// An explicit upgrade command names its own target (default: this
+			// gateway's version), so the operator can also roll a machine back
+			// to a cached older build.
+			if v := normalizeAgentVersion(cmd.Params["version"]); v != "" {
+				targetVersion = v
+			} else {
+				targetVersion = AgentBinaryVersion()
+			}
 		}
 		if cmd.Action == cnCmdDeregister {
 			deregistered = true
@@ -349,7 +360,14 @@ func (s *Server) handleCNMachines(w http.ResponseWriter, r *http.Request) {
 	for _, m := range machines {
 		rows = append(rows, newCNMachineRow(m, now))
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"as_of": config.NowUTC(), "machines": rows})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"as_of":    config.NowUTC(),
+		"machines": rows,
+		// Cached builds the operator may pin a machine to (upgrade or roll
+		// back), newest first, plus the version this gateway runs.
+		"cached_versions": s.CachedAgentVersions(),
+		"gateway_version": AgentBinaryVersion(),
+	})
 }
 
 // handleCNMachineItem dispatches /api/cnmachines/… sub-paths: the enroll-token
@@ -419,7 +437,8 @@ func (s *Server) handleCNMachineCommand(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	var body struct {
-		Action string `json:"action"`
+		Action  string `json:"action"`
+		Version string `json:"version"`
 	}
 	if err := readJSON(w, r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -431,8 +450,17 @@ func (s *Server) handleCNMachineCommand(w http.ResponseWriter, r *http.Request, 
 	}
 	params := map[string]string{}
 	if body.Action == cnCmdSelfUpgrade {
-		// The gateway pins the upgrade to its own version.
-		params["version"] = version.Version
+		// An operator may name a cached build (that is how a machine is rolled
+		// back); without a version the gateway pins its own.
+		want := normalizeAgentVersion(body.Version)
+		if want == "" {
+			want = AgentBinaryVersion()
+		}
+		if !s.CachedAgentVersion(want) {
+			writeError(w, http.StatusBadRequest, "version "+want+" is not cached on this gateway")
+			return
+		}
+		params["version"] = want
 	}
 	if err := s.cnReg.QueueCommand(id, body.Action, params); err != nil {
 		if errors.Is(err, ErrUnknownMachine) {

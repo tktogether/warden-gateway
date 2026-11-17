@@ -1540,6 +1540,13 @@
       badges.appendChild(statusPill('探测 —', ''));
     }
     if (Number(m.pending) > 0) { badges.appendChild(statusPill('待执行 ' + m.pending, 'warn')); }
+    // A machine whose running version differs from its target has work pending:
+    // either an upgrade the panel queued, or a rollback the operator pinned.
+    var gatewayVersion = (state.cnmachines && state.cnmachines.gateway_version) || '';
+    if (m.desired_version && m.version && m.desired_version !== m.version) {
+      var rollback = gatewayVersion && m.desired_version !== gatewayVersion;
+      badges.appendChild(statusPill((rollback ? '已钉版本 ' : '待升级 ') + m.desired_version, 'warn'));
+    }
     head.appendChild(badges);
     card.appendChild(head);
 
@@ -1578,8 +1585,29 @@
     var upgrade = el('button', 'btn small', '升级');
     upgrade.type = 'button';
     upgrade.addEventListener('click', function () {
-      confirmDialog('升级 agent', '将向 ' + cnMachineName(m) + ' 下发升级命令，agent 会升级到网关当前版本并自动重启。确认继续？').then(function (yes) {
-        if (yes) { cnMachineCommand(m, 'self-upgrade', upgrade); }
+      var cached = (state.cnmachines && state.cnmachines.cached_versions) || [];
+      var current = (state.cnmachines && state.cnmachines.gateway_version) || '';
+      // Only cached builds can be served, so the choices are the cache menu:
+      // the gateway's own version by default, any older one is a rollback.
+      var options = cached.length ? cached : (current ? [current] : []);
+      var chosen = m.desired_version || current || (options[0] || '');
+      var body = el('div');
+      if (!options.length) {
+        body.appendChild(el('p', 'muted', '本网关没有缓存的 agent 构建，请先在网关重新执行一次安装/升级以填充缓存。'));
+        confirmDialog('升级 agent', body).then(function () {});
+        return;
+      }
+      body.appendChild(el('p', null, '选择 ' + cnMachineName(m) + ' 要安装的 agent 版本。低于网关版本即为回退；机器会下载、校验并重启。'));
+      var select = el('select', 'input');
+      options.forEach(function (v) {
+        var opt = el('option', null, v + (v === current ? '（网关当前）' : (v === m.version ? '（正在运行）' : '')));
+        opt.value = v;
+        if (v === chosen) { opt.selected = true; }
+        select.appendChild(opt);
+      });
+      body.appendChild(select);
+      confirmDialog('升级 agent', body).then(function (yes) {
+        if (yes) { cnMachineCommand(m, 'self-upgrade', upgrade, select.value); }
       });
     });
     actions.appendChild(upgrade);
@@ -1648,10 +1676,12 @@
     return box;
   }
 
-  async function cnMachineCommand(m, action, button) {
+  async function cnMachineCommand(m, action, button, version) {
     setBusy(button, true);
     try {
-      await api('/api/cnmachines/' + encodeURIComponent(m.id) + '/command', { method: 'POST', body: { action: action } });
+      var body = { action: action };
+      if (version) { body.version = version; }
+      await api('/api/cnmachines/' + encodeURIComponent(m.id) + '/command', { method: 'POST', body: body });
       showToast('已下发' + cnActionLabel(action) + '命令，等待 ' + cnMachineName(m) + ' 心跳执行');
       loadCnmachines({ silent: true });
     } catch (err) {
@@ -2181,7 +2211,14 @@
       var body = qs('#modal-body');
       clear(body);
       titleEl.textContent = title;
-      add(body, el('p', '', message));
+      // A string gets wrapped in a paragraph; a DOM node is appended as-is so
+      // dialogs can host controls (e.g. the agent version picker). Nodes are
+      // only ever built by our own el() helper, never from machine data.
+      if (typeof message === 'string') {
+        add(body, el('p', '', message));
+      } else if (message) {
+        body.appendChild(message);
+      }
       var actions = el('div', 'form-actions');
       var cancel = el('button', 'btn', '取消');
       cancel.type = 'button';

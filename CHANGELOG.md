@@ -10,7 +10,8 @@
 - 网关 `/api/agent/*`：`POST /api/agent/enroll` 用一次性 enroll token 换发 machine token（随机 32 字节，网关只存 SHA-256 摘要，agent 端 0600）；`POST /api/agent/heartbeat` 返回命令队列、域名列表与目标版本。注册表、token 摘要、待执行命令、机器快照与事件 journal 持久化到 `<DataDir>/cn-agents.json`（0600），网关重启或升级不丢已注册机器，纳入现有备份/恢复；所有 agent 管理操作进审计日志。
 - 面板新增「国内机」页：每台机器的在线/离线状态、健康分类、版本、磁盘/内存/负载、容器与应用摘要、最后心跳时间；操作按钮为立即同步、自检、升级、注销——没有远程重启或整机 reboot 入口。注册流程：面板生成一次性 enroll token 与安装命令，国内机执行后自动出现在列表。
 - 分流域名在线编辑：面板「设置」页新增分流域名编辑器，保存后写入 `cfg.DNS.Domains` 成为运行时唯一事实源，自动补进 SNI 透传列表保证每个分流域名都被覆盖，随服务重启生效并在心跳周期内下发到所有在线 agent，全程无需发版。
-- CI：GitHub Release 在网关二进制之外同时发布 `warden-cn-agent-linux-amd64` / `-arm64` / `-arm` 二进制、`.sha256` 侧车与 tar.gz。网关安装/升级时把这些构建预取到 `$SCRIPT_DIR/agent/`，由 `GET /api/agent/binary/{version}/{arch}` **自托管**对外分发，国内机安装与升级都只连网关。
+- CI：GitHub Release 在网关二进制之外同时发布 `warden-cn-agent-linux-amd64` / `-arm64` / `-arm` 二进制、`.sha256` 侧车与 tar.gz。网关安装/升级时把这些构建预取到 `$SCRIPT_DIR/agent/<version>/`（保留最近 3 个版本），由 `GET /api/agent/binary/{version}/{arch}` **自托管**对外分发，国内机安装与升级都只连网关。
+- 多版本与回退：面板「升级」可选择任意已缓存版本，低于网关版本即回退；目标版本优先级为「操作员 pin > 自动跟随 > 保持现状」，未缓存版本直接拒绝。agent 替换二进制前记录待验证版本，systemd 崩溃回退守卫把它转成「已阻止版本」，恢复后的旧 agent 不再自动重试同一坏包（避免升级回滚循环），只有面板显式升级才清除阻止。
 
 ### 改进
 

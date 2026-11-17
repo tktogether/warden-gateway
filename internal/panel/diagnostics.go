@@ -125,7 +125,7 @@ func (s *Server) handleCNCommands(w http.ResponseWriter, r *http.Request) {
 	// agent_binary_url points the CN machine at this gateway's own cached agent
 	// build, so install and upgrade never touch GitHub directly. Without an
 	// origin there is nothing to point at and the URL stays empty.
-	agentBinaryURL := agentBinaryURL(origin, "amd64")
+	agentBinaryURL := agentBinaryURL(origin, AgentBinaryVersion(), "amd64")
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"as_of":                config.NowUTC(),
 		"origin":               origin,

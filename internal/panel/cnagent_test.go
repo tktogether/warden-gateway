@@ -589,6 +589,8 @@ func TestEnrollTokenAndList(t *testing.T) {
 
 func TestQueueUpgradeCommandSetsVersion(t *testing.T) {
 	srv, key := newAgentPanel(t)
+	srv.scriptDir = t.TempDir()
+	cacheAgentBuild(t, srv, AgentBinaryVersion(), "amd64", []byte("current"))
 	cookie, csrf := login(t, srv, key)
 	id, _ := enrollMachine(t, srv, "edge-01")
 
@@ -612,7 +614,8 @@ func TestQueueUpgradeCommandSetsVersion(t *testing.T) {
 		t.Fatalf("command status %d: %s", rec.Code, rec.Body)
 	}
 
-	// The queued command carries the gateway's own version as target.
+	// The queued command carries the gateway's own version as target (compared
+	// in normalized, v-less form: that is the cache path segment).
 	m := srv.cnReg.MachineByID(id)
 	if m == nil || len(m.Pending) != 1 {
 		t.Fatalf("pending queue = %+v, want one command", m)
@@ -620,16 +623,18 @@ func TestQueueUpgradeCommandSetsVersion(t *testing.T) {
 	if m.Pending[0].Action != "self-upgrade" {
 		t.Errorf("queued action = %q, want self-upgrade", m.Pending[0].Action)
 	}
-	if got := m.Pending[0].Params["version"]; got != version.Version {
-		t.Errorf("queued params.version = %q, want %q", got, version.Version)
+	if got := m.Pending[0].Params["version"]; got != AgentBinaryVersion() {
+		t.Errorf("queued params.version = %q, want %q", got, AgentBinaryVersion())
 	}
 
-	// The list shows one pending command without leaking its params.
+	// The list shows one pending command without leaking its params. The
+	// top-level gateway_version/cached_versions fields legitimately name builds,
+	// so the check targets the params payload itself.
 	_, rec = cnMachineList(t, srv, cookie)
 	if !strings.Contains(rec.Body.String(), "\"pending\":1") {
 		t.Errorf("list does not report the pending command: %s", rec.Body)
 	}
-	if strings.Contains(rec.Body.String(), version.Version) {
+	if strings.Contains(rec.Body.String(), `"params"`) || strings.Contains(rec.Body.String(), `"version":"`+AgentBinaryVersion()+`"`) {
 		t.Errorf("list leaks command params: %s", rec.Body)
 	}
 }
@@ -827,5 +832,85 @@ func TestMachineListConcurrentWithHeartbeats(t *testing.T) {
 	list, _ := cnMachineList(t, srv, cookie)
 	if len(list.Machines) != 1 || !list.Machines[0].Online {
 		t.Fatalf("list after concurrent runs = %+v, want one online machine", list.Machines)
+	}
+}
+
+// TestPinnedVersionOutranksAutoFollow pins the rollback/gray-release contract:
+// a version pinned by the operator wins over auto-follow, so a machine keeps
+// the requested build instead of being dragged onto the gateway's version on
+// the next heartbeat.
+func TestPinnedVersionOutranksAutoFollow(t *testing.T) {
+	srv, key := newAgentPanel(t)
+	srv.minBeatInterval = 0 // two beats in one test must not trip the limiter
+	cookie, csrf := login(t, srv, key)
+	id, token := enrollMachine(t, srv, "pinned-host")
+	if rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/auto-follow",
+		map[string]any{"enabled": true}, cookie, csrf); rec.Code != http.StatusOK {
+		t.Fatalf("auto-follow status %d: %s", rec.Code, rec.Body)
+	}
+	if err := srv.cnReg.SetDesiredVersion(id, "1.5.3"); err != nil {
+		t.Fatal(err)
+	}
+	rec := postAgentJSON(t, srv, srv.cfg.PanelPath+"/api/agent/heartbeat", token, heartbeatReport(srv, id))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("heartbeat status %d: %s", rec.Code, rec.Body)
+	}
+	var reply cnagent.HeartbeatReply
+	if err := json.Unmarshal(rec.Body.Bytes(), &reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply.TargetVersion != "1.5.3" {
+		t.Fatalf("target_version = %q, want the pinned 1.5.3 (auto-follow must not override a pin)", reply.TargetVersion)
+	}
+
+	// Clearing the pin hands control back to auto-follow.
+	if err := srv.cnReg.SetDesiredVersion(id, ""); err != nil {
+		t.Fatal(err)
+	}
+	rec = postAgentJSON(t, srv, srv.cfg.PanelPath+"/api/agent/heartbeat", token, heartbeatReport(srv, id))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("heartbeat status %d: %s", rec.Code, rec.Body)
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply.TargetVersion != AgentBinaryVersion() {
+		t.Fatalf("target_version = %q, want the gateway version %q after clearing the pin", reply.TargetVersion, AgentBinaryVersion())
+	}
+}
+
+// TestUpgradeCommandRejectsUncachedVersion pins that an operator cannot point a
+// machine at a build this gateway cannot serve (which would 404 forever).
+func TestUpgradeCommandRejectsUncachedVersion(t *testing.T) {
+	srv, key := newAgentPanel(t)
+	srv.scriptDir = t.TempDir()
+	cookie, csrf := login(t, srv, key)
+	id, _ := enrollMachine(t, srv, "uncached-host")
+	rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/command",
+		map[string]any{"action": "self-upgrade", "version": "0.0.1"}, cookie, csrf)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for an uncached version (body %s)", rec.Code, rec.Body)
+	}
+}
+
+// TestUpgradeCommandPinsCachedVersion pins the rollback path: choosing a cached
+// older build queues a self-upgrade carrying that version.
+func TestUpgradeCommandPinsCachedVersion(t *testing.T) {
+	srv, key := newAgentPanel(t)
+	srv.scriptDir = t.TempDir()
+	cookie, csrf := login(t, srv, key)
+	id, _ := enrollMachine(t, srv, "rollback-host")
+	cacheAgentBuild(t, srv, "1.5.3", "amd64", []byte("old"))
+	rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/command",
+		map[string]any{"action": "self-upgrade", "version": "1.5.3"}, cookie, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body)
+	}
+	m := srv.cnReg.MachineByID(id)
+	if m == nil || len(m.Pending) == 0 {
+		t.Fatal("expected a queued self-upgrade command")
+	}
+	if got := m.Pending[0].Params["version"]; got != "1.5.3" {
+		t.Fatalf("queued version = %q, want 1.5.3", got)
 	}
 }

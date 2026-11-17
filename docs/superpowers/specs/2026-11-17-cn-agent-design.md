@@ -95,8 +95,10 @@ agent 自己监听 198.18.0.1:53，分流域名答网关 IP、其余转发上游
 
 - `POST /api/agent/enroll`：一次性 enroll token + 机器信息 → 颁发 machine token（随机 32 字节，网关只存 SHA-256 摘要）。enroll token 用后即焚。
 - `POST /api/agent/heartbeat`：认证后接收上报，返回命令队列 + 域名列表 + agent 版本。连续 3 个周期（30 秒）无心跳判定离线。每 token 限流。
-- `GET /api/agent/binary/{version}/{arch}[.sha256]`：**自托管** agent 缓存构建。内容来自 ScriptDir 下的 `agent/` 目录，由安装/升级时的 `cache_agent_binaries` 预取（三种架构 + 裸 hex 侧车）。两段路径都走白名单，非缓存版本一律 404；无需认证（bootstrap 在拿到 token 前就要下载，内容是公开构建产物）。国内机因此只连网关，不必访问 GitHub。
+- `GET /api/agent/binary/{version}/{arch}[.sha256]`：**自托管** agent 缓存构建。内容来自 `$SCRIPT_DIR/agent/<version>/`，由安装/升级时的 `cache_agent_binaries` 预取（三种架构 + 裸 hex 侧车，保留最近 3 个版本）。两段路径都走白名单 + 版本格式校验，未缓存版本一律 404；无需认证（bootstrap 在拿到 token 前就要下载，内容是公开构建产物）。国内机因此只连网关，不必访问 GitHub。多版本目录是灰度与回退的前提：面板可把某台机器钉在任意已缓存版本上。
 - **升级策略（已决策，2026-11-17）**：默认手动——面板逐台点「升级」才设置该机器的目标版本；每台机器可单独打开「自动跟随网关版本」开关（默认关）。生产机上不会出现无人触发的二进制替换。
+- **目标版本优先级**：操作员 pin（显式升级或回退选定的版本）> AutoFollow（网关自身版本）> 空（机器保持现状）。选中任何**已缓存**版本即为合法意图，低于网关版本就是回退；未缓存版本直接 400，避免机器反复 404。
+- **升级回滚循环守卫**：agent 在替换二进制退出前写 `upgrade-pending`（待验证版本）；systemd `ExecStartPre` 守卫连续两次崩溃回退时，把它转成 `upgrade-blocked`。恢复后的 agent 看到被阻止版本就不再自动重试（否则同一坏包会无限重启），只在面板显式下发 `self-upgrade` 时清除阻止。
 - **持久化**：注册表、machine token 摘要、待执行命令队列、每台机器的最新快照与事件 journal 落盘到 DataDir 独立状态文件（0600），并纳入现有备份/恢复流程；内存仅作运行缓存。网关重启或升级不得丢失已注册机器——否则国内机就得登机重跑 enroll，直接违背"全程无需登录国内机"。所有 agent 管理操作进 audit log。
 
 ### 6.3 面板

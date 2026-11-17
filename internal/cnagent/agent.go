@@ -189,6 +189,11 @@ func New(cfg *Config, log *logging.Logger) (*Agent, error) {
 		return SelfCheck(context.Background(), &ccfg, a.statePath)
 	}
 
+	// A pending marker means the previous process exited to validate a freshly
+	// installed build; reaching this line means that build started, so the
+	// guard has nothing to roll back and the marker can go.
+	a.clearUpgradePending()
+
 	return a, nil
 }
 
@@ -298,11 +303,21 @@ func (a *Agent) RunOnce(ctx context.Context) error {
 	// machine is leaving; no more upgrades).
 	if !a.deregisteredSnapshot() && !a.upgradedSnapshot() {
 		if tv := strings.TrimSpace(reply.TargetVersion); tv != "" && tv != version.Version {
-			res := CommandResult{Action: cmdActionSelfUpgrade}
-			res.OK, res.Detail = a.doUpgrade(ctx, tv)
-			a.mu.Lock()
-			a.lastCommand = &res
-			a.mu.Unlock()
+			if a.upgradeBlocked(tv) {
+				// This build already crashed twice here and the guard rolled it
+				// back. Retrying the same automatic upgrade would loop forever;
+				// wait for an operator to override it (a self-upgrade command).
+				res := CommandResult{Action: cmdActionSelfUpgrade, Detail: "upgrade to " + tv + " is blocked after a rollback (manual upgrade required)"}
+				a.mu.Lock()
+				a.lastCommand = &res
+				a.mu.Unlock()
+			} else {
+				res := CommandResult{Action: cmdActionSelfUpgrade}
+				res.OK, res.Detail = a.doUpgrade(ctx, tv)
+				a.mu.Lock()
+				a.lastCommand = &res
+				a.mu.Unlock()
+			}
 		}
 	}
 
@@ -546,6 +561,12 @@ func (a *Agent) doUpgrade(ctx context.Context, target string) (bool, string) {
 	// upgradeFn returning nil means SelfUpgrade finished the on-disk swap.
 	// From here the only sane move is to exit so systemd starts the new
 	// binary; RunOnce turns the flag into errAgentUpgraded.
+	//
+	// The build is on disk but not proven yet: the ExecStartPre guard rolls it
+	// back if it crashes twice. Record which build is under test so that a
+	// rollback can be attributed to it and become a block instead of a retry
+	// loop (upgradeguard.go).
+	a.markUpgradePending(target)
 	a.mu.Lock()
 	a.upgraded = true
 	a.mu.Unlock()
@@ -577,6 +598,11 @@ func (a *Agent) runCommand(ctx context.Context, cmd Command) CommandResult {
 		res.Detail = fmt.Sprintf("applied %d domains (hash %s)", len(domains), hash)
 
 	case cmdActionSelfUpgrade:
+		// An explicit command is a human decision: it overrides an earlier
+		// automatic rollback of the same build.
+		if v := strings.TrimSpace(cmd.Params["version"]); v != "" && a.upgradeBlocked(v) {
+			a.clearUpgradeBlock("manual self-upgrade command")
+		}
 		res.OK, res.Detail = a.doUpgrade(ctx, cmd.Params["version"])
 		return res
 

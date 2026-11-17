@@ -23,6 +23,22 @@ func agentBinaryPanel(t *testing.T) (*Server, string) {
 	return srv, key
 }
 
+// cacheAgentBuild writes one cached build (binary + sidecar) for a version,
+// reproducing the on-disk layout of cache_agent_binaries.
+func cacheAgentBuild(t *testing.T, srv *Server, ver, arch string, body []byte) {
+	t.Helper()
+	dir := filepath.Join(srv.scriptDir, agentAssetDirName, normalizeAgentVersion(ver))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "warden-cn-agent-linux-"+arch), body, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "warden-cn-agent-linux-"+arch+".sha256"), []byte("abc123\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestAgentBinaryServesCachedBuild pins the self-hosted distribution path:
 // /api/agent/binary/{version}/{arch}[.sha256] serves the cached release asset
 // without authentication (bootstrap.sh fetches it before it holds a token),
@@ -30,15 +46,9 @@ func agentBinaryPanel(t *testing.T) (*Server, string) {
 // cannot read arbitrary files.
 func TestAgentBinaryServesCachedBuild(t *testing.T) {
 	srv, _ := agentBinaryPanel(t)
-	assetDir := filepath.Join(srv.scriptDir, agentAssetDirName)
 	ver := AgentBinaryVersion()
 	binary := []byte("\x7fELF fake agent build")
-	if err := os.WriteFile(filepath.Join(assetDir, "warden-cn-agent-linux-amd64"), binary, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(assetDir, "warden-cn-agent-linux-amd64.sha256"), []byte("abc123\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	cacheAgentBuild(t, srv, ver, "amd64", binary)
 
 	cases := []struct {
 		name       string
@@ -87,8 +97,52 @@ func TestAgentBinaryMissingCacheIsExplicit(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
-	if got := rec.Body.String(); got == "" || !contains(got, "not cached") {
+	if got := rec.Body.String(); got == "" || !contains(got, "no cached agent build") {
 		t.Fatalf("body = %q, want an explanation mentioning the missing cache", got)
+	}
+}
+
+// TestAgentBinaryServesAnyCachedVersion pins the multi-version contract: a
+// machine may be pinned to (or rolled back onto) any build the operator has
+// cached, not just the gateway's own.
+func TestAgentBinaryServesAnyCachedVersion(t *testing.T) {
+	srv, _ := agentBinaryPanel(t)
+	cacheAgentBuild(t, srv, AgentBinaryVersion(), "amd64", []byte("current"))
+	cacheAgentBuild(t, srv, "1.5.3", "amd64", []byte("older"))
+
+	if got := do(t, srv, "GET", "/api/agent/binary/1.5.3/amd64", nil, nil, ""); got.Code != http.StatusOK || got.Body.String() != "older" {
+		t.Fatalf("older build: status %d body %q, want 200 %q", got.Code, got.Body.String(), "older")
+	}
+	if got := do(t, srv, "GET", "/api/agent/binary/v1.5.3/amd64", nil, nil, ""); got.Code != http.StatusOK || got.Body.String() != "older" {
+		t.Fatalf("v-prefixed older build: status %d body %q, want 200 %q", got.Code, got.Body.String(), "older")
+	}
+	// A version nobody cached stays a 404 rather than a stale fallback.
+	if got := do(t, srv, "GET", "/api/agent/binary/1.4.0/amd64", nil, nil, ""); got.Code != http.StatusNotFound {
+		t.Fatalf("uncached version: status %d, want 404", got.Code)
+	}
+}
+
+// TestCachedAgentVersionsListsNewestFirst pins the panel's pin/rollback menu.
+func TestCachedAgentVersionsListsNewestFirst(t *testing.T) {
+	srv, _ := agentBinaryPanel(t)
+	for _, v := range []string{"1.5.3", "1.10.0", "1.6.0"} {
+		cacheAgentBuild(t, srv, v, "amd64", []byte(v))
+	}
+	got := srv.CachedAgentVersions()
+	want := []string{"1.10.0", "1.6.0", "1.5.3"}
+	if len(got) != len(want) {
+		t.Fatalf("CachedAgentVersions = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("CachedAgentVersions = %v, want %v", got, want)
+		}
+	}
+	if !srv.CachedAgentVersion("v1.5.3") {
+		t.Fatal("CachedAgentVersion should accept a v-prefixed version")
+	}
+	if srv.CachedAgentVersion("9.9.9") {
+		t.Fatal("CachedAgentVersion must reject an uncached version")
 	}
 }
 
@@ -112,10 +166,13 @@ func TestAgentBinaryURLShape(t *testing.T) {
 	orig := version.Version
 	t.Cleanup(func() { version.Version = orig })
 	version.Version = "v9.9.9"
-	if got, want := agentBinaryURL("http://gw.example.com/", "arm64"), "http://gw.example.com/api/agent/binary/9.9.9/arm64"; got != want {
+	if got, want := agentBinaryURL("http://gw.example.com/", "9.9.9", "arm64"), "http://gw.example.com/api/agent/binary/9.9.9/arm64"; got != want {
 		t.Fatalf("agentBinaryURL = %q, want %q", got, want)
 	}
-	if got := agentBinaryURL("", "amd64"); got != "" {
+	if got, want := agentBinaryURL("http://gw.example.com", "v9.9.9", "amd64"), "http://gw.example.com/api/agent/binary/9.9.9/amd64"; got != want {
+		t.Fatalf("agentBinaryURL with a v-prefixed version = %q, want %q", got, want)
+	}
+	if got := agentBinaryURL("", "9.9.9", "amd64"); got != "" {
 		t.Fatalf("empty origin should yield empty URL, got %q", got)
 	}
 }

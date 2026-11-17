@@ -144,6 +144,12 @@ func TestBootstrapAgentMode(t *testing.T) {
 		// from this gateway's cached build, never straight from GitHub.
 		"/api/agent/binary/",
 		"cache_agent_binaries",
+		// Multi-version cache + rollback loop guard: the version is a path
+		// segment, only the newest few builds are kept, and a build the guard
+		// rolled back is recorded so the agent stops retrying it.
+		"cn_prune_agent_cache",
+		"upgrade-blocked",
+		"upgrade-pending",
 	}
 	script := string(raw)
 	for _, want := range required {

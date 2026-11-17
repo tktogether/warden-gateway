@@ -500,9 +500,12 @@ install_binary() {
 # 国内机的安装与自升级因此只连本网关，不必访问 GitHub；预取失败不阻塞网关安装
 # （面板会返回 404 并提示重跑安装器），但会在输出里明确告警。
 cache_agent_binaries() {
-  local arch asset tmp ok_flag=0
-  [ "$DRY_RUN" -eq 1 ] && { printf '  + 预取 agent 构建到 %s/agent/\n' "$SCRIPT_DIR"; return 0; }
-  mkdir -p "$SCRIPT_DIR/agent" 2>/dev/null || { warn "创建 agent 缓存目录失败"; return 1; }
+  local arch asset tmp ok_flag=0 ver_dir
+  [ "$DRY_RUN" -eq 1 ] && { printf '  + 预取 agent 构建到 %s/agent/%s/\n' "$SCRIPT_DIR" "${VERSION#v}"; return 0; }
+  # 每个版本一个目录：/agent/<version>/<asset>[.sha256]。多版本才能支持灰度与
+  # 回退——把某台机器钉在旧构建上，或回滚到已缓存的版本。
+  ver_dir="$SCRIPT_DIR/agent/${VERSION#v}"
+  mkdir -p "$ver_dir" 2>/dev/null || { warn "创建 agent 缓存目录失败：$ver_dir"; return 1; }
   local base
   if [ "$VERSION" = "latest" ]; then
     base="https://github.com/$REPO/releases/latest/download"
@@ -511,7 +514,7 @@ cache_agent_binaries() {
   fi
   for arch in amd64 arm64 arm; do
     asset="warden-cn-agent-linux-$arch"
-    tmp="$SCRIPT_DIR/agent/.$asset.$$"
+    tmp="$ver_dir/.$asset.$$"
     if ! download "$base/$asset" "$tmp"; then
       rm -f "$tmp"
       warn "预取 agent 构建失败：$asset（面板将无法分发该架构的 agent）"
@@ -522,17 +525,47 @@ cache_agent_binaries() {
       warn "预取的 agent 构建为空：$asset"
       continue
     fi
-    mv -f "$tmp" "$SCRIPT_DIR/agent/$asset"
-    sha256sum "$SCRIPT_DIR/agent/$asset" 2>/dev/null | awk '{print $1}' > "$SCRIPT_DIR/agent/$asset.sha256" || {
-      rm -f "$SCRIPT_DIR/agent/$asset" "$SCRIPT_DIR/agent/$asset.sha256"
+    mv -f "$tmp" "$ver_dir/$asset"
+    sha256sum "$ver_dir/$asset" 2>/dev/null | awk '{print $1}' > "$ver_dir/$asset.sha256" || {
+      rm -f "$ver_dir/$asset" "$ver_dir/$asset.sha256"
       warn "生成 agent 校验和失败：$asset"
       continue
     }
-    chmod 0755 "$SCRIPT_DIR/agent/$asset"
-    chmod 0644 "$SCRIPT_DIR/agent/$asset.sha256"
+    chmod 0755 "$ver_dir/$asset"
+    chmod 0644 "$ver_dir/$asset.sha256"
     ok_flag=1
   done
-  [ "$ok_flag" -eq 1 ] && ok "agent 构建已缓存到 $SCRIPT_DIR/agent（国内机只连本网关下载）"
+  if [ "$ok_flag" -eq 1 ]; then
+    ok "agent 构建已缓存到 $ver_dir（国内机只连本网关下载）"
+    cn_prune_agent_cache
+  fi
+  return 0
+}
+
+# cn_prune_agent_cache 只保留最近 3 个 agent 版本目录（含本次刚缓存的）。
+# 更旧的删除，避免网关磁盘随发版无限增长；正在被机器钉住的版本若被清掉，
+# 该机器的心跳仍会指向它，下载会 404 并保持旧二进制运行（安全网第 6 条）。
+cn_prune_agent_cache() {
+  local root="$SCRIPT_DIR/agent" keep=3
+  [ -d "$root" ] || return 0
+  # 按版本号排序（sort -V 可用时用它，否则退化为字典序），删除第 keep 个之后的。
+  local dirs
+  if dirs="$(find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V)"; then
+    :
+  else
+    dirs="$(find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sed 's#.*/##' | sort)"
+  fi
+  [ -n "$dirs" ] || return 0
+  local total idx name
+  total="$(printf '%s\n' "$dirs" | wc -l)"
+  idx=0
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    idx=$((idx + 1))
+    if [ "$idx" -le $((total - keep)) ]; then
+      rm -rf "$root/$name" 2>/dev/null || true
+    fi
+  done <<< "$dirs"
   return 0
 }
 
@@ -2095,12 +2128,23 @@ cn_agent_write_guard() {
 set -u
 BIN="$CN_AGENT_BIN"
 LOG="$CN_AGENT_GUARD_LOG"
+STATE_DIR="$CN_AGENT_STATE_DIR"
 nrestarts="\$(systemctl show warden-cn-agent -p NRestarts --value 2>/dev/null || printf '0')"
 case "\$nrestarts" in ''|*[!0-9]*) nrestarts=0;; esac
 [ "\$nrestarts" -ge 2 ] || exit 0
 [ -e "\$BIN.prev" ] || exit 0
+# 回滚前先把「待验证版本」转成「已阻止版本」：恢复后的旧 agent 下次心跳会
+# 看到同一个 target_version，没有这个标记就会再装一次、再崩一次（升级回滚
+# 循环）。只有面板显式下发的 self-upgrade 命令才会清掉它。
+if [ -f "\$STATE_DIR/upgrade-pending" ]; then
+  tr -d ' \r\n' < "\$STATE_DIR/upgrade-pending" > "\$STATE_DIR/upgrade-blocked" 2>/dev/null || true
+  rm -f "\$STATE_DIR/upgrade-pending"
+fi
 if mv -f "\$BIN.prev" "\$BIN"; then
   printf '%s warden-cn-agent 连续崩溃 %s 次，已回退到上一个二进制\n' "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" "\$nrestarts" >> "\$LOG" 2>/dev/null || true
+  if [ -s "\$STATE_DIR/upgrade-blocked" ]; then
+    printf '%s 已阻止版本 %s 的自动升级（需面板手动升级）\n' "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" "\$(cat "\$STATE_DIR/upgrade-blocked")" >> "\$LOG" 2>/dev/null || true
+  fi
   systemctl reset-failed warden-cn-agent >/dev/null 2>&1 || true
 fi
 exit 0

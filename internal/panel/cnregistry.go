@@ -266,7 +266,31 @@ func (r *CNRegistry) UpdateReport(id string, report map[string]interface{}, desi
 		return ErrUnknownMachine
 	}
 	m.Report = report
-	m.DesiredVersion = desiredVersion
+	// AutoFollow keeps the machine trailing the gateway's own version; without
+	// it DesiredVersion is whatever the operator pinned (an older build for a
+	// rollback, or empty to leave the machine alone). A routine heartbeat never
+	// clears an explicit pin.
+	if desiredVersion != "" {
+		m.DesiredVersion = desiredVersion
+	}
+	return r.saveLocked()
+}
+
+// SetDesiredVersion pins the agent build a machine should run. An empty version
+// clears the pin: the machine keeps whatever it has unless AutoFollow is on.
+func (r *CNRegistry) SetDesiredVersion(machineID, ver string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := r.machineByIDLocked(machineID)
+	if m == nil {
+		return ErrUnknownMachine
+	}
+	m.DesiredVersion = ver
+	detail := ver
+	if detail == "" {
+		detail = "cleared"
+	}
+	r.appendEventLocked(m, "desired_version", detail, time.Now().UTC())
 	return r.saveLocked()
 }
 
