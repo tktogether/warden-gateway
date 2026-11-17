@@ -149,6 +149,62 @@ func TestBootstrapAgentMode(t *testing.T) {
 	}
 }
 
+// TestReleaseWorkflowAgentAssets locks the release pipeline contract that the
+// CN agent download paths depend on (bootstrap.sh cn-setup and
+// internal/cnagent upgrade.go fetch warden-cn-agent-linux-{arch} plus a
+// bare-hex .sha256 sidecar from the v{VERSION} tag): .github/workflows/
+// release.yml must build ./cmd/warden-cn-agent with the same version stamps
+// as the gateway, publish per-arch bare binaries named
+// warden-cn-agent-linux-{amd64|arm64|arm} (matrix arch armv7 maps to asset
+// arch arm), generate hash-only .sha256 sidecars, and attach the bare
+// binaries and sidecars to the GitHub release.
+func TestReleaseWorkflowAgentAssets(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatalf("read release.yml: %v", err)
+	}
+	workflow := string(raw)
+	required := []string{
+		// agent build line: same flags and -o target next to the package path
+		"-o dist/warden-cn-agent ./cmd/warden-cn-agent",
+		"cmd/warden-cn-agent",          // package path fed to go build
+		"warden-cn-agent-linux-",       // bare binary + sidecar asset prefix
+		".sha256",                      // sidecar extension
+		"warden-cn-agent_linux_",       // bonus tarball naming
+		"awk '{print $1}'",             // sidecar contains only the hash, one line
+		"dist/warden-cn-agent-linux-*", // publish attaches binaries + sidecars
+	}
+	for _, want := range required {
+		if !strings.Contains(workflow, want) {
+			t.Errorf("release.yml is missing %q", want)
+		}
+	}
+	// Both binaries must carry the version stamp (gateway + agent).
+	const stamp = "-X github.com/tktogether/warden-gateway/internal/version.Version="
+	if n := strings.Count(workflow, stamp); n != 2 {
+		t.Errorf("version stamp count = %d, want 2 (gateway + agent)", n)
+	}
+	// The sidecar must be hashed from the published bare binary itself.
+	if !strings.Contains(workflow, "sha256sum dist/warden-cn-agent-linux-") {
+		t.Errorf("release.yml does not hash dist/warden-cn-agent-linux-* into its sidecar")
+	}
+	// Explicit arch mapping: matrix arch amd64|arm64|armv7 must publish asset
+	// arch amd64|arm64|arm (armv7→arm). Match whole lines so "arm64" cannot
+	// stand in for the "arm" entry.
+	agentArches := map[string]bool{}
+	for _, line := range strings.Split(workflow, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "agent_arch: ") {
+			agentArches[strings.TrimPrefix(line, "agent_arch: ")] = true
+		}
+	}
+	for _, want := range []string{"amd64", "arm64", "arm"} {
+		if !agentArches[want] {
+			t.Errorf("release.yml matrix is missing agent_arch: %s (armv7 must map to arm)", want)
+		}
+	}
+}
+
 func TestSelfModeAllowsEmptyEntry(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.PublicURL = "https://203.0.113.10:8443/warden"
