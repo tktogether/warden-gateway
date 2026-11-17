@@ -44,8 +44,9 @@ var supportedUpgradeArchs = map[string]bool{
 // arch is passed explicitly (production callers pass runtime.GOARCH, tests
 // inject a fixed value); version is used verbatim in the URL as the
 // heartbeat's target_version delivered it (e.g. "v1.6.0"), minus its "v"
-// prefix, matching the gateway's cached-build path. A nil httpClient gets an
-// internally built client with upgradeHTTPTimeout.
+// prefix, matching the gateway's cached-build path. A nil httpClient gets
+// cfg.HTTPClient(upgradeHTTPTimeout), so self-signed gateways marked
+// insecure_tls can serve upgrades too.
 func SelfUpgrade(ctx context.Context, cfg *Config, version, arch, selfPath string, httpClient *http.Client) error {
 	if cfg == nil {
 		return fmt.Errorf("cnagent upgrade: config is nil")
@@ -55,6 +56,12 @@ func SelfUpgrade(ctx context.Context, cfg *Config, version, arch, selfPath strin
 	}
 	if strings.TrimSpace(version) == "" {
 		return fmt.Errorf("cnagent upgrade: target version is required")
+	}
+	// The nil fallback must also honor insecure_tls: a self-signed gateway
+	// serves both the binary and its sidecar over the same certificate. The
+	// download budget stays the dedicated 60s upgrade timeout.
+	if httpClient == nil {
+		httpClient = cfg.HTTPClient(upgradeHTTPTimeout)
 	}
 
 	base := strings.TrimRight(cfg.Origin, "/") +
@@ -107,7 +114,9 @@ func SelfUpgrade(ctx context.Context, cfg *Config, version, arch, selfPath strin
 }
 
 // downloadReleaseFile fetches url and returns the body, treating any non-2xx
-// status as an error. A nil client gets one bounded by upgradeHTTPTimeout.
+// status as an error. SelfUpgrade resolves a nil client through
+// Config.HTTPClient first (so insecure_tls applies); the fallback here only
+// guards future direct callers of this unexported helper.
 func downloadReleaseFile(ctx context.Context, httpClient *http.Client, url string) ([]byte, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: upgradeHTTPTimeout}

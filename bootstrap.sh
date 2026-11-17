@@ -123,6 +123,7 @@ CN_AGENT_NO_AGENT=0
 CN_AGENT_ORIGIN=""
 CN_AGENT_MACHINE_ID=""
 CN_AGENT_TOKEN=""
+CN_AGENT_INSECURE_TLS=0
 CN_DEFAULT_DOMAINS="github.com,api.github.com,codeload.github.com,raw.githubusercontent.com,objects.githubusercontent.com,gist.githubusercontent.com,ghcr.io,pkg-containers.githubusercontent.com,registry-1.docker.io,auth.docker.io,production.cloudfront.docker.com"
 
 C_RESET=""
@@ -275,6 +276,8 @@ Warden Gateway 一键安装脚本
 
 国内机设置选项（仅 cn-setup / cn-check / cn-status / cn-restore 使用）：
   --enroll-token TOKEN   用面板签发的一次性注册令牌执行 agent 模式迁移（推荐）
+  --insecure-tls         面板为自签名证书或仅 IP 访问时关闭 agent 的证书校验
+                         （默认自动探测：仅当校验失败而 -k 可访问时启用）
   --no-agent             强制使用 legacy 模式（dnsmasq + 看门狗，已弃用）
   --origin URL           面板源地址，例如 https://panel.example.com（agent 模式必填，
                          或用 --public-url / 交互输入）
@@ -317,6 +320,7 @@ warden-cn - Warden Gateway 国内机维护命令
 
 cn-setup 选项：
   --enroll-token TOKEN     面板签发的一次性注册令牌，执行 agent 模式迁移（推荐）
+  --insecure-tls           面板为自签名证书或仅 IP 访问时关闭 agent 证书校验
   --no-agent               强制 legacy 模式（dnsmasq + 看门狗，已弃用）
   --origin URL             面板源地址（agent 模式必填，或用 --public-url / 交互输入）
   --gateway-ip IP          代理机地址（必填或自动探测本机出口 IP）
@@ -393,6 +397,7 @@ parse_args() {
       --cn-mode) CN_SPLIT_MODE="$2"; EXPLICIT_CN=1; shift 2;;
       --cn-id) CN_RESTORE_ID="$2"; shift 2;;
       --enroll-token) CN_AGENT_ENROLL_TOKEN="$2"; shift 2;;
+      --insecure-tls) CN_AGENT_INSECURE_TLS=1; shift;;
       --no-agent) CN_AGENT_NO_AGENT=1; shift;;
       --upstream) CN_AGENT_UPSTREAM="$2"; shift 2;;
       --origin) CN_AGENT_ORIGIN="$2"; shift 2;;
@@ -499,10 +504,14 @@ install_binary() {
 # VERSION=latest 时必须先读已安装二进制的版本（write_version_from_binary 在
 # 缓存之后才跑），再退回 $SCRIPT_DIR/VERSION；都拿不到就返回非零，由调用方
 # 跳过缓存——绝不能建出 $SCRIPT_DIR/agent/latest/ 这种永远匹配不上的目录。
+# Docker 模式例外：宿主机上的 $BIN_PATH 可能是不再运行的旧二进制，脚本版本
+# 文件由 cn_docker_cache_agent 从运行中的容器刷新，优先级必须高于它。
 cache_agent_version() {
   local ver=""
   if [ "$VERSION" != "latest" ]; then
     ver="${VERSION#v}"
+  elif [ "$MODE" = "docker" ] && [ -f "$SCRIPT_DIR/VERSION" ]; then
+    ver="$(tr -d ' \r\n' < "$SCRIPT_DIR/VERSION" | sed 's/^v//')"
   else
     if [ -x "$BIN_PATH" ]; then
       ver="$("$BIN_PATH" version 2>/dev/null | awk 'NR == 1 {print $1}' | sed 's/^v//')"
@@ -615,6 +624,50 @@ cn_prune_agent_cache() {
       rm -rf "$root/$name" 2>/dev/null || true
     fi
   done <<< "$dirs"
+  return 0
+}
+
+# cn_docker_cache_agent Docker 安装/升级后的 agent 构建预取。单脚本 Docker
+# 安装既没有 $BIN_PATH version，也没有 $SCRIPT_DIR/VERSION，版本只能从正在
+# 运行的网关解析：优先本机 HTTP 健康端点（listen.http 来自配置，其次 CLI
+# 值），再退到容器内二进制的 version，最后 -k 访问 PUBLIC_URL。解析成功后
+# 先写 $SCRIPT_DIR/VERSION（cache_agent_version 在 Docker 模式优先读它），
+# 再走统一的 cache_agent_binaries；任何失败只告警，不影响安装/升级。
+cn_docker_cache_agent() {
+  local v="" http_addr raw
+  if [ -f "$CONFIG_FILE" ]; then
+    http_addr="$(sed -n '/"listen"[[:space:]]*:[[:space:]]*{/,/}/p' "$CONFIG_FILE" \
+      | sed -n 's/.*"http"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  fi
+  [ -n "$http_addr" ] || http_addr="$HTTP_LISTEN"
+  if [ -n "$http_addr" ]; then
+    v="$(curl -fsS --connect-timeout 3 --max-time 8 "http://$http_addr/api/health" 2>/dev/null \
+      | sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' | head -n 1 || true)"
+  fi
+  if [ -z "$v" ] && have docker; then
+    raw="$(docker exec "$SERVICE" /usr/local/bin/warden-gateway version 2>/dev/null | head -n 1 || true)"
+    v="$(printf '%s' "$raw" | awk '{print $1}' | sed 's/^v//')"
+  fi
+  if [ -z "$v" ] && [ -n "$PUBLIC_URL" ]; then
+    v="$(curl -kfsS --connect-timeout 3 --max-time 8 "$PUBLIC_URL/api/health" 2>/dev/null \
+      | sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' | head -n 1 || true)"
+  fi
+  v="$(printf '%s' "$v" | tr -d ' \r\n')"
+  v="${v#v}"
+  case "$v" in
+    ''|latest|*[!0-9.]*)
+      warn "无法从运行中的 Docker 网关解析具体版本，跳过 agent 构建预取"
+      return 1;;
+  esac
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  + 从运行中的网关解析版本 %s，并预取 agent 构建\n' "$v"
+    return 0
+  fi
+  if ! printf '%s\n' "$v" > "$SCRIPT_DIR/VERSION"; then
+    warn "写入 $SCRIPT_DIR/VERSION 失败，跳过 agent 构建预取"
+    return 1
+  fi
+  cache_agent_binaries || true
   return 0
 }
 
@@ -2008,6 +2061,27 @@ cn_agent_resolve_origin() {
   return 1
 }
 
+# cn_agent_apply_insecure_tls 处理自签名/IP 面板的证书校验（spec §8.2）：
+# 安装器的探测一直用 curl -k，但 agent 默认校验证书，tls.mode=self 时每次
+# 心跳都会 x509 失败。判据是"普通（校验证书）请求失败、-k 请求成功"——
+# 只有这种情况下才认为网关证书不可验证（自签名或仅 IP 访问），为本次机器
+# 启用 insecure_tls 并明确告警；ACME 正常路径不写该字段、保持校验。
+cn_agent_apply_insecure_tls() {
+  if [ "$CN_AGENT_INSECURE_TLS" -eq 1 ]; then
+    warn "已启用 --insecure-tls：agent 跳过面板证书校验（仅适用于自签名/IP 面板）"
+    return 0
+  fi
+  if curl -fsS --connect-timeout 3 --max-time 8 "$CN_AGENT_ORIGIN/api/health" >/dev/null 2>&1; then
+    return 0
+  fi
+  if curl -kfsS --connect-timeout 3 --max-time 8 "$CN_AGENT_ORIGIN/api/health" >/dev/null 2>&1; then
+    CN_AGENT_INSECURE_TLS=1
+    warn "证书校验失败但 -k 可访问：判定为自签名/IP 面板，已为本机 agent 关闭证书校验（insecure_tls）"
+    return 0
+  fi
+  return 0
+}
+
 # cn_agent_version 确定要下载的 agent 版本（release tag = v<版本>）。
 # 依次取：--version 显式值 → 脚本安装目录的 VERSION 文件 → 面板 /api/health
 # 的 version 字段（agent 与网关同版本，对齐面板 agent_binary_url 的语义）。
@@ -2079,8 +2153,14 @@ cn_agent_ensure_machine_id() {
 # 的 snake_case JSON 标签一一对应；token 先留空，enroll 成功后由
 # cn_setup_agent 用 machine token 重写（ruling：文件创建时 token 为空）。
 cn_agent_write_config() {
-  local token="$1" machine_id="$2" hostname
+  local token="$1" machine_id="$2" hostname insecure=""
   hostname="$(cn_agent_hostname_safe)"
+  # 正常 ACME 路径不写 insecure_tls（保持 agent.json 最小）；只有自签名/IP
+  # 面板才追加该字段，Config.InsecureTLS 据此决定心跳/升级是否校验证书。
+  if [ "$CN_AGENT_INSECURE_TLS" -eq 1 ]; then
+    insecure=',
+  "insecure_tls": true'
+  fi
   cn_snapshot_file "$CN_AGENT_CONFIG"
   cn_put_file "$CN_AGENT_CONFIG" 0600 <<EOF
 {
@@ -2092,7 +2172,7 @@ cn_agent_write_config() {
   "machine_id": "$machine_id",
   "hostname": "$hostname",
   "heartbeat_seconds": $CN_AGENT_HEARTBEAT,
-  "dns_listen": "198.18.0.1:53"
+  "dns_listen": "198.18.0.1:53"$insecure
 }
 EOF
 }
@@ -2526,6 +2606,7 @@ cn_setup_agent() {
   CN_GATEWAY="$GATEWAY_IP"
   is_ipv4 "$CN_GATEWAY" || die "网关地址不是 IPv4：$CN_GATEWAY"
   cn_agent_resolve_origin || return 1
+  cn_agent_apply_insecure_tls
   step "面板" "$CN_AGENT_ORIGIN"
   version="$(cn_agent_version)"
   arch="$(cn_agent_arch)"
@@ -3270,8 +3351,10 @@ cmd_install() {
     init_docker_config
     run_docker_container
     # Prefetch after the service is running: three downloads can take minutes
-    # and must never extend the install/upgrade downtime window (F7).
-    cache_agent_binaries || true
+    # and must never extend the install/upgrade downtime window (F7). Docker
+    # installs have no host binary/version file, so resolve the running
+    # gateway's version first (R2).
+    cn_docker_cache_agent || true
   else
     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
     install_binary
@@ -3332,10 +3415,12 @@ cmd_update() {
   if [ -z "$PUBLIC_URL" ]; then PUBLIC_URL="$(config_public_url)"; fi
   if [ "$MODE" = "docker" ]; then
     install_scripts
-    cache_agent_binaries || true
     install_cli
     pull_docker_image
     run_docker_container
+    # Same as install: only the running container knows its version; prefetch
+    # after it is up so the cache never holds a host binary's version (R2).
+    cn_docker_cache_agent || true
   else
     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
     install_binary

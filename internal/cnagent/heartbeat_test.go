@@ -6,7 +6,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 // TestHeartbeatSendsBearerAndParsesReply pins the wire contract with the
@@ -158,6 +160,46 @@ func TestHeartbeatSendsBearerAndParsesReply(t *testing.T) {
 	}
 	if reply.TargetVersion != "v1.6.0" {
 		t.Errorf("target_version = %q, want v1.6.0", reply.TargetVersion)
+	}
+}
+
+// TestHeartbeatInsecureTLS pins the self-signed/IP-only gateway path
+// (tls.mode=self): the default verifying client must reject the untrusted
+// certificate, while InsecureTLS makes both the explicit client and the nil
+// fallback accept it. Without this, enrollment succeeds (curl -k) but every
+// heartbeat fails with x509 and the migration times out.
+func TestHeartbeatInsecureTLS(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"commands":[],"target_version":""}`))
+	}))
+	defer ts.Close()
+
+	report := &Report{MachineID: "self-signed-machine"}
+
+	secure := testConfig(t)
+	secure.Origin = ts.URL
+	if _, err := SendHeartbeat(context.Background(), secure, report, secure.HTTPClient(time.Second)); err == nil {
+		t.Fatal("SendHeartbeat with InsecureTLS=false succeeded against a self-signed server, want a certificate error")
+	} else if !strings.Contains(err.Error(), "certificate") && !strings.Contains(err.Error(), "x509") {
+		t.Fatalf("SendHeartbeat with InsecureTLS=false = %v, want a certificate verification failure", err)
+	}
+
+	insecure := testConfig(t)
+	insecure.Origin = ts.URL
+	insecure.InsecureTLS = true
+	for name, client := range map[string]*http.Client{
+		"explicit":     insecure.HTTPClient(5 * time.Second),
+		"nil-fallback": nil,
+	} {
+		reply, err := SendHeartbeat(context.Background(), insecure, report, client)
+		if err != nil {
+			t.Errorf("SendHeartbeat (%s client) with InsecureTLS=true: %v", name, err)
+			continue
+		}
+		if reply == nil {
+			t.Errorf("SendHeartbeat (%s client) returned a nil reply", name)
+		}
 	}
 }
 

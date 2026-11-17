@@ -150,6 +150,11 @@ func TestBootstrapAgentMode(t *testing.T) {
 		"cn_prune_agent_cache",
 		"upgrade-blocked",
 		"upgrade-pending",
+		// Self-signed/IP-only gateways: enrollment already uses curl -k, so the
+		// agent must be able to opt out of certificate verification too, with
+		// an explicit warning and agent.json field (review R1).
+		"--insecure-tls",
+		"insecure_tls",
 	}
 	script := string(raw)
 	for _, want := range required {
@@ -282,6 +287,66 @@ func TestBootstrapRollbackGuardBaseline(t *testing.T) {
 	}
 	if strings.Contains(start, "enable --now") {
 		t.Error("cn_agent_start_and_wait uses enable --now, which is a no-op on an active unit")
+	}
+}
+
+// TestBootstrapDockerAgentCache locks the Docker install/update fix (review
+// R2): a single-script Docker install has neither a host binary nor a
+// VERSION file, so the version must come from the RUNNING gateway and land in
+// $SCRIPT_DIR/VERSION before the shared prefetch runs. Both Docker branches
+// must go through the one resolver (cn_docker_cache_agent), and the Docker
+// resolver must never trust a stale host binary.
+func TestBootstrapDockerAgentCache(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "bootstrap.sh"))
+	if err != nil {
+		t.Fatalf("read bootstrap.sh: %v", err)
+	}
+	script := string(raw)
+
+	fn := bootstrapFuncRegion(script, "cn_docker_cache_agent")
+	if fn == "" {
+		t.Fatal("cn_docker_cache_agent function not found in bootstrap.sh")
+	}
+	for _, want := range []string{
+		"/api/health",          // version comes from the running gateway
+		`"http"`,               // listen.http parsed from config.json
+		"docker exec",          // fallback: the container's own binary
+		`$SCRIPT_DIR/VERSION`,  // resolved version handed to cache_agent_version
+		"cache_agent_binaries", // one shared prefetch path
+	} {
+		if !strings.Contains(fn, want) {
+			t.Errorf("cn_docker_cache_agent is missing %q", want)
+		}
+	}
+
+	for _, cmd := range []string{"cmd_install", "cmd_update"} {
+		region := bootstrapFuncRegion(script, cmd)
+		if region == "" {
+			t.Fatalf("%s function not found in bootstrap.sh", cmd)
+		}
+		if !strings.Contains(region, "cn_docker_cache_agent") {
+			t.Errorf("%s Docker branch does not call cn_docker_cache_agent", cmd)
+		}
+	}
+
+	// Docker mode must prefer $SCRIPT_DIR/VERSION over a possibly stale host
+	// $BIN_PATH; the non-Docker path keeps the existing binary-first order.
+	versionFn := bootstrapFuncRegion(script, "cache_agent_version")
+	if versionFn == "" {
+		t.Fatal("cache_agent_version function not found in bootstrap.sh")
+	}
+	dockerMode := strings.Index(versionFn, `[ "$MODE" = "docker" ]`)
+	if dockerMode < 0 {
+		t.Fatal("cache_agent_version has no Docker-specific precedence branch")
+	}
+	dockerBranch := versionFn[dockerMode:]
+	vIdx := strings.Index(dockerBranch, `$SCRIPT_DIR/VERSION`)
+	bIdx := strings.Index(dockerBranch, `"$BIN_PATH" version`)
+	if vIdx < 0 || bIdx < 0 {
+		t.Fatalf("cache_agent_version Docker branch does not reference both VERSION and $BIN_PATH (version=%d binary=%d)", vIdx, bIdx)
+	}
+	if vIdx > bIdx {
+		t.Error("cache_agent_version checks $BIN_PATH before $SCRIPT_DIR/VERSION in Docker mode")
 	}
 }
 

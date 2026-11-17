@@ -119,14 +119,15 @@ func (e *StatusError) Error() string {
 // SendHeartbeat posts report to the gateway heartbeat endpoint and returns
 // the parsed reply. It stamps ProtocolVersion on a copy of the report, sends
 // the token as a Bearer Authorization header, and treats any non-2xx status
-// as a *StatusError carrying the status code. A nil httpClient means
-// http.DefaultClient.
+// as a *StatusError carrying the status code. A nil httpClient means the
+// config's own client (cfg.HTTPClient with no timeout), so a self-signed
+// gateway marked insecure_tls works even for callers that pass nil.
 func SendHeartbeat(ctx context.Context, cfg *Config, report *Report, httpClient *http.Client) (*HeartbeatReply, error) {
 	if report == nil {
 		return nil, errors.New("heartbeat: report is nil")
 	}
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = cfg.HTTPClient(0)
 	}
 
 	// Stamp the wire protocol version on a copy so the caller's struct is

@@ -187,7 +187,7 @@ func newAgent(cfg *Config, log *logging.Logger, statePath string) (*Agent, error
 			}
 			return SelfUpgrade(ctx, cfg, ver, runtime.GOARCH, selfPath, nil)
 		},
-		httpClient: &http.Client{Timeout: heartbeatHTTPTimeout},
+		httpClient: cfg.HTTPClient(heartbeatHTTPTimeout),
 		selfPathFn: os.Executable,
 	}
 

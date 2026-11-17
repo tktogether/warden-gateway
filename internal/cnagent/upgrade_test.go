@@ -1,6 +1,7 @@
 package cnagent
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -123,6 +124,50 @@ func TestSelfUpgradeReplacesBinary(t *testing.T) {
 	}
 	if n := hits.Load(); n != 2 {
 		t.Errorf("release server requests = %d, want 2 (binary + sha256 sidecar)", n)
+	}
+}
+
+// TestSelfUpgradeInsecureTLS pins the third self-signed client path: with a
+// nil httpClient, SelfUpgrade must use cfg.HTTPClient so a tls.mode=self
+// gateway can distribute agent builds, while InsecureTLS=false (the ACME
+// default) still refuses the untrusted certificate and leaves the binary
+// untouched.
+func TestSelfUpgradeInsecureTLS(t *testing.T) {
+	oldBinary := []byte("old warden-cn-agent binary v1.5.0")
+	newBinary := []byte("new warden-cn-agent binary from a self-signed gateway")
+	mux := http.NewServeMux()
+	base := "/api/agent/binary/1.6.0/warden-cn-agent-linux-amd64"
+	mux.HandleFunc(base, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(newBinary)
+	})
+	mux.HandleFunc(base+".sha256", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(hexOf(newBinary) + "\n"))
+	})
+	srv := httptest.NewTLSServer(mux)
+	t.Cleanup(srv.Close)
+
+	selfPath := filepath.Join(t.TempDir(), "warden-cn-agent")
+	writeSelf(t, selfPath, oldBinary)
+
+	secure := testConfig(t)
+	secure.Origin = srv.URL
+	if err := SelfUpgrade(context.Background(), secure, "v1.6.0", "amd64", selfPath, nil); err == nil {
+		t.Fatal("SelfUpgrade with InsecureTLS=false succeeded against a self-signed server, want a certificate error")
+	} else if !strings.Contains(err.Error(), "certificate") && !strings.Contains(err.Error(), "x509") {
+		t.Fatalf("SelfUpgrade with InsecureTLS=false = %v, want a certificate verification failure", err)
+	}
+	if got, _ := os.ReadFile(selfPath); !bytes.Equal(got, oldBinary) {
+		t.Fatal("failed TLS verification modified the local binary")
+	}
+
+	insecure := testConfig(t)
+	insecure.Origin = srv.URL
+	insecure.InsecureTLS = true
+	if err := SelfUpgrade(context.Background(), insecure, "v1.6.0", "amd64", selfPath, nil); err != nil {
+		t.Fatalf("SelfUpgrade with InsecureTLS=true: %v", err)
+	}
+	if got, _ := os.ReadFile(selfPath); !bytes.Equal(got, newBinary) {
+		t.Errorf("self binary after insecure upgrade = %q, want %q", got, newBinary)
 	}
 }
 

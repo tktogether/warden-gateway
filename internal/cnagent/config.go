@@ -5,16 +5,19 @@ package cnagent
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -38,6 +41,11 @@ type Config struct {
 	MachineID        string `json:"machine_id"`
 	Hostname         string `json:"hostname"`
 	HeartbeatSeconds int    `json:"heartbeat_seconds"`
+	// InsecureTLS disables certificate verification for the gateway. It is an
+	// explicit install-time opt-in written by bootstrap.sh for self-signed or
+	// IP-only panels (tls.mode=self), where there is no verifiable name. ACME
+	// deployments leave it false and keep full verification.
+	InsecureTLS bool `json:"insecure_tls,omitempty"`
 }
 
 // DefaultConfig returns the config used before provisioning fills in the
@@ -111,6 +119,27 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("upstream port must be numeric 1-65535, got %q", port)
 	}
 	return nil
+}
+
+// HTTPClient returns the HTTP client used for gateway control-plane calls.
+// Verification is on by default; when InsecureTLS is set the client skips
+// certificate verification. That setting exists only for gateways behind a
+// self-signed certificate or an IP-only panel, where the certificate cannot be
+// validated; bootstrap.sh writes it explicitly (--insecure-tls or the
+// self-signed auto-detection) so ACME deployments keep verification.
+func (c *Config) HTTPClient(timeout time.Duration) *http.Client {
+	if c != nil && c.InsecureTLS {
+		// #nosec G402 -- deliberate operator opt-in for a self-signed/IP-only
+		// gateway; the alternative is that such gateways cannot be managed at
+		// all. TLS is still used, only the certificate chain check is skipped.
+		return &http.Client{
+			Timeout: timeout,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // #nosec G402
+			},
+		}
+	}
+	return &http.Client{Timeout: timeout}
 }
 
 // NewMachineID returns a stable machine identity: the contents of

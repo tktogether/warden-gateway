@@ -1,6 +1,7 @@
 package cnagent
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -20,6 +21,7 @@ func testConfig(t *testing.T) *Config {
 
 func TestConfigRoundTrip(t *testing.T) {
 	cfg := testConfig(t)
+	cfg.InsecureTLS = true
 	path := filepath.Join(t.TempDir(), "agent.json")
 	if err := Save(path, cfg); err != nil {
 		t.Fatal(err)
@@ -40,6 +42,28 @@ func TestConfigRoundTrip(t *testing.T) {
 	}
 	if _, err := Load(filepath.Join(t.TempDir(), "missing.json")); err == nil {
 		t.Fatal("expected Load of missing file to fail")
+	}
+}
+
+// TestInsecureTLSJSON pins the install-time opt-in for self-signed/IP-only
+// gateways: the normal ACME path omits the field so agent.json stays minimal,
+// and only an enabled opt-in serializes "insecure_tls": true.
+func TestInsecureTLSJSON(t *testing.T) {
+	cfg := testConfig(t)
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "insecure_tls") {
+		t.Errorf("marshal without InsecureTLS = %s, want no insecure_tls field", data)
+	}
+	cfg.InsecureTLS = true
+	data, err = json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"insecure_tls":true`) {
+		t.Errorf("marshal with InsecureTLS = %s, want insecure_tls true", data)
 	}
 }
 
