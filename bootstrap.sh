@@ -551,6 +551,33 @@ cache_agent_version() {
 # 安装器），但会在输出里明确告警。
 # 侧车必须来自 CI（同一 release 的 $asset.sha256），不能用刚下载的字节现算：
 # 现算只能发现损坏，发现不了网关侧被替换；校验不过/缺侧车就跳过该架构。
+# cn_release_mirrors 输出一个 GitHub 发布资产 URL 的候选来源：显式代理优先，
+# 再直连，再公共镜像。网关自己也常处在 GitHub 直连不稳定的网络里；只试直连
+# 会让 agent 缓存整批失败（实测：网关包靠 gh-proxy 下载成功，agent 资产却
+# 因为只试直连全部失败）。
+cn_release_mirrors() {
+  local url="$1"
+  if [ -n "$GITHUB_PROXY" ]; then
+    printf '%s/%s\n' "${GITHUB_PROXY%/}" "$url"
+  fi
+  printf '%s\n' "$url"
+  printf 'https://gh-proxy.com/%s\n' "$url"
+  printf 'https://ghfast.top/%s\n' "$url"
+}
+
+# cn_fetch_mirrors 依次尝试候选来源下载同一个资产，成功一次即可。
+cn_fetch_mirrors() {
+  local url="$1" dest="$2" cand
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    if download "$cand" "$dest" && [ -s "$dest" ]; then
+      return 0
+    fi
+    rm -f "$dest"
+  done <<< "$(cn_release_mirrors "$url")"
+  return 1
+}
+
 cache_agent_binaries() {
   local arch asset tmp sidecar expected actual ok_flag=0 ver ver_dir
   if ! ver="$(cache_agent_version)"; then
@@ -571,7 +598,7 @@ cache_agent_binaries() {
     asset="warden-cn-agent-linux-$arch"
     tmp="$ver_dir/.$asset.$$"
     sidecar="$tmp.sha256"
-    if ! download "$base/$asset" "$tmp"; then
+    if ! cn_fetch_mirrors "$base/$asset" "$tmp"; then
       rm -f "$tmp" "$sidecar"
       warn "预取 agent 构建失败：$asset（面板将无法分发该架构的 agent）"
       continue
@@ -581,7 +608,7 @@ cache_agent_binaries() {
       warn "预取的 agent 构建为空：$asset"
       continue
     fi
-    if ! download "$base/$asset.sha256" "$sidecar"; then
+    if ! cn_fetch_mirrors "$base/$asset.sha256" "$sidecar"; then
       rm -f "$tmp" "$sidecar"
       warn "预取 agent 校验和失败：$asset.sha256（跳过该架构，面板不会分发未经 CI 签发的构建）"
       continue

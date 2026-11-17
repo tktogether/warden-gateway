@@ -160,6 +160,10 @@ func TestBootstrapAgentMode(t *testing.T) {
 		"CN_RESOLVED_CONF",
 		"resolved.conf.d",
 		"Domains=~.",
+		// Agent prefetch has to fall back across GitHub mirrors like the
+		// gateway release download does; direct-only failed in practice.
+		"cn_fetch_mirrors",
+		"gh-proxy.com",
 	}
 	script := string(raw)
 	for _, want := range required {
