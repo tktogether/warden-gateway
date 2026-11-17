@@ -261,3 +261,64 @@ func TestEventCapAndOrder(t *testing.T) {
 		t.Errorf("Events[1] = %+v, want previous command", m.Events[1])
 	}
 }
+
+// TestEnrollSameHostReplaces pins the re-setup contract: enrolling the same
+// hostname again replaces the old record instead of leaving a phantom offline
+// machine (and its undeliverable queued commands) in the panel forever.
+func TestEnrollSameHostReplaces(t *testing.T) {
+	dir := t.TempDir()
+	reg, err := LoadCNRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	tok1, err := reg.NewEnrollToken(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, tok1m, err := reg.Enroll(tok1, "cn-01", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.QueueCommand(first.ID, "self-check", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	tok2, err := reg.NewEnrollToken(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, tok2m, err := reg.Enroll(tok2, "cn-01", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	machines := reg.Machines()
+	if len(machines) != 1 {
+		t.Fatalf("machines = %d, want 1 (same host re-enrolled)", len(machines))
+	}
+	if machines[0].ID != second.ID {
+		t.Fatalf("kept machine %s, want the new one %s", machines[0].ID, second.ID)
+	}
+	if len(machines[0].Pending) != 0 {
+		t.Fatalf("old queued commands survived: %+v", machines[0].Pending)
+	}
+	// The replaced machine's token no longer authenticates.
+	if _, err := reg.Beat(config.HashAccessKey(tok1m), now); !errors.Is(err, ErrUnknownMachine) {
+		t.Fatalf("old token Beat err = %v, want ErrUnknownMachine", err)
+	}
+	if _, err := reg.Beat(config.HashAccessKey(tok2m), now); err != nil {
+		t.Fatalf("new token Beat err = %v", err)
+	}
+
+	// A different hostname is kept alongside it.
+	tok3, err := reg.NewEnrollToken(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.Enroll(tok3, "cn-02", now); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(reg.Machines()); got != 2 {
+		t.Fatalf("machines = %d, want 2 after a different host", got)
+	}
+}

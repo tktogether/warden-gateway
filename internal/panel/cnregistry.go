@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -168,6 +169,24 @@ func (r *CNRegistry) Enroll(rawEnrollToken, hostname string, now time.Time) (*CN
 	}
 	token.Used = true
 	nowStr := now.UTC().Format(time.RFC3339)
+	// A re-run of cn-setup enrolls the same host again. Keep one record per
+	// hostname: the newest enrollment wins. The old record's token is gone, so
+	// its queued commands could never be delivered anyway — dropping them is
+	// the only honest outcome, and the old row stops sitting in the panel
+	// forever as a phantom offline machine.
+	replacedID := ""
+	if host := strings.TrimSpace(hostname); host != "" {
+		kept := r.machines[:0]
+		for _, old := range r.machines {
+			if old.Hostname == host {
+				replacedID = old.ID
+				continue
+			}
+			kept = append(kept, old)
+		}
+		// Copy keeps the original order; re-slice in place (no allocation).
+		r.machines = kept
+	}
 	m := &CNMachine{
 		ID:         id,
 		Hostname:   hostname,
@@ -177,6 +196,9 @@ func (r *CNRegistry) Enroll(rawEnrollToken, hostname string, now time.Time) (*CN
 	}
 	r.machines = append(r.machines, m)
 	r.appendEventLocked(m, "enrolled", "hostname "+hostname, now)
+	if replacedID != "" {
+		r.appendEventLocked(m, "replaced", "previous machine "+replacedID+" of the same host", now)
+	}
 	if err := r.saveLocked(); err != nil {
 		return nil, "", err
 	}
