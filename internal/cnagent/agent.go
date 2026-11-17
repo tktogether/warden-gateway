@@ -124,6 +124,15 @@ type Agent struct {
 	execFn func(name string, args ...string) error
 	// httpClient posts heartbeats; bounded by heartbeatHTTPTimeout.
 	httpClient *http.Client
+	// selfPathFn resolves the running executable path; tests override it so
+	// the post-upgrade .prev cleanup never touches the real test binary.
+	selfPathFn func() (string, error)
+	// pendingAtStart records whether this process started with an
+	// upgrade-pending marker on disk. The marker and the rollback copy
+	// (<executable>.prev) are cleared only after the first fully successful
+	// cycle, so a build that crashes during that cycle stays attributable to
+	// the systemd guard.
+	pendingAtStart bool
 
 	// --- Run state, guarded by mu ---
 	mu            sync.Mutex
@@ -144,6 +153,13 @@ type Agent struct {
 // boots into a working DNS-forwarding state even if the gateway is unreachable
 // (ensureProxy forwards everything upstream until the first payload arrives).
 func New(cfg *Config, log *logging.Logger) (*Agent, error) {
+	return newAgent(cfg, log, DefaultStatePath)
+}
+
+// newAgent is New with an injectable state-file location. Production always
+// uses DefaultStatePath; tests use it to exercise the upgrade-pending handshake
+// against a temp directory.
+func newAgent(cfg *Config, log *logging.Logger, statePath string) (*Agent, error) {
 	if cfg == nil {
 		return nil, errors.New("cnagent: config is nil")
 	}
@@ -154,7 +170,7 @@ func New(cfg *Config, log *logging.Logger) (*Agent, error) {
 	a := &Agent{
 		cfg:        cfg,
 		log:        log,
-		statePath:  DefaultStatePath,
+		statePath:  statePath,
 		configPath: defaultConfigPath,
 		dnsListen:  listen,
 		prober:     realProber{},
@@ -172,6 +188,7 @@ func New(cfg *Config, log *logging.Logger) (*Agent, error) {
 			return SelfUpgrade(ctx, cfg, ver, runtime.GOARCH, selfPath, nil)
 		},
 		httpClient: &http.Client{Timeout: heartbeatHTTPTimeout},
+		selfPathFn: os.Executable,
 	}
 
 	// Task 8 wiring (ruling 2): the sd_notify watchdog ping goes through
@@ -190,9 +207,11 @@ func New(cfg *Config, log *logging.Logger) (*Agent, error) {
 	}
 
 	// A pending marker means the previous process exited to validate a freshly
-	// installed build; reaching this line means that build started, so the
-	// guard has nothing to roll back and the marker can go.
-	a.clearUpgradePending()
+	// installed build. Reaching this point does NOT prove the build healthy:
+	// the marker stays until this process completes a fully successful cycle
+	// (heartbeat + state write), so a build that crashes during that first
+	// cycle is still attributable to the systemd guard.
+	a.pendingAtStart = a.upgradePendingExists()
 
 	return a, nil
 }
@@ -302,7 +321,7 @@ func (a *Agent) RunOnce(ctx context.Context) error {
 	// already upgraded (avoid a duplicate download) or deregistered (the
 	// machine is leaving; no more upgrades).
 	if !a.deregisteredSnapshot() && !a.upgradedSnapshot() {
-		if tv := strings.TrimSpace(reply.TargetVersion); tv != "" && tv != version.Version {
+		if tv := strings.TrimSpace(reply.TargetVersion); tv != "" && normalizeVersion(tv) != normalizeVersion(version.Version) {
 			if a.upgradeBlocked(tv) {
 				// This build already crashed twice here and the guard rolled it
 				// back. Retrying the same automatic upgrade would loop forever;
@@ -322,8 +341,15 @@ func (a *Agent) RunOnce(ctx context.Context) error {
 	}
 
 	// 6. Persist the cycle. Failures here are logged, not fatal: the DNS
-	// proxy must never go down because a state write failed.
-	a.writeState(pr, degraded)
+	// proxy must never go down because a state write failed. A successful
+	// write completes the validation of a build this process started with a
+	// pending marker: clear the marker and the .prev rollback copy so the
+	// guard stops watching a build that has demonstrably worked.
+	if err := a.writeState(pr, degraded); err != nil {
+		a.log.Errorf("write state file %s: %v", a.statePath, err)
+	} else if a.pendingAtStart && !a.deregisteredSnapshot() && !a.upgradedSnapshot() {
+		a.clearValidatedUpgrade()
+	}
 
 	if a.deregisteredSnapshot() {
 		return errAgentDeregistered
@@ -414,7 +440,7 @@ func (a *Agent) buildReport(ctx context.Context, pr ProbeResult, degraded bool) 
 	return &Report{
 		MachineID:     a.cfg.MachineID,
 		Hostname:      a.cfg.Hostname,
-		AgentVersion:  version.String(),
+		AgentVersion:  normalizeVersion(version.Version),
 		BootTime:      boot,
 		UptimeSeconds: uptime,
 		Probe: Probe{
@@ -555,6 +581,12 @@ func (a *Agent) doUpgrade(ctx context.Context, target string) (bool, string) {
 		target = a.targetVersion
 		a.mu.Unlock()
 	}
+	// The gateway may name the same build as "v1.6.0" while this binary was
+	// stamped "1.6.0" (or vice versa). Swapping the binary for an identical
+	// version would restart the unit forever, so treat it as already done.
+	if normalizeVersion(target) != "" && normalizeVersion(target) == normalizeVersion(version.Version) {
+		return true, "already running " + normalizeVersion(version.Version)
+	}
 	if err := a.upgradeFn(ctx, target); err != nil {
 		return false, err.Error()
 	}
@@ -598,6 +630,14 @@ func (a *Agent) runCommand(ctx context.Context, cmd Command) CommandResult {
 		res.Detail = fmt.Sprintf("applied %d domains (hash %s)", len(domains), hash)
 
 	case cmdActionSelfUpgrade:
+		// A command naming the running build (in any v-prefix form) is a
+		// no-op: the agent must not swap in an identical version and restart
+		// the unit for nothing.
+		if v := normalizeVersion(cmd.Params["version"]); v != "" && v == normalizeVersion(version.Version) {
+			res.OK = true
+			res.Detail = "already running " + v
+			return res
+		}
 		// An explicit command is a human decision: it overrides an earlier
 		// automatic rollback of the same build.
 		if v := strings.TrimSpace(cmd.Params["version"]); v != "" && a.upgradeBlocked(v) {
@@ -738,7 +778,7 @@ type agentState struct {
 // writeState overwrites the state file for this cycle (ruling 1: mode 0644).
 // It is only called on successful-heartbeat cycles — a failed heartbeat must
 // not touch the file at all (ruling 7).
-func (a *Agent) writeState(pr ProbeResult, degraded bool) {
+func (a *Agent) writeState(pr ProbeResult, degraded bool) error {
 	a.mu.Lock()
 	st := agentState{
 		ProbeResult:  pr.Result,
@@ -759,12 +799,12 @@ func (a *Agent) writeState(pr ProbeResult, degraded bool) {
 
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
-		a.log.Errorf("encode state file: %v", err)
-		return
+		return fmt.Errorf("encode state file: %w", err)
 	}
 	if err := writeFile0644(a.statePath, data); err != nil {
-		a.log.Errorf("write state file %s: %v", a.statePath, err)
+		return fmt.Errorf("write state file: %w", err)
 	}
+	return nil
 }
 
 // writeFile0644 writes data to path atomically (temp file + rename) with mode

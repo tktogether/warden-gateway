@@ -152,16 +152,17 @@ func TestAgentEnrollFlow(t *testing.T) {
 }
 
 // TestAgentEnrollRateLimited pins the per-IP enroll limiter (final review fix
-// 4): /api/agent/enroll is unauthenticated and audited per attempt, so an
-// anonymous flood must be capped — five rapid attempts from one IP are still
-// processed (403 for the bad token), the sixth gets 429 before the registry
-// is touched, and over-limit attempts write no audit line (bounding audit.log
-// is the point of the limiter).
+// 4, widened to 10/min in fix wave 2): /api/agent/enroll is unauthenticated and
+// audited per attempt, so an anonymous flood must be capped — ten rapid
+// attempts from one IP are still processed (403 for the bad token), the
+// eleventh gets 429 with Retry-After before the registry is touched, and
+// over-limit attempts write no audit line (bounding audit.log is the point of
+// the limiter).
 func TestAgentEnrollRateLimited(t *testing.T) {
 	srv, _ := newAgentPanel(t)
 	body := map[string]string{"enroll_token": "deadbeef", "hostname": "flood"}
 
-	for i := 1; i <= 5; i++ {
+	for i := 1; i <= cnEnrollRateMax; i++ {
 		rec := do(t, srv, "POST", "/api/agent/enroll", body, nil, "")
 		if rec.Code != http.StatusForbidden {
 			t.Fatalf("attempt %d status %d, want 403 (still within the per-IP budget)", i, rec.Code)
@@ -169,13 +170,16 @@ func TestAgentEnrollRateLimited(t *testing.T) {
 	}
 	rec := do(t, srv, "POST", "/api/agent/enroll", body, nil, "")
 	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("6th rapid attempt status %d, want 429", rec.Code)
+		t.Fatalf("11th rapid attempt status %d, want 429", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "60" {
+		t.Errorf("Retry-After = %q, want 60", got)
 	}
 
 	before := countAuditActions(t, srv, "cn.enroll")
 	rec = do(t, srv, "POST", "/api/agent/enroll", body, nil, "")
 	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("7th rapid attempt status %d, want 429", rec.Code)
+		t.Fatalf("12th rapid attempt status %d, want 429", rec.Code)
 	}
 	if after := countAuditActions(t, srv, "cn.enroll"); after != before {
 		t.Errorf("audit cn.enroll lines %d -> %d, want unchanged (over-limit attempts must not be audited)", before, after)
@@ -848,7 +852,7 @@ func TestPinnedVersionOutranksAutoFollow(t *testing.T) {
 		map[string]any{"enabled": true}, cookie, csrf); rec.Code != http.StatusOK {
 		t.Fatalf("auto-follow status %d: %s", rec.Code, rec.Body)
 	}
-	if err := srv.cnReg.SetDesiredVersion(id, "1.5.3"); err != nil {
+	if err := srv.cnReg.SetPinnedVersion(id, "1.5.3"); err != nil {
 		t.Fatal(err)
 	}
 	rec := postAgentJSON(t, srv, srv.cfg.PanelPath+"/api/agent/heartbeat", token, heartbeatReport(srv, id))
@@ -864,7 +868,7 @@ func TestPinnedVersionOutranksAutoFollow(t *testing.T) {
 	}
 
 	// Clearing the pin hands control back to auto-follow.
-	if err := srv.cnReg.SetDesiredVersion(id, ""); err != nil {
+	if err := srv.cnReg.SetPinnedVersion(id, ""); err != nil {
 		t.Fatal(err)
 	}
 	rec = postAgentJSON(t, srv, srv.cfg.PanelPath+"/api/agent/heartbeat", token, heartbeatReport(srv, id))
@@ -876,6 +880,215 @@ func TestPinnedVersionOutranksAutoFollow(t *testing.T) {
 	}
 	if reply.TargetVersion != AgentBinaryVersion() {
 		t.Fatalf("target_version = %q, want the gateway version %q after clearing the pin", reply.TargetVersion, AgentBinaryVersion())
+	}
+}
+
+// TestAutoFollowAdvancesAcrossGatewayVersions pins F2's core fix: AutoFollow
+// used to write DesiredVersion once and then be treated as an operator pin on
+// every later beat, freezing the machine on the first gateway version. The
+// effective target must follow AgentBinaryVersion as the gateway advances.
+func TestAutoFollowAdvancesAcrossGatewayVersions(t *testing.T) {
+	orig := version.Version
+	t.Cleanup(func() { version.Version = orig })
+
+	srv, key := newAgentPanel(t)
+	srv.minBeatInterval = 0
+	cookie, csrf := login(t, srv, key)
+	id, token := enrollMachine(t, srv, "follower")
+	if rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/auto-follow",
+		map[string]any{"enabled": true}, cookie, csrf); rec.Code != http.StatusOK {
+		t.Fatalf("auto-follow status %d: %s", rec.Code, rec.Body)
+	}
+
+	beat := func() cnagent.HeartbeatReply {
+		rec := postAgentJSON(t, srv, srv.cfg.PanelPath+"/api/agent/heartbeat", token, heartbeatReport(srv, id))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("heartbeat status %d: %s", rec.Code, rec.Body)
+		}
+		var reply cnagent.HeartbeatReply
+		if err := json.Unmarshal(rec.Body.Bytes(), &reply); err != nil {
+			t.Fatal(err)
+		}
+		return reply
+	}
+
+	version.Version = "v1.6.0"
+	if got := beat().TargetVersion; got != "1.6.0" {
+		t.Fatalf("target_version = %q, want 1.6.0", got)
+	}
+	if m := srv.cnReg.MachineByID(id); m == nil || m.PinnedVersion != "" || m.DesiredVersion != "1.6.0" {
+		t.Fatalf("machine after first beat = %+v, want computed desired 1.6.0 and no pin", m)
+	}
+
+	version.Version = "v1.7.0"
+	if got := beat().TargetVersion; got != "1.7.0" {
+		t.Fatalf("target_version after gateway upgrade = %q, want 1.7.0 (auto-follow must advance)", got)
+	}
+	reloaded, err := LoadCNRegistry(srv.dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := reloaded.MachineByID(id); m == nil || m.DesiredVersion != "1.7.0" || m.PinnedVersion != "" {
+		t.Fatalf("persisted machine = %+v, want computed desired 1.7.0 with no pin", m)
+	}
+}
+
+// TestPinSurvivesHeartbeats pins the other half: an operator pin must never be
+// overwritten by a routine heartbeat, even while auto-follow is enabled.
+func TestPinSurvivesHeartbeats(t *testing.T) {
+	orig := version.Version
+	t.Cleanup(func() { version.Version = orig })
+	version.Version = "v1.7.0"
+
+	srv, key := newAgentPanel(t)
+	srv.minBeatInterval = 0
+	cookie, csrf := login(t, srv, key)
+	id, token := enrollMachine(t, srv, "pinned")
+	if rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/auto-follow",
+		map[string]any{"enabled": true}, cookie, csrf); rec.Code != http.StatusOK {
+		t.Fatalf("auto-follow status %d: %s", rec.Code, rec.Body)
+	}
+	if err := srv.cnReg.SetPinnedVersion(id, "1.5.3"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		rec := postAgentJSON(t, srv, srv.cfg.PanelPath+"/api/agent/heartbeat", token, heartbeatReport(srv, id))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("beat %d status %d: %s", i, rec.Code, rec.Body)
+		}
+		var reply cnagent.HeartbeatReply
+		if err := json.Unmarshal(rec.Body.Bytes(), &reply); err != nil {
+			t.Fatal(err)
+		}
+		if reply.TargetVersion != "1.5.3" {
+			t.Fatalf("beat %d target_version = %q, want the pinned 1.5.3", i, reply.TargetVersion)
+		}
+	}
+	reloaded, err := LoadCNRegistry(srv.dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := reloaded.MachineByID(id); m == nil || m.PinnedVersion != "1.5.3" || m.DesiredVersion != "1.5.3" {
+		t.Fatalf("persisted machine = %+v, want the pin and desired 1.5.3", m)
+	}
+}
+
+// TestAutoFollowClearsPin pins the explicit override: turning auto-follow on
+// drops a rollback pin and records why, so the machine starts following again.
+func TestAutoFollowClearsPin(t *testing.T) {
+	srv, key := newAgentPanel(t)
+	srv.minBeatInterval = 0
+	cookie, csrf := login(t, srv, key)
+	id, _ := enrollMachine(t, srv, "unpin-follow")
+	if err := srv.cnReg.SetPinnedVersion(id, "1.5.3"); err != nil {
+		t.Fatal(err)
+	}
+	if rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/auto-follow",
+		map[string]any{"enabled": true}, cookie, csrf); rec.Code != http.StatusOK {
+		t.Fatalf("auto-follow status %d: %s", rec.Code, rec.Body)
+	}
+	m := srv.cnReg.MachineByID(id)
+	if m == nil || m.PinnedVersion != "" || !m.AutoFollow {
+		t.Fatalf("machine = %+v, want auto-follow on with the pin cleared", m)
+	}
+	found := false
+	for _, ev := range m.Events {
+		if ev.Kind == "pin" && ev.Detail == "1.5.3" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("pin-cleared event missing from %+v", m.Events)
+	}
+}
+
+// TestUpgradeCommandPinsVersion pins command-driven pinning: dispatching a
+// self-upgrade naming an older cached build persists that choice, so the next
+// heartbeat cannot drag the machine back to the gateway version.
+func TestUpgradeCommandPinsVersion(t *testing.T) {
+	srv, _ := newAgentPanel(t)
+	srv.minBeatInterval = 0
+	id, token := enrollMachine(t, srv, "command-pin")
+	if err := srv.cnReg.QueueCommand(id, "self-upgrade", map[string]string{"version": "1.5.3"}); err != nil {
+		t.Fatal(err)
+	}
+	rec := postAgentJSON(t, srv, srv.cfg.PanelPath+"/api/agent/heartbeat", token, heartbeatReport(srv, id))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("beat status %d: %s", rec.Code, rec.Body)
+	}
+	var reply cnagent.HeartbeatReply
+	if err := json.Unmarshal(rec.Body.Bytes(), &reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply.TargetVersion != "1.5.3" {
+		t.Fatalf("target_version = %q, want 1.5.3 from the command", reply.TargetVersion)
+	}
+	reloaded, err := LoadCNRegistry(srv.dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := reloaded.MachineByID(id); m == nil || m.PinnedVersion != "1.5.3" {
+		t.Fatalf("persisted machine = %+v, want PinnedVersion 1.5.3", m)
+	}
+	// A follow-up routine beat keeps the pin.
+	postAgentJSON(t, srv, "/api/agent/heartbeat", token, heartbeatReport(srv, id))
+	if m := srv.cnReg.MachineByID(id); m == nil || m.PinnedVersion != "1.5.3" || m.DesiredVersion != "1.5.3" {
+		t.Fatalf("machine after routine beat = %+v, want the pin preserved", m)
+	}
+}
+
+// TestPinEndpointAndAudit pins the management endpoint the panel's "follow
+// gateway" choice uses: a cached version pins, an empty version clears, an
+// uncached version is rejected, and both outcomes are audited.
+func TestPinEndpointAndAudit(t *testing.T) {
+	srv, key := newAgentPanel(t)
+	srv.scriptDir = t.TempDir()
+	cacheAgentBuild(t, srv, "1.5.3", "amd64", []byte("old"))
+	cookie, csrf := login(t, srv, key)
+	id, _ := enrollMachine(t, srv, "pin-endpoint")
+
+	rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/pin",
+		map[string]any{"version": "v1.5.3"}, cookie, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pin status %d: %s", rec.Code, rec.Body)
+	}
+	if m := srv.cnReg.MachineByID(id); m == nil || m.PinnedVersion != "1.5.3" {
+		t.Fatalf("machine = %+v, want PinnedVersion 1.5.3", m)
+	}
+
+	if rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/pin",
+		map[string]any{"version": ""}, cookie, csrf); rec.Code != http.StatusOK {
+		t.Fatalf("clear pin status %d: %s", rec.Code, rec.Body)
+	}
+	if m := srv.cnReg.MachineByID(id); m == nil || m.PinnedVersion != "" || m.DesiredVersion != "" {
+		t.Fatalf("machine after clearing = %+v, want no pin and no computed target", m)
+	}
+
+	if rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/pin",
+		map[string]any{"version": "9.9.9"}, cookie, csrf); rec.Code != http.StatusBadRequest {
+		t.Fatalf("uncached pin status %d, want 400", rec.Code)
+	}
+	if rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/deadbeef/pin",
+		map[string]any{"version": ""}, cookie, csrf); rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown machine pin status %d, want 404", rec.Code)
+	}
+	if items := srv.auditItems(50, "cn.pin"); len(items) < 2 {
+		t.Errorf("cn.pin audit lines = %d, want at least 2 (set + clear)", len(items))
+	}
+}
+
+// TestCNMachineRowNormalizesReportedVersion pins F11: version.String() used to
+// report "v1.6.0 (sha)" while the desired target was "1.6.0", so the
+// 待升级/已钉版本 badge lit up forever. The row must compare bare versions.
+func TestCNMachineRowNormalizesReportedVersion(t *testing.T) {
+	m := CNMachine{
+		Report:         map[string]interface{}{"agent_version": "v1.6.0 (abc1234)"},
+		DesiredVersion: "1.6.0",
+	}
+	row := newCNMachineRow(m, time.Now())
+	if row.Version != "1.6.0" {
+		t.Fatalf("row version = %q, want the normalized 1.6.0", row.Version)
 	}
 }
 

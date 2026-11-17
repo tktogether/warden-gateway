@@ -32,11 +32,17 @@ type CNMachine struct {
 	ID, Hostname, TokenHash string
 	EnrolledAt, LastSeen    string // RFC3339 UTC
 	Report                  map[string]interface{}
-	DesiredVersion          string
-	AutoFollow              bool
-	Deregistered            bool
-	Pending                 []CNCommand
-	Events                  []CNEvent // newest first, cap 50
+	// PinnedVersion is the operator's explicit build choice (rollback or a
+	// manual upgrade). Empty means no pin: the machine follows AutoFollow.
+	PinnedVersion string
+	// DesiredVersion is the COMPUTED effective target for display: the pin
+	// when one exists, otherwise the gateway version while AutoFollow is on,
+	// otherwise empty. It is written by UpdateReport, never read as a pin.
+	DesiredVersion string
+	AutoFollow     bool
+	Deregistered   bool
+	Pending        []CNCommand
+	Events         []CNEvent // newest first, cap 50
 }
 
 // CNCommand is one operation queued for a CN agent.
@@ -256,47 +262,62 @@ func (r *CNRegistry) PopCommands(id string, max int) []CNCommand {
 	return out
 }
 
-// UpdateReport stores the machine's latest heartbeat report and desired agent
-// version, then persists both.
-func (r *CNRegistry) UpdateReport(id string, report map[string]interface{}, desiredVersion string) error {
+// UpdateReport stores the machine's latest heartbeat report and computes the
+// effective target version under the registry lock, returning it so the
+// heartbeat handler never reads live machine fields itself:
+//
+//	pin (operator choice) > auto-follow (gateway version) > "" (standalone)
+//
+// A routine heartbeat therefore never clears an explicit pin, while an
+// auto-following machine keeps advancing as the gateway is upgraded.
+func (r *CNRegistry) UpdateReport(id string, report map[string]interface{}, autoTarget string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	m := r.machineByIDLocked(id)
 	if m == nil {
-		return ErrUnknownMachine
+		return "", ErrUnknownMachine
 	}
 	m.Report = report
-	// AutoFollow keeps the machine trailing the gateway's own version; without
-	// it DesiredVersion is whatever the operator pinned (an older build for a
-	// rollback, or empty to leave the machine alone). A routine heartbeat never
-	// clears an explicit pin.
-	if desiredVersion != "" {
-		m.DesiredVersion = desiredVersion
+	effective := ""
+	switch {
+	case m.PinnedVersion != "":
+		effective = m.PinnedVersion
+	case m.AutoFollow:
+		effective = autoTarget
 	}
-	return r.saveLocked()
+	m.DesiredVersion = effective
+	return effective, r.saveLocked()
 }
 
-// SetDesiredVersion pins the agent build a machine should run. An empty version
-// clears the pin: the machine keeps whatever it has unless AutoFollow is on.
-func (r *CNRegistry) SetDesiredVersion(machineID, ver string) error {
+// SetPinnedVersion pins the agent build a machine should run. An empty version
+// clears the pin, handing control back to AutoFollow (or leaving the machine
+// alone when follow is off). Both outcomes are recorded as a "pin" event.
+func (r *CNRegistry) SetPinnedVersion(machineID, ver string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	m := r.machineByIDLocked(machineID)
 	if m == nil {
 		return ErrUnknownMachine
 	}
-	m.DesiredVersion = ver
+	ver = normalizeAgentVersion(ver)
+	m.PinnedVersion = ver
+	if ver != "" {
+		m.DesiredVersion = ver
+	} else if !m.AutoFollow {
+		m.DesiredVersion = ""
+	}
 	detail := ver
 	if detail == "" {
 		detail = "cleared"
 	}
-	r.appendEventLocked(m, "desired_version", detail, time.Now().UTC())
+	r.appendEventLocked(m, "pin", detail, time.Now().UTC())
 	return r.saveLocked()
 }
 
 // SetAutoFollow toggles a machine's auto-follow flag and persists the change.
-// An auto-following machine adopts the gateway version as its desired agent
-// version on the next heartbeat.
+// Turning it ON explicitly drops any rollback pin (the operator asked to
+// follow the gateway); the drop is recorded as a "pin" event so the timeline
+// explains why the pinned build was abandoned.
 func (r *CNRegistry) SetAutoFollow(machineID string, enabled bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -304,12 +325,21 @@ func (r *CNRegistry) SetAutoFollow(machineID string, enabled bool) error {
 	if m == nil {
 		return ErrUnknownMachine
 	}
+	now := time.Now().UTC()
 	m.AutoFollow = enabled
+	if enabled {
+		detail := m.PinnedVersion
+		if detail == "" {
+			detail = "cleared"
+		}
+		m.PinnedVersion = ""
+		r.appendEventLocked(m, "pin", detail, now)
+	}
 	state := "disabled"
 	if enabled {
 		state = "enabled"
 	}
-	r.appendEventLocked(m, "auto_follow", state, time.Now().UTC())
+	r.appendEventLocked(m, "auto_follow", state, now)
 	return r.saveLocked()
 }
 

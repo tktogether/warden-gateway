@@ -3,6 +3,7 @@ package panel
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -57,6 +58,7 @@ func TestAgentBinaryServesCachedBuild(t *testing.T) {
 		wantBody   string
 	}{
 		{"binary", "/api/agent/binary/" + ver + "/amd64", http.StatusOK, string(binary)},
+		{"panel-prefixed", "/warden/api/agent/binary/" + ver + "/amd64", http.StatusOK, string(binary)},
 		{"sidecar", "/api/agent/binary/" + ver + "/amd64.sha256", http.StatusOK, "abc123\n"},
 		{"trailing slash", "/api/agent/binary/" + ver + "/amd64/", http.StatusOK, string(binary)},
 		{"unknown version", "/api/agent/binary/9.9.9/amd64", http.StatusNotFound, ""},
@@ -174,6 +176,59 @@ func TestAgentBinaryURLShape(t *testing.T) {
 	}
 	if got := agentBinaryURL("", "9.9.9", "amd64"); got != "" {
 		t.Fatalf("empty origin should yield empty URL, got %q", got)
+	}
+}
+
+// TestAgentBinaryRejectsLatest pins F4's validation half: "latest" is never a
+// valid cached version (the cache only ever holds concrete releases), so it is
+// neither listed nor accepted as a pin/command target.
+func TestAgentBinaryRejectsLatest(t *testing.T) {
+	srv, _ := agentBinaryPanel(t)
+	if err := os.MkdirAll(filepath.Join(srv.scriptDir, agentAssetDirName, "latest"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srv.scriptDir, agentAssetDirName, "latest", "warden-cn-agent-linux-amd64"), []byte("stale"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"latest", "vlatest", ""} {
+		if srv.CachedAgentVersion(v) {
+			t.Errorf("CachedAgentVersion(%q) = true, want false", v)
+		}
+	}
+	for _, v := range srv.CachedAgentVersions() {
+		if v == "latest" {
+			t.Fatalf("CachedAgentVersions lists latest: %v", srv.CachedAgentVersions())
+		}
+	}
+	if rec := do(t, srv, "GET", "/api/agent/binary/latest/amd64", nil, nil, ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("GET latest status %d, want 404", rec.Code)
+	}
+}
+
+// TestAgentBinaryStreamsWithLastModified pins F9: the endpoint uses
+// http.ServeContent, so it advertises Last-Modified/Accept-Ranges and answers
+// Range requests instead of reading and writing the whole file each time.
+func TestAgentBinaryStreamsWithLastModified(t *testing.T) {
+	srv, _ := agentBinaryPanel(t)
+	ver := AgentBinaryVersion()
+	cacheAgentBuild(t, srv, ver, "amd64", []byte("0123456789abcdef"))
+
+	rec := do(t, srv, "GET", "/api/agent/binary/"+ver+"/amd64", nil, nil, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	if rec.Header().Get("Last-Modified") == "" {
+		t.Error("Last-Modified missing: response is not served through ServeContent")
+	}
+	if rec.Header().Get("Accept-Ranges") != "bytes" {
+		t.Errorf("Accept-Ranges = %q, want bytes", rec.Header().Get("Accept-Ranges"))
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/binary/"+ver+"/amd64", nil)
+	req.Header.Set("Range", "bytes=0-3")
+	rangeRec := httptest.NewRecorder()
+	srv.ServeHTTP(rangeRec, req)
+	if rangeRec.Code != http.StatusPartialContent || rangeRec.Body.String() != "0123" {
+		t.Fatalf("range response = %d %q, want 206 0123", rangeRec.Code, rangeRec.Body.String())
 	}
 }
 

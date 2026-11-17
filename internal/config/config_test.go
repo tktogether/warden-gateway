@@ -176,6 +176,93 @@ func TestBootstrapAgentMode(t *testing.T) {
 	}
 }
 
+// TestBootstrapRollbackGuardBaseline locks the F5 crash-rollback arithmetic in
+// bootstrap.sh: the guard may only act when an upgrade-pending marker exists,
+// must compare NRestarts against the baseline the agent wrote before its clean
+// upgrade restart (`current - baseline >= 2`), and must not use an absolute
+// count (the upgrade's own exit-0 restart used to trigger it).
+func TestBootstrapRollbackGuardBaseline(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "bootstrap.sh"))
+	if err != nil {
+		t.Fatalf("read bootstrap.sh: %v", err)
+	}
+	script := string(raw)
+
+	guard := bootstrapFuncRegion(script, "cn_agent_write_guard")
+	if guard == "" {
+		t.Fatal("cn_agent_write_guard function not found in bootstrap.sh")
+	}
+	for _, want := range []string{
+		"upgrade-pending",         // only act while a build is under validation
+		"NRestarts",               // read the live restart counter
+		`awk '{print \$2; exit}'`, // baseline = second field of the marker
+		"baseline",                // ...
+		`delta=\$((nrestarts - baseline))`,
+		`[ "\$delta" -ge 2 ]`, // crash => two restarts beyond the baseline
+		"upgrade-blocked",     // converted after a rollback
+		`\$STATE_DIR/upgrade-blocked`,
+	} {
+		if !strings.Contains(guard, want) {
+			t.Errorf("cn_agent_write_guard is missing %q", want)
+		}
+	}
+	if strings.Contains(guard, `"\$nrestarts" -ge 2`) {
+		t.Error("guard still rolls back on the absolute NRestarts count (the upgrade's own restart would trigger it)")
+	}
+
+	// F4/deferred: the cache resolves a concrete version and verifies the CI
+	// sidecar (never re-hashes its own download), and never creates "latest".
+	cache := bootstrapFuncRegion(script, "cache_agent_binaries")
+	if cache == "" {
+		t.Fatal("cache_agent_binaries function not found in bootstrap.sh")
+	}
+	for _, want := range []string{
+		"cache_agent_version",
+		`$asset.sha256`,
+		"sha256sum",
+		`"$ver_dir/$asset.sha256"`,
+	} {
+		if !strings.Contains(cache, want) {
+			t.Errorf("cache_agent_binaries is missing %q", want)
+		}
+	}
+	if !strings.Contains(script, `case "$ver" in`) || !strings.Contains(script, `''|latest|`) {
+		t.Error("cache_agent_version must reject empty/latest resolutions")
+	}
+
+	// F14: the prune fallback must be selected by probing find's -printf
+	// support, not by the exit status of a piped sort.
+	prune := bootstrapFuncRegion(script, "cn_prune_agent_cache")
+	if prune == "" {
+		t.Fatal("cn_prune_agent_cache function not found in bootstrap.sh")
+	}
+	if !strings.Contains(prune, `find "$root" -maxdepth 0 -printf ''`) {
+		t.Error("cn_prune_agent_cache does not probe find -printf support explicitly")
+	}
+	if strings.Contains(prune, `if dirs="$(find`) {
+		t.Error("cn_prune_agent_cache still tests sort's exit status instead of find support")
+	}
+
+	// F8: re-running cn-setup must restart an active unit and delete the stale
+	// state file before waiting for a fresh successful heartbeat.
+	start := bootstrapFuncRegion(script, "cn_agent_start_and_wait")
+	if start == "" {
+		t.Fatal("cn_agent_start_and_wait function not found in bootstrap.sh")
+	}
+	for _, want := range []string{
+		`systemctl enable "$CN_AGENT_UNIT_NAME"`,
+		`systemctl restart "$CN_AGENT_UNIT_NAME"`,
+		`rm -f "$CN_AGENT_STATE_DIR/state.json"`,
+	} {
+		if !strings.Contains(start, want) {
+			t.Errorf("cn_agent_start_and_wait is missing %q", want)
+		}
+	}
+	if strings.Contains(start, "enable --now") {
+		t.Error("cn_agent_start_and_wait uses enable --now, which is a no-op on an active unit")
+	}
+}
+
 // bootstrapFuncRegion returns the body of the named shell function, from its
 // `name() {` line up to the next top-level function definition, so
 // assertions can target one function instead of the whole script.

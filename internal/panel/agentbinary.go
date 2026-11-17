@@ -34,6 +34,17 @@ func normalizeAgentVersion(v string) string {
 	return strings.TrimPrefix(strings.TrimSpace(v), "v")
 }
 
+// normalizeReportedAgentVersion defensively turns a heartbeat agent_version
+// into the bare version the panel compares against pins. New agents already
+// send "1.6.0"; older ones sent version.String() ("v1.6.0 (sha)"), which used
+// to make the "待升级/已钉版本" badge compare unequal forever.
+func normalizeReportedAgentVersion(v string) string {
+	if fields := strings.Fields(v); len(fields) > 0 {
+		return normalizeAgentVersion(fields[0])
+	}
+	return ""
+}
+
 // AgentBinaryVersion is the agent build version this gateway runs and therefore
 // offers by default: its own release version, without the "v".
 func AgentBinaryVersion() string {
@@ -45,18 +56,21 @@ func AgentBinaryVersion() string {
 // Path shape: /api/agent/binary/{version}/{arch}[.sha256]. The version segment
 // addresses the per-version cache directory, so a machine can hold any build the
 // operator has cached — including an older one it is being pinned back to.
+// path is the ROUTED path (panel prefix already stripped by route), never
+// r.URL.Path: the prefix exists in production URLs and re-trimming the raw URL
+// here made the endpoint 404 for every real request.
 //
 // Unlike the heartbeat endpoint this is unauthenticated: bootstrap.sh fetches
 // the binary before it holds a machine token, and the payload is a public
 // release artifact. Both path elements are checked against allow-lists and the
 // version against a strict pattern, so a crafted request cannot read arbitrary
 // files.
-func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request, path string) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/agent/binary/"), "/")
+	rest := strings.Trim(strings.TrimPrefix(path, "/api/agent/binary/"), "/")
 	parts := strings.Split(rest, "/")
 	if len(parts) != 2 {
 		http.Error(w, "not found", http.StatusNotFound)
@@ -68,7 +82,7 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	if !agentVersionPattern.MatchString(wantVersion) {
+	if !agentVersionPattern.MatchString(wantVersion) || wantVersion == "latest" {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
@@ -77,8 +91,15 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 	if withSidecar {
 		file += ".sha256"
 	}
-	raw, err := os.ReadFile(filepath.Join(s.scriptDir, agentAssetDirName, wantVersion, file))
+	filePath := filepath.Join(s.scriptDir, agentAssetDirName, wantVersion, file)
+	f, err := os.Open(filePath)
 	if err != nil {
+		http.Error(w, "no cached agent build for "+wantVersion+" on this gateway (re-run the gateway installer, or pick a cached version in the panel)", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.IsDir() {
 		http.Error(w, "no cached agent build for "+wantVersion+" on this gateway (re-run the gateway installer, or pick a cached version in the panel)", http.StatusNotFound)
 		return
 	}
@@ -89,7 +110,10 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 	} else {
 		w.Header().Set("Content-Type", "application/octet-stream")
 	}
-	_, _ = w.Write(raw)
+	// ServeContent streams the file (no whole-file read per request), handles
+	// HEAD/Range, and sets Last-Modified; the explicit Content-Type above is
+	// preserved.
+	http.ServeContent(w, r, file, info.ModTime(), f)
 }
 
 // CachedAgentVersions lists the agent versions cached on this gateway, newest
@@ -101,7 +125,7 @@ func (s *Server) CachedAgentVersions() []string {
 	}
 	out := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if !e.IsDir() {
+		if !e.IsDir() || e.Name() == "latest" {
 			continue
 		}
 		if agentVersionPattern.MatchString(e.Name()) {
@@ -115,7 +139,7 @@ func (s *Server) CachedAgentVersions() []string {
 // CachedAgentVersion reports whether a given version is served by this gateway.
 func (s *Server) CachedAgentVersion(v string) bool {
 	v = normalizeAgentVersion(v)
-	if !agentVersionPattern.MatchString(v) {
+	if v == "" || v == "latest" || !agentVersionPattern.MatchString(v) {
 		return false
 	}
 	for _, cached := range s.CachedAgentVersions() {

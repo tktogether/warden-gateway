@@ -1,8 +1,11 @@
 package cnagent
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -15,8 +18,13 @@ import (
 //
 // Two plain-text marker files under the state dir close that loop:
 //
-//	upgrade-pending  written by the agent right before it exits for a restart,
-//	                 naming the build the guard is about to validate.
+//	upgrade-pending  written by the agent right before it exits for a restart:
+//	                 "<version> <nrestarts>" — the build the guard is about to
+//	                 validate and the unit's restart counter at that moment.
+//	                 The baseline matters because the upgrade's own clean
+//	                 exit-0 restart increments NRestarts; the guard compares
+//	                 against the baseline instead of an absolute count, so a
+//	                 healthy upgrade restart is not mistaken for a crash.
 //	upgrade-blocked  written by the guard when it rolls that build back.
 //
 // The agent skips automatic upgrade attempts toward a blocked build and reports
@@ -32,20 +40,70 @@ func (a *Agent) stateFile(name string) string {
 	return filepath.Join(filepath.Dir(a.statePath), name)
 }
 
-// markUpgradePending records the build about to be validated by the guard.
+// upgradePendingExists reports whether a pending marker was on disk before this
+// process began. New records it so a later successful cycle can clear the
+// marker without clearing one written by an upgrade that happened since.
+func (a *Agent) upgradePendingExists() bool {
+	_, err := os.Stat(a.stateFile(upgradePendingFile))
+	return err == nil
+}
+
+// markUpgradePending records the build about to be validated by the guard and
+// the unit's restart count before the expected clean restart.
 func (a *Agent) markUpgradePending(ver string) {
 	path := a.stateFile(upgradePendingFile)
-	if err := os.WriteFile(path, []byte(strings.TrimSpace(ver)+"\n"), 0o644); err != nil {
+	payload := strings.TrimSpace(ver) + " " + strconv.Itoa(nrestarts()) + "\n"
+	if err := os.WriteFile(path, []byte(payload), 0o644); err != nil {
 		a.log.Warnf("record pending upgrade %s: %v", ver, err)
 	}
 }
 
-// clearUpgradePending removes the pending marker: the new build started fine,
-// so the guard has nothing to roll back.
+// clearUpgradePending removes the pending marker: the new build proved healthy
+// and the guard has nothing to roll back.
 func (a *Agent) clearUpgradePending() {
 	if err := os.Remove(a.stateFile(upgradePendingFile)); err != nil && !os.IsNotExist(err) {
 		a.log.Warnf("clear pending upgrade marker: %v", err)
 	}
+}
+
+// clearValidatedUpgrade runs after the first fully successful cycle of a
+// process that started with a pending marker: the build has demonstrably
+// worked, so drop the marker and the rollback copy. Clearing .prev here (not
+// at construction) is what lets a build that crashes during its very first
+// cycle still be rolled back and attributed.
+func (a *Agent) clearValidatedUpgrade() {
+	a.clearUpgradePending()
+	self := ""
+	if a.selfPathFn != nil {
+		if path, err := a.selfPathFn(); err == nil {
+			self = path
+		}
+	} else if path, err := os.Executable(); err == nil {
+		self = path
+	}
+	if self != "" {
+		if err := os.Remove(self + ".prev"); err != nil && !os.IsNotExist(err) {
+			a.log.Warnf("remove validated rollback copy %s.prev: %v", self, err)
+		}
+	}
+	a.pendingAtStart = false
+}
+
+// nrestarts reads the unit's NRestarts counter. Any failure (no systemd, no
+// unit, non-Linux test host) yields 0, which makes the guard fall back to
+// counting from the start of the unit's lifetime.
+func nrestarts() int {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "systemctl", "show", cnAgentService, "-p", "NRestarts", "--value").Output()
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 // blockedUpgrade reports the build the guard rolled back, if any.
@@ -67,6 +125,7 @@ func (a *Agent) upgradeBlocked(ver string) bool {
 // clearUpgradeBlock removes the block, recording why: a manual upgrade command
 // is the operator overriding the earlier automatic rollback.
 func (a *Agent) clearUpgradeBlock(reason string) {
+	blocked := a.blockedUpgrade()
 	path := a.stateFile(upgradeBlockedFile)
 	if err := os.Remove(path); err != nil {
 		if !os.IsNotExist(err) {
@@ -74,15 +133,10 @@ func (a *Agent) clearUpgradeBlock(reason string) {
 		}
 		return
 	}
-	a.log.Infof("cleared upgrade block for %s (%s)", a.blockedUpgrade(), reason)
+	a.log.Infof("cleared upgrade block for %s (%s)", blocked, reason)
 }
 
 // normalizeVersion trims the leading "v" so "v1.6.0" and "1.6.0" compare equal.
 func normalizeVersion(v string) string {
 	return strings.TrimPrefix(strings.TrimSpace(v), "v")
-}
-
-// upgradeStamp is the version a fresh process reports as "running since".
-func upgradeStamp() string {
-	return time.Now().UTC().Format(time.RFC3339)
 }

@@ -177,6 +177,10 @@ func (a *App) Handler() http.Handler {
 			a.serveHealthz(w, r)
 		case strings.HasPrefix(p, a.cfg.PanelPath):
 			a.panel.ServeHTTP(w, r)
+		case strings.HasPrefix(p, "/api/agent/binary/"):
+			// The CN agent bootstrap/downloader uses the origin-root URL; the
+			// panel also serves the same handler under its own prefix.
+			a.panel.ServeHTTP(w, r)
 		case strings.HasPrefix(p, "/v2/"):
 			if a.docker == nil {
 				http.Error(w, "docker proxy is disabled", http.StatusServiceUnavailable)

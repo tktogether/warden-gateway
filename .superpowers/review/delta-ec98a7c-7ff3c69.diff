@@ -1,0 +1,3037 @@
+=== COMMITS ===
+7ff3c69 feat: multi-version agent cache with rollback and loop guard
+a3550ce feat: self-host the cn agent binary behind the gateway
+c432147 fix: actuate self-upgrade, url/pill/guard corrections, enroll rate limit
+
+=== STAT ===
+ CHANGELOG.md                                       |   5 +-
+ README.md                                          |   4 +-
+ bootstrap.sh                                       | 137 ++++++++++++-
+ cmd/warden-cn-agent/main.go                        |   8 +-
+ docs/ARCHITECTURE.md                               |   2 +-
+ .../specs/2026-11-17-cn-agent-design.md            |  12 +-
+ internal/cnagent/agent.go                          | 143 +++++++++++---
+ internal/cnagent/agent_test.go                     | 194 +++++++++++++++++++
+ internal/cnagent/config.go                         |  23 ++-
+ internal/cnagent/config_test.go                    |  39 ++++
+ internal/cnagent/upgrade.go                        |  18 +-
+ internal/cnagent/upgrade_test.go                   |   6 +-
+ internal/cnagent/upgradeguard.go                   |  88 +++++++++
+ internal/cnagent/upgradeguard_test.go              | 105 ++++++++++
+ internal/config/config_test.go                     |  44 +++++
+ internal/panel/agentbinary.go                      | 173 +++++++++++++++++
+ internal/panel/agentbinary_test.go                 | 213 +++++++++++++++++++++
+ internal/panel/cnagent.go                          |  80 +++++++-
+ internal/panel/cnagent_test.go                     | 137 ++++++++++++-
+ internal/panel/cnregistry.go                       |  26 ++-
+ internal/panel/diagnostics.go                      |  43 ++---
+ internal/panel/panel.go                            |  16 +-
+ internal/panel/panel_test.go                       |  25 ++-
+ internal/panel/web/app.js                          |  52 ++++-
+ internal/version/version.go                        |   2 +-
+ 25 files changed, 1492 insertions(+), 103 deletions(-)
+
+=== DIFF ===
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e245190..77b1036 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,23 +1,24 @@
+ # 更新记录
+ 
+ ## v1.6.0
+ 
+ ### 新增
+ 
+ - 国内机常驻 agent `warden-cn-agent`（新 `cmd/warden-cn-agent`，`internal/cnagent`）：单二进制 systemd 常驻服务，接管国内机分流。内置 DNS 监听 `198.18.0.1:53`（复用 `internal/dnsproxy`，地址与 v1.5.x 的 dnsmasq 一致）：分流域名答网关 IP，其余转发上游；健康探测判定网关不可达时逐查询降级为直连解析，不再有"60 秒一次摘 hosts 块"的状态机延迟。健康探测沿用 `OK` / `LINK_443_BLOCKED` / `LINK_PORTS_BLOCKED` / `C_DOWN` / `LOCAL_BROKEN` 分类，先确认本机外网正常再判定网关故障。通过 docker socket 自动发现容器（名称、镜像、状态、启动时间），带 Coolify 标签的容器归组为应用上报，只采集元数据。
+ - agent 心跳：默认每 10 秒（±20% 抖动避免多台机器同拍）`POST /api/agent/heartbeat`，Bearer machine token 认证。一个心跳往返完成三件事：上报状态、健康探测结果与容器/资源摘要，领命令（`sync-domains`、`self-check`、`self-upgrade`、`deregister`），拿最新分流域名列表——网关侧带版本 hash，hash 没变不下发全量。网关连续 30 秒（3 个周期）无心跳判定离线；每个 token 按 8 秒间隔限流（心跳间隔最低 10 秒）。心跳失败时本地维持现状运行，绝不因远端异常清空本地配置。
+-- agent 自升级：经网关的 GitHub 代理短路径 `{origin}/github.com/tktogether/warden-gateway/releases/download/{tag}/...` 下载目标版本二进制，同源拉取 `.sha256` 侧车校验，通过后临时文件写入、原子 rename 替换自身、退出交 systemd 重启；下载或校验失败本次不动，下个心跳重试。新版本连续崩溃时 systemd 自动回退到备份的旧二进制。systemd 单元为 `Restart=always` + `WatchdogSec=60`（agent 周期性 sd_notify，卡死强杀重启）加 `MemoryMax` 资源约束。
++- agent 自升级：经网关**自托管端点** `{origin}/api/agent/binary/{version}/{arch}` 下载目标版本二进制，同源拉取 `.sha256` 侧车校验，通过后临时文件写入、原子 rename 替换自身、退出交 systemd 重启；国内机全程不访问 GitHub。下载或校验失败本次不动，下个心跳重试。新版本连续崩溃时 systemd 自动回退到备份的旧二进制。systemd 单元为 `Restart=always` + `WatchdogSec=60`（agent 周期性 sd_notify，卡死强杀重启）加 `MemoryMax` 资源约束。
+ - 网关 `/api/agent/*`：`POST /api/agent/enroll` 用一次性 enroll token 换发 machine token（随机 32 字节，网关只存 SHA-256 摘要，agent 端 0600）；`POST /api/agent/heartbeat` 返回命令队列、域名列表与目标版本。注册表、token 摘要、待执行命令、机器快照与事件 journal 持久化到 `<DataDir>/cn-agents.json`（0600），网关重启或升级不丢已注册机器，纳入现有备份/恢复；所有 agent 管理操作进审计日志。
+ - 面板新增「国内机」页：每台机器的在线/离线状态、健康分类、版本、磁盘/内存/负载、容器与应用摘要、最后心跳时间；操作按钮为立即同步、自检、升级、注销——没有远程重启或整机 reboot 入口。注册流程：面板生成一次性 enroll token 与安装命令，国内机执行后自动出现在列表。
+ - 分流域名在线编辑：面板「设置」页新增分流域名编辑器，保存后写入 `cfg.DNS.Domains` 成为运行时唯一事实源，自动补进 SNI 透传列表保证每个分流域名都被覆盖，随服务重启生效并在心跳周期内下发到所有在线 agent，全程无需发版。
+-- CI：GitHub Release 在网关二进制之外同时发布 `warden-cn-agent-linux-amd64` / `-arm64` 二进制、`.sha256` 侧车与 tar.gz。agent 二进制经网关 GitHub 代理短路径分发，网关不为它设托管端点。
++- CI：GitHub Release 在网关二进制之外同时发布 `warden-cn-agent-linux-amd64` / `-arm64` / `-arm` 二进制、`.sha256` 侧车与 tar.gz。网关安装/升级时把这些构建预取到 `$SCRIPT_DIR/agent/<version>/`（保留最近 3 个版本），由 `GET /api/agent/binary/{version}/{arch}` **自托管**对外分发，国内机安装与升级都只连网关。
++- 多版本与回退：面板「升级」可选择任意已缓存版本，低于网关版本即回退；目标版本优先级为「操作员 pin > 自动跟随 > 保持现状」，未缓存版本直接拒绝。agent 替换二进制前记录待验证版本，systemd 崩溃回退守卫把它转成「已阻止版本」，恢复后的旧 agent 不再自动重试同一坏包（避免升级回滚循环），只有面板显式升级才清除阻止。
+ 
+ ### 改进
+ 
+ - `bootstrap.sh cn-setup` 新增 agent 模式（`--enroll-token` 触发），按固定顺序迁移：快照 → resolv.conf 先写公网兜底 → 停止旧 dnsmasq 与看门狗 → 经网关短路径下载 agent 并启动 → enroll 并等待首次心跳成功 → `getent` 抽检分流域名解析到网关 IP → resolv.conf 定型为 agent DNS 在前 + 公网 DNS 兜底在后 → 摘除 hosts 托管块 → 清理旧脚本、dnsmasq 配置与 watchdog 状态。任何一步失败回滚快照，机器回到迁移前状态。hosts 托管块机制在 agent 模式下整体废弃。
+ - `cn-check` / `cn-status` / `cn-restore` 命令名与语义保留：agent 模式下内部改为读 agent 本地状态、驱动 agent；`cn-restore` 停用 agent、还原 resolv.conf、清除 `agent.json`。
+ - `/api/cn` 保留全部现有字段，新增 `agent_binary_url` 等 agent 相关字段；`/api/cn` 与 `/api/dns/status` 的域名列表改为 live 配置，`DefaultSplitDomains()` 与 bootstrap.sh 的 `CN_DEFAULT_DOMAINS` 只保留为全新安装的初始种子。
+ 
+ ### 兼容性
+ 
+ - 升级顺序：先代理机（普通 `warden upgrade` 到 v1.6.0），后国内机，两步互相独立，中间可停留任意久。升级网关后 `/api/agent/*` 可用但注册表为空，老国内机行为完全不变。
+diff --git a/README.md b/README.md
+index 5dcb66e..02b728f 100644
+--- a/README.md
++++ b/README.md
+@@ -270,33 +270,33 @@ warden-gateway version
+ ```bash
+ curl -fsSL https://panel.example.com/bootstrap.sh -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh cn-setup \
+   --origin https://panel.example.com --gateway-ip 192.0.2.10 \
+   --enroll-token <面板生成的令牌> --yes
+ ```
+ 
+ 命令由面板生成；`--gateway-ip` 是网关公网地址（agent 探测用它判定网关可达），enroll token 只能用一次。脚本通过面板地址下载，不依赖 GitHub。执行时按固定顺序迁移：
+ 
+ 1. 快照所有将被改动的文件；resolv.conf 先写入公网兜底 DNS 作为安全网。
+ 2. 停止并禁用旧 dnsmasq 与看门狗单元，resolv.conf 暂置纯公网直连——此刻就是装 warden 之前的老状态，业务不中断。
+-3. 经网关自己的 GitHub 代理短路径下载 agent 二进制，安装 `warden-cn-agent` systemd 服务（`Restart=always` + `WatchdogSec=60` + 内存约束），注册（enroll）并等待首次心跳成功，抽检分流域名在本机解析到网关 IP。
++3. 从网关自托管端点下载 agent 二进制（网关安装/升级时已预取三种架构的构建到 `$SCRIPT_DIR/agent/`），安装 `warden-cn-agent` systemd 服务（`Restart=always` + `WatchdogSec=60` + 内存约束），注册（enroll）并等待首次心跳成功，抽检分流域名在本机解析到网关 IP。
+ 4. resolv.conf 定型为 agent DNS（`198.18.0.1`）在前 + 公网 DNS 兜底在后：agent 进程整体死亡时解析落到公网 DNS，退化为无分流但绝不断网。NetworkManager `dns=none` 守卫保留。
+ 5. 摘除 `/etc/hosts` 托管块，清理旧 dnsmasq 配置与看门狗脚本。任何一步失败自动回滚快照，机器回到迁移前状态。
+ 
+ ### agent 提供什么
+ 
+ | 项目 | 说明 |
+ | --- | --- |
+ | 内置 DNS | 分流域名答网关 IP，其余转发上游；网关不可达时逐查询降级为直连解析，任何查询都有答案，不悬挂到客户端超时 |
+ | 健康探测 | 沿用 legacy 看门狗的判定分类（见下文），先确认本机外网正常再判定网关故障 |
+ | 心跳 | 默认每 10 秒上报状态、领命令、拿最新分流域名列表（±20% 抖动避免多机同拍）；网关 30 秒无心跳判定离线 |
+ | workload 发现 | 通过 docker socket 枚举运行中容器（名称、镜像、状态、启动时间），带 Coolify 标签的归组为应用，只采集元数据，不含环境变量与业务数据 |
+-| 自升级 | 面板逐台触发，或为单台打开「自动跟随网关版本」（默认关）；经网关 GitHub 代理短路径下载、SHA-256 校验、原子替换，失败下个心跳重试，新版本连续崩溃由 systemd 回退旧二进制 |
++| 自升级 | 面板逐台触发（可选任意**已缓存**版本，低于网关版本即回退，未缓存版本被拒绝），或为单台打开「自动跟随网关版本」（默认关）；从网关自托管端点 `/api/agent/binary/{version}/{arch}` 下载、SHA-256 校验、原子替换，失败下个心跳重试，新版本连续崩溃由 systemd 回退旧二进制并阻止该版本被反复重试 |
+ 
+ 面板「国内机」页展示每台机器的在线状态、健康分类、版本、磁盘/内存/负载、容器与应用摘要、最后心跳时间，可远程触发：立即同步、自检、升级、注销。没有远程重启或整机 reboot。
+ 
+ 分流域名在面板「设置」页的分流域名编辑器增删：保存后成为运行时唯一事实源，自动补进 SNI 透传列表，网关重启生效，并在心跳周期内下发到所有在线 agent。迁移完成后，分流域名的日常变更不再需要登录国内机。
+ 
+ agent 与网关全程 HTTPS（复用面板证书）；machine token 在网关只存 SHA-256 摘要，在 agent 端保存在 0600 的 `/etc/warden-gateway-cn/agent.json`。
+ 
+ ### 检查与回退
+ 
+ ```bash
+diff --git a/bootstrap.sh b/bootstrap.sh
+index ab9aac6..c7b7c90 100755
+--- a/bootstrap.sh
++++ b/bootstrap.sh
+@@ -488,20 +488,94 @@ install_binary() {
+   if [ -n "$BINARY" ]; then
+     step "安装" "使用本地二进制 $BINARY"
+     install_binary_local
+   else
+     step "安装" "下载 $VERSION 版本"
+     install_binary_from_release
+   fi
+   mv -f "$BIN_PATH.new" "$BIN_PATH"
+ }
+ 
++# cache_agent_binaries 把本版本的 agent 构建（三种架构 + 裸 hex sha256 侧车）
++# 预取到 $SCRIPT_DIR/agent/，由面板 /api/agent/binary/{version}/{arch} 对外提供。
++# 国内机的安装与自升级因此只连本网关，不必访问 GitHub；预取失败不阻塞网关安装
++# （面板会返回 404 并提示重跑安装器），但会在输出里明确告警。
++cache_agent_binaries() {
++  local arch asset tmp ok_flag=0 ver_dir
++  [ "$DRY_RUN" -eq 1 ] && { printf '  + 预取 agent 构建到 %s/agent/%s/\n' "$SCRIPT_DIR" "${VERSION#v}"; return 0; }
++  # 每个版本一个目录：/agent/<version>/<asset>[.sha256]。多版本才能支持灰度与
++  # 回退——把某台机器钉在旧构建上，或回滚到已缓存的版本。
++  ver_dir="$SCRIPT_DIR/agent/${VERSION#v}"
++  mkdir -p "$ver_dir" 2>/dev/null || { warn "创建 agent 缓存目录失败：$ver_dir"; return 1; }
++  local base
++  if [ "$VERSION" = "latest" ]; then
++    base="https://github.com/$REPO/releases/latest/download"
++  else
++    base="https://github.com/$REPO/releases/download/$VERSION"
++  fi
++  for arch in amd64 arm64 arm; do
++    asset="warden-cn-agent-linux-$arch"
++    tmp="$ver_dir/.$asset.$$"
++    if ! download "$base/$asset" "$tmp"; then
++      rm -f "$tmp"
++      warn "预取 agent 构建失败：$asset（面板将无法分发该架构的 agent）"
++      continue
++    fi
++    if [ ! -s "$tmp" ]; then
++      rm -f "$tmp"
++      warn "预取的 agent 构建为空：$asset"
++      continue
++    fi
++    mv -f "$tmp" "$ver_dir/$asset"
++    sha256sum "$ver_dir/$asset" 2>/dev/null | awk '{print $1}' > "$ver_dir/$asset.sha256" || {
++      rm -f "$ver_dir/$asset" "$ver_dir/$asset.sha256"
++      warn "生成 agent 校验和失败：$asset"
++      continue
++    }
++    chmod 0755 "$ver_dir/$asset"
++    chmod 0644 "$ver_dir/$asset.sha256"
++    ok_flag=1
++  done
++  if [ "$ok_flag" -eq 1 ]; then
++    ok "agent 构建已缓存到 $ver_dir（国内机只连本网关下载）"
++    cn_prune_agent_cache
++  fi
++  return 0
++}
++
++# cn_prune_agent_cache 只保留最近 3 个 agent 版本目录（含本次刚缓存的）。
++# 更旧的删除，避免网关磁盘随发版无限增长；正在被机器钉住的版本若被清掉，
++# 该机器的心跳仍会指向它，下载会 404 并保持旧二进制运行（安全网第 6 条）。
++cn_prune_agent_cache() {
++  local root="$SCRIPT_DIR/agent" keep=3
++  [ -d "$root" ] || return 0
++  # 按版本号排序（sort -V 可用时用它，否则退化为字典序），删除第 keep 个之后的。
++  local dirs
++  if dirs="$(find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V)"; then
++    :
++  else
++    dirs="$(find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sed 's#.*/##' | sort)"
++  fi
++  [ -n "$dirs" ] || return 0
++  local total idx name
++  total="$(printf '%s\n' "$dirs" | wc -l)"
++  idx=0
++  while IFS= read -r name; do
++    [ -n "$name" ] || continue
++    idx=$((idx + 1))
++    if [ "$idx" -le $((total - keep)) ]; then
++      rm -rf "$root/$name" 2>/dev/null || true
++    fi
++  done <<< "$dirs"
++  return 0
++}
++
+ is_cn_mirror() {
+   case "$1" in
+     *://mirrors.aliyun.com*|*://mirrors.cloud.aliyuncs.com*|*://mirrors.tuna.tsinghua.edu.cn*|*://mirrors.ustc.edu.cn*|*://mirrors.cloud.tencent.com*|*://mirrors.huaweicloud.com*|*://mirrors.163.com*|*://mirrors.bfsu.edu.cn*|*://mirrors.nju.edu.cn*|*cmecloud.cn*|*://mirrors.zju.edu.cn*|*://mirrors.sjtug.sjtu.edu.cn*) return 0;;
+     *) return 1;;
+   esac
+ }
+ 
+ is_email() {
+   case "$1" in
+     *@*.*) return 0;;
+@@ -1970,21 +2044,23 @@ cn_agent_write_config() {
+ EOF
+ }
+ 
+ # cn_agent_download 经代理机的 GitHub 代理短路径下载 agent 二进制
+ # （spec §9.3：一律不直连 GitHub）。systemd 会以 root 运行这个二进制，
+ # 安装前必须用 .sha256 侧车校验（与 agent 自升级同严格：侧车只允许裸 hex，
+ # 两列 sha256sum 输出视为格式错误；缺侧车即失败，不静默跳过），
+ # 校验通过才原子替换到 $CN_AGENT_BIN。
+ cn_agent_download() {
+   local version="$1" arch="$2" url tmp sidecar expected actual
+-  url="$CN_AGENT_ORIGIN/github.com/$REPO/releases/download/v$version/warden-cn-agent-linux-$arch"
++  # 网关自托管：面板把与自身同版本的 agent 构建缓存在本地，国内机只连网关，
++  # 安装与升级都不必再访问 GitHub（agent 自升级走同一条路径）。
++  url="$CN_AGENT_ORIGIN/api/agent/binary/${version#v}/warden-cn-agent-linux-$arch"
+   step "下载" "$url"
+   if [ "$DRY_RUN" -eq 1 ]; then
+     printf '  + curl -fsSL %s -o %s\n' "$url" "$CN_AGENT_BIN"
+     return 0
+   fi
+   if ! mkdir -p "$(dirname "$CN_AGENT_BIN")"; then
+     warn "创建 agent 安装目录失败：$(dirname "$CN_AGENT_BIN")"
+     return 1
+   fi
+   tmp="$CN_AGENT_BIN.new.$$"
+@@ -1994,21 +2070,21 @@ cn_agent_download() {
+     rm -f "$tmp"
+     warn "下载 agent 二进制失败"
+     return 1
+   fi
+   if [ ! -s "$tmp" ]; then
+     rm -f "$tmp"
+     warn "下载的 agent 二进制为空"
+     return 1
+   fi
+   # .sha256 侧车校验（缺侧车或格式不符都算失败）。
+-  local sidecar="$CN_AGENT_ORIGIN/github.com/$REPO/releases/download/v$version/warden-cn-agent-linux-$arch.sha256"
++  local sidecar="$CN_AGENT_ORIGIN/api/agent/binary/${version#v}/warden-cn-agent-linux-$arch.sha256"
+   if ! curl -kfsS --connect-timeout 10 --max-time 60 \
+       -o "$tmp.sha" "$sidecar"; then
+     rm -f "$tmp" "$tmp.sha"
+     warn "下载 agent sha256 侧车失败：$sidecar"
+     return 1
+   fi
+   expected="$(tr -d ' \r\n\t' < "$tmp.sha")"
+   rm -f "$tmp.sha"
+   case "$expected" in
+     ''|*[!0-9a-fA-F]*)
+@@ -2045,26 +2121,37 @@ cn_agent_download() {
+ # warden-cn-agent 连续重启 >= 2 次时，若存在自升级备份 .prev，则换回旧二进制
+ # 并清掉失败计数（spec §8 安全网：新版本启动失败自动回退），结果记入日志文件。
+ cn_agent_write_guard() {
+   cn_snapshot_file "$CN_AGENT_ROLLBACK_GUARD"
+   cn_put_file "$CN_AGENT_ROLLBACK_GUARD" 0755 <<GUARDEOF
+ #!/bin/bash
+ # 由 warden-gateway bootstrap 生成，请勿手工编辑。
+ set -u
+ BIN="$CN_AGENT_BIN"
+ LOG="$CN_AGENT_GUARD_LOG"
++STATE_DIR="$CN_AGENT_STATE_DIR"
+ nrestarts="\$(systemctl show warden-cn-agent -p NRestarts --value 2>/dev/null || printf '0')"
+ case "\$nrestarts" in ''|*[!0-9]*) nrestarts=0;; esac
+ [ "\$nrestarts" -ge 2 ] || exit 0
+ [ -e "\$BIN.prev" ] || exit 0
++# 回滚前先把「待验证版本」转成「已阻止版本」：恢复后的旧 agent 下次心跳会
++# 看到同一个 target_version，没有这个标记就会再装一次、再崩一次（升级回滚
++# 循环）。只有面板显式下发的 self-upgrade 命令才会清掉它。
++if [ -f "\$STATE_DIR/upgrade-pending" ]; then
++  tr -d ' \r\n' < "\$STATE_DIR/upgrade-pending" > "\$STATE_DIR/upgrade-blocked" 2>/dev/null || true
++  rm -f "\$STATE_DIR/upgrade-pending"
++fi
+ if mv -f "\$BIN.prev" "\$BIN"; then
+   printf '%s warden-cn-agent 连续崩溃 %s 次，已回退到上一个二进制\n' "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" "\$nrestarts" >> "\$LOG" 2>/dev/null || true
++  if [ -s "\$STATE_DIR/upgrade-blocked" ]; then
++    printf '%s 已阻止版本 %s 的自动升级（需面板手动升级）\n' "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" "\$(cat "\$STATE_DIR/upgrade-blocked")" >> "\$LOG" 2>/dev/null || true
++  fi
+   systemctl reset-failed warden-cn-agent >/dev/null 2>&1 || true
+ fi
+ exit 0
+ GUARDEOF
+ }
+ 
+ # cn_agent_write_unit 写 warden-cn-agent.service。WatchdogSec=60（裁定 R7：
+ # 最坏探测周期约 39s，30s 会被误杀）；第一个 ExecStartPre 确保 198.18.0.1
+ # 存在（agent 不自建 dummy 接口，与 legacy dnsmasq 单元同款），第二个跑
+ # 崩溃回退守卫。
+@@ -2217,50 +2304,89 @@ cn_agent_cleanup_legacy() {
+   if [ "$DRY_RUN" -eq 0 ] && have systemctl; then
+     systemctl daemon-reload >/dev/null 2>&1 || true
+   fi
+   return 0
+ }
+ 
+ # cn_agent_rollback 迁移失败回滚（spec §9.4 失败中止语义）：恢复第 1 步
+ # 快照、重新启用旧单元、resolv.conf 还原为纯公网兜底——第 2 步写入的公网
+ # DNS 保留（无害且有益）。resolv.conf 的原始内容不在回滚中还原，而是留在
+ # 快照归档里，供 cn-restore 完整回退到迁移前。
++# 例外（重复迁移，裁定于最终评审修复 5）：机器在本次 cn-setup 之前就已是
++# agent 模式（快照记录 warden-cn-agent.service existed=1）时，失败重跑不能
++# 把此前正常工作的 agent 留在停用状态——按快照还原迁移前的 agent 态
++# resolv.conf（198.18.0.1 在前 + 公网兜底），并重新 enable --now
++# warden-cn-agent。原本就是 legacy 的机器保持原样：纯公网 + 旧单元。
+ cn_agent_rollback() {
+-  local path existed size stored
++  local path existed size stored agent_was=0
+   warn "agent 迁移失败，回滚到迁移前状态（保留公网兜底 DNS）"
+   if [ "$DRY_RUN" -eq 0 ] && have systemctl; then
+     systemctl disable --now "$CN_AGENT_UNIT_NAME" >/dev/null 2>&1 || true
+   fi
+   if [ -f "$CN_BACKUP_DIR/records.tsv" ]; then
+     # records.tsv 行格式与 cn_finish_backup 相同：path \t existed \t size，
+     # 三个变量都必须接收，否则 existed 会吞进 size 导致误删而非还原。
+     while IFS="$(printf '\t')" read -r path existed size; do
+       [ -n "$path" ] || continue
++      # 重复迁移探测：迁移前 agent 单元已存在（existed=1）→ 本次是在已有
++      # agent 的机器上重跑 cn-setup --enroll-token，回滚要恢复 agent 模式。
++      if [ "$path" = "$CN_AGENT_UNIT" ] && [ "$existed" = "1" ]; then
++        agent_was=1
++      fi
+       case "$path" in
+         *resolv.conf) continue;;
+       esac
+       if [ "$existed" = "1" ]; then
+         stored="$CN_BACKUP_DIR/files/$(cn_path_hash "$path")"
+         if [ -f "$stored" ]; then
+           mkdir -p "$(dirname "$path")" 2>/dev/null || true
+           cp -p "$stored" "$path" || warn "回滚恢复失败：$path"
+         fi
+       else
+         rm -f "$path"
+       fi
+     done < "$CN_BACKUP_DIR/records.tsv"
+   fi
+-  cn_agent_resolv_write public || true
++  if [ "$agent_was" = "1" ]; then
++    # 迁移前 agent 就在本机运行：resolv.conf 按快照还原（快照里的正是迁移
++    # 前的 agent 定型形态），而不是改写为纯公网。
++    if [ -f "$CN_BACKUP_DIR/records.tsv" ]; then
++      while IFS="$(printf '\t')" read -r path existed size; do
++        [ -n "$path" ] || continue
++        case "$path" in
++          *resolv.conf) ;;
++          *) continue;;
++        esac
++        if [ "$existed" = "1" ]; then
++          stored="$CN_BACKUP_DIR/files/$(cn_path_hash "$path")"
++          if [ -f "$stored" ]; then
++            mkdir -p "$(dirname "$path")" 2>/dev/null || true
++            cp -p "$stored" "$path" || warn "回滚恢复失败：$path"
++          fi
++        fi
++      done < "$CN_BACKUP_DIR/records.tsv"
++    fi
++  else
++    cn_agent_resolv_write public || true
++  fi
+   if [ "$DRY_RUN" -eq 0 ] && have systemctl; then
+     systemctl daemon-reload >/dev/null 2>&1 || true
+     systemctl enable --now "$CN_DNS_UNIT_NAME" >/dev/null 2>&1 || true
+     systemctl enable --now "$CN_WATCH_UNIT_NAME.timer" >/dev/null 2>&1 || true
++    if [ "$agent_was" = "1" ]; then
++      # 单元文件与二进制已按快照还原，把此前正常工作的 agent 重新拉起。
++      if ! systemctl enable --now "$CN_AGENT_UNIT_NAME" >/dev/null 2>&1; then
++        warn "warden-cn-agent 重新启动失败：journalctl -u $CN_AGENT_UNIT_NAME -n 30"
++      fi
++    fi
++  elif [ "$DRY_RUN" -eq 1 ] && [ "$agent_was" = "1" ]; then
++    printf '  + systemctl enable --now %s\n' "$CN_AGENT_UNIT_NAME"
+   fi
+   return 0
+ }
+ 
+ # cn_agent_fail 迁移任一步失败的统一出口：回滚 + 快照归档（供 cn-restore
+ # 完整回退，含 resolv.conf 原始内容）。总是返回 0，由调用方 return 1。
+ cn_agent_fail() {
+   cn_agent_rollback || true
+   cn_finish_backup || true
+   cn_prune_backups || true
+@@ -3047,20 +3173,21 @@ cmd_install() {
+     install_scripts
+     install_cli
+     pull_docker_image
+     init_docker_config
+     run_docker_container
+   else
+     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+     install_binary
+     init_config
+     install_scripts
++    cache_agent_binaries || true
+     install_cli
+     write_version_from_binary
+     install_unit
+     install_logrotate
+     install_service
+   fi
+   if wait_health "$PUBLIC_URL"; then
+     ok "健康检查通过"
+   else
+     journalctl -u "$SERVICE" -n 40 --no-pager || true
+@@ -3101,27 +3228,29 @@ cmd_update() {
+     info "脚本" "使用仓库最新脚本执行升级"
+     NW_UPDATE_REEXEC=1 UPDATE_SCRIPT_DIR="$UPDATE_SCRIPT_DIR" exec bash "$UPDATE_SCRIPT_DIR/bootstrap.sh" "${ORIG_ARGS[@]}"
+   fi
+   if [ "${NW_UPDATE_REEXEC:-0}" = "1" ] && [ -n "${UPDATE_SCRIPT_DIR:-}" ]; then
+     trap 'rm -rf "$UPDATE_SCRIPT_DIR"' EXIT
+   fi
+   title "Warden Gateway 升级"
+   if [ -z "$PUBLIC_URL" ]; then PUBLIC_URL="$(config_public_url)"; fi
+   if [ "$MODE" = "docker" ]; then
+     install_scripts
++    cache_agent_binaries || true
+     install_cli
+     pull_docker_image
+     run_docker_container
+   else
+     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+     install_binary
+     install_scripts
++    cache_agent_binaries || true
+     install_cli
+     write_version_from_binary
+     install_unit
+     install_logrotate
+     systemctl daemon-reload
+     systemctl start "$SERVICE"
+   fi
+   sleep 2
+   if [ -n "$PUBLIC_URL" ] && wait_health "$PUBLIC_URL" 1; then ok "升级完成"; else warn "升级后健康检查未通过"; fi
+ }
+diff --git a/cmd/warden-cn-agent/main.go b/cmd/warden-cn-agent/main.go
+index 9611370..1a3cd25 100644
+--- a/cmd/warden-cn-agent/main.go
++++ b/cmd/warden-cn-agent/main.go
+@@ -96,22 +96,23 @@ func runRun(args []string) error {
+ 	defer logger.Close()
+ 
+ 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+ 	defer stop()
+ 
+ 	logger.Infof("warden-cn-agent %s starting, origin %s", version.String(), cfg.Origin)
+ 	return a.Run(ctx)
+ }
+ 
+ // runOnce executes exactly one cycle and prints a one-line result. A queued
+-// deregister that completed successfully is a clean exit (exit 0), not an
+-// error.
++// deregister or a completed self-upgrade is a clean exit (exit 0), not an
++// error: after an upgrade the binary is already swapped on disk, so exiting 0
++// lets systemd Restart=always bring the new version up.
+ func runOnce(args []string) error {
+ 	fs := flag.NewFlagSet("once", flag.ExitOnError)
+ 	cfgPath := fs.String("config", defaultAgentConfigPath, "agent configuration file")
+ 	if err := fs.Parse(args); err != nil {
+ 		return err
+ 	}
+ 	a, _, logger, err := newAgent(*cfgPath)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -122,14 +123,17 @@ func runOnce(args []string) error {
+ 	defer stop()
+ 
+ 	err = a.RunOnce(ctx)
+ 	switch {
+ 	case err == nil:
+ 		fmt.Println("once: cycle completed")
+ 		return nil
+ 	case cnagent.IsDeregistered(err):
+ 		fmt.Println("once: agent deregistered")
+ 		return nil
++	case cnagent.IsUpgraded(err):
++		fmt.Println("once: agent upgraded, exiting for restart")
++		return nil
+ 	default:
+ 		return err
+ 	}
+ }
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index 0d9bb28..5d221da 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -48,21 +48,21 @@ GET https://panel.example.com/github.com/owner/repo/...         -> SNI -> 8443 -
+ ### 国内机 Agent
+ 
+ 国内机上运行的 `warden-cn-agent`（`cmd/warden-cn-agent`，逻辑在 `internal/cnagent`）是独立进程，只向网关发起连接：
+ 
+ ```text
+ 国内机 warden-cn-agent
+   POST /api/agent/heartbeat -> 443 SNI(panel.example.com) -> 8443 -> 会话无关的 Bearer token 认证 -> 命令队列 + 分流域名列表 + 目标版本
+   POST /api/agent/enroll    -> 一次性 enroll token 换发 machine token（网关只存 SHA-256 摘要）
+ ```
+ 
+-agent 内置 DNS 监听 `198.18.0.1:53`（复用 `internal/dnsproxy`）：分流域名答网关 IP，其余转发上游；健康探测判定网关不可达时逐查询降级为直连解析。心跳默认 10 秒（±20% 抖动），网关 30 秒无心跳判定离线，按 token 8 秒限流。agent 命令为 `sync-domains`、`self-check`、`self-upgrade`、`deregister`；自升级经网关的 GitHub 代理短路径下载 Release 二进制并以 `.sha256` 侧车校验。
++agent 内置 DNS 监听 `198.18.0.1:53`（复用 `internal/dnsproxy`）：分流域名答网关 IP，其余转发上游；健康探测判定网关不可达时逐查询降级为直连解析。心跳默认 10 秒（±20% 抖动），网关 30 秒无心跳判定离线，按 token 8 秒限流。agent 命令为 `sync-domains`、`self-check`、`self-upgrade`、`deregister`；自升级从网关**自托管端点** `/api/agent/binary/{version}/{arch}` 取缓存构建并以 `.sha256` 侧车校验，全程不访问 GitHub。网关在安装/升级时由 `cache_agent_binaries` 把三种架构的构建预取到 `$SCRIPT_DIR/agent/`，该目录由面板对外提供。
+ 
+ 分流域名的运行时事实源是 `cfg.DNS.Domains`：面板编辑保存后自动补进 SNI 透传列表，随服务重启生效，并在心跳周期内下发到所有在线 agent（版本 hash 变化才带全量）。`DefaultSplitDomains()` 只作为全新安装的初始种子。注册表、machine token 摘要、命令队列、机器快照与事件 journal 持久化在 `<DataDir>/cn-agents.json`（0600），纳入备份/恢复；agent 管理操作记入审计日志。
+ 
+ ### 透传
+ 
+ 未命中面板域名且命中透传列表的 SNI 会被原样转发到 `host:443`。TLS 不终止，客户端仍校验原站证书。
+ 
+ ## 配置与数据
+ 
+ | 路径 | 内容 |
+diff --git a/docs/superpowers/specs/2026-11-17-cn-agent-design.md b/docs/superpowers/specs/2026-11-17-cn-agent-design.md
+index 0c2a61c..08b029e 100644
+--- a/docs/superpowers/specs/2026-11-17-cn-agent-design.md
++++ b/docs/superpowers/specs/2026-11-17-cn-agent-design.md
+@@ -81,29 +81,31 @@ agent 自己监听 198.18.0.1:53，分流域名答网关 IP、其余转发上游
+ ## 6. 组件设计
+ 
+ ### 6.1 warden-cn-agent（新 `cmd/warden-cn-agent`）
+ 
+ - 单二进制，静态编译，systemd 常驻。
+ - **内置 DNS 服务器**：复用 `internal/dnsproxy.Proxy`（同一 Go module），监听 `198.18.0.1:53`（地址与现网一致，resolv.conf 语义不变）。分流域名 → 网关 IP；其余 → 上游。降级时（探测判定网关不可达）分流域名也直接走上游返回——降级逐查询生效，无状态机延迟。
+ - **健康探测循环**：沿用现有分类 `OK` / `LINK_443_BLOCKED` / `LINK_PORTS_BLOCKED` / `C_DOWN` / `LOCAL_BROKEN`；保留"本地对照组先确认外网正常，再判定网关故障"的逻辑，避免把本机断网误判成网关故障。
+ - **workload 自动发现**：通过 docker socket 枚举容器（名称、镜像、状态、启动时间）；带 Coolify 标签的容器归组为应用上报。只采集元数据（见 8.2）。
+ - **心跳**：默认每 10 秒 `POST /api/agent/heartbeat`（Bearer machine token；±20% 抖动避免多台机器同拍，间隔可在 agent 配置调整）。单台负载约 6 次请求/分钟，网关侧可忽略。响应携带：待执行命令、域名列表（含版本 hash，agent 本地 hash 一致则忽略）、升级意图——网关为每台机器持久化「目标版本」，开启「自动跟随网关版本」的机器随网关发版自动更新目标版本；agent 仅在目标版本与本地不一致时执行自升级。
+ - **命令执行**：`sync-domains`（立即重新拉取并应用）、`self-check`（执行等价 cn-check 的检查，报告随下次心跳回传）、`self-upgrade`、`deregister`（清除本机分流配置、恢复直连 resolv.conf、停用自身单元）。**没有远程重启命令**：升级与配置变更本身会重启 agent，卡死由 systemd 看门狗处理；面板不做整机 reboot 能力（已决策，2026-11-17）。
+-- **自升级**：从 GitHub Releases 下载目标版本二进制——URL 走**网关自己的 GitHub 代理短路径**（`{origin}/github.com/tktogether/warden-gateway/releases/download/{tag}/...`），同源拉取 `.sha256` 侧车校验通过 → 临时文件写入 → 原子 rename 替换自身 → 退出交由 systemd 重启。下载失败或校验不过 → 本次不动，下个心跳重试（安全网第 6 条）。新版本启动失败（连续 2 次崩溃）时 systemd 自动回退到备份的旧二进制（unit 里用 `ExecStartPre` 恢复机制）。
++- **自升级**：从**网关自托管的缓存构建**下载目标版本二进制——URL 为 `{origin}/api/agent/binary/{version}/{arch}`，同源拉取 `.sha256` 侧车校验通过 → 临时文件写入 → 原子 rename 替换自身 → 退出交由 systemd 重启。国内机全程不访问 GitHub。下载失败或校验不过 → 本次不动，下个心跳重试（安全网第 6 条）。新版本启动失败（连续 2 次崩溃）时 systemd 自动回退到备份的旧二进制（unit 里用 `ExecStartPre` 恢复机制）。
+ - **本地状态文件**：`/etc/warden-gateway-cn/agent.json`（0600：machine token、网关 origin、上游 DNS、当前列表 hash）；所有改动前快照（沿用现有 `cn_snapshot_file` 模式）。
+ 
+ ### 6.2 网关侧 `/api/agent/*`（新）
+ 
+ - `POST /api/agent/enroll`：一次性 enroll token + 机器信息 → 颁发 machine token（随机 32 字节，网关只存 SHA-256 摘要）。enroll token 用后即焚。
+ - `POST /api/agent/heartbeat`：认证后接收上报，返回命令队列 + 域名列表 + agent 版本。连续 3 个周期（30 秒）无心跳判定离线。每 token 限流。
+-- **不设 agent 二进制托管端点**：分发走网关 GitHub 代理短路径直取 GitHub Releases（见 6.1 与 9.3），网关只掌控"目标版本"。
++- `GET /api/agent/binary/{version}/{arch}[.sha256]`：**自托管** agent 缓存构建。内容来自 `$SCRIPT_DIR/agent/<version>/`，由安装/升级时的 `cache_agent_binaries` 预取（三种架构 + 裸 hex 侧车，保留最近 3 个版本）。两段路径都走白名单 + 版本格式校验，未缓存版本一律 404；无需认证（bootstrap 在拿到 token 前就要下载，内容是公开构建产物）。国内机因此只连网关，不必访问 GitHub。多版本目录是灰度与回退的前提：面板可把某台机器钉在任意已缓存版本上。
+ - **升级策略（已决策，2026-11-17）**：默认手动——面板逐台点「升级」才设置该机器的目标版本；每台机器可单独打开「自动跟随网关版本」开关（默认关）。生产机上不会出现无人触发的二进制替换。
++- **目标版本优先级**：操作员 pin（显式升级或回退选定的版本）> AutoFollow（网关自身版本）> 空（机器保持现状）。选中任何**已缓存**版本即为合法意图，低于网关版本就是回退；未缓存版本直接 400，避免机器反复 404。
++- **升级回滚循环守卫**：agent 在替换二进制退出前写 `upgrade-pending`（待验证版本）；systemd `ExecStartPre` 守卫连续两次崩溃回退时，把它转成 `upgrade-blocked`。恢复后的 agent 看到被阻止版本就不再自动重试（否则同一坏包会无限重启），只在面板显式下发 `self-upgrade` 时清除阻止。
+ - **持久化**：注册表、machine token 摘要、待执行命令队列、每台机器的最新快照与事件 journal 落盘到 DataDir 独立状态文件（0600），并纳入现有备份/恢复流程；内存仅作运行缓存。网关重启或升级不得丢失已注册机器——否则国内机就得登机重跑 enroll，直接违背"全程无需登录国内机"。所有 agent 管理操作进 audit log。
+ 
+ ### 6.3 面板
+ 
+ - 新页「国内机」：机器卡片（在线/离线、版本、健康分类、磁盘/内存/负载、容器与应用摘要、最后心跳时间）+ 操作按钮（立即同步、自检、升级、注销；**无远程重启/重启整机入口**）。轻量刷新模式同现有面板指标页。
+ - **分流域名管理**（原诉求 1）：设置页新增「分流域名」编辑器（增删改查）。保存后：
+   1. 写入 `cfg.DNS.Domains` —— 这成为运行时唯一事实源；
+   2. 校验每个域名被 `sni.passthrough` 某个模式覆盖，未覆盖的自动补进 passthrough（用户显式管理过的 passthrough 不被覆盖时给出提示）；
+   3. 保存即生效——沿用现有 `scheduleRestart` 机制，即 `systemctl restart` 整个网关服务：秒级中断，所有 443 在途连接断一次。域名编辑低频、中断可接受，v1 就这么做；零中断热替换列为后续优化，不进 v1 验收；
+   4. 心跳周期内自动下发到所有在线 agent。
+@@ -157,29 +159,29 @@ agent 自己监听 198.18.0.1:53，分流域名答网关 IP、其余转发上游
+ - 存量迁移是唯一需要登录国内机的动作（NAT 决定无法省略）；迁移完成后一切变更远程进行。
+ 
+ ### 9.2 代理机侧数据迁移
+ 
+ - 首次以 v1.6.0 启动：`cfg.DNS.Domains` 为空则用 `DefaultSplitDomains()` 播种并保存（配置版本号 +1）。此后面板编辑改的就是这份 live 列表——这是"事实源切换"的落地点。
+ - 注册表 / 命令队列状态文件按需创建（DataDir，0600），纳入现有备份/恢复。
+ 
+ ### 9.3 agent 二进制的供给（已决策：经代理机获取，不捆绑托管）
+ 
+ - CI 同时构建 `warden-gateway` 与 `warden-cn-agent`（linux-amd64 静态编译），发布到同一 GitHub Release——tag 化即天然多版本，回退与灰度免费获得。
+-- 国内机（cn-setup 首装与 agent 自升级）一律经**代理机的 GitHub 代理短路径**下载：`{origin}/github.com/tktogether/warden-gateway/releases/download/{tag}/warden-cn-agent-linux-amd64`（+ `.sha256` 侧车）。网关不为 agent 设托管端点、不解包捆绑——分发复用现有、已被 v1.5.2/v1.5.3 打磨过的代理链路。
+-- 升级时机控制权仍在网关（目标版本来自心跳）；代理链路故障时升级自动搁置，本地照旧运行。
++- 国内机（cn-setup 首装与 agent 自升级）一律从**本网关的缓存构建**下载：`{origin}/api/agent/binary/{version}/warden-cn-agent-linux-{arch}`（+ `.sha256` 侧车）。网关在安装/升级时用 `cache_agent_binaries` 预取三种架构到 `$SCRIPT_DIR/agent/`，因此国内机只连网关、不必访问 GitHub；缓存缺失时端点 404 并提示重跑网关安装器。
++- 升级时机控制权仍在网关（目标版本来自心跳）；网关缓存缺失或下载失败时升级自动搁置，本地照旧运行。
+ 
+ ### 9.4 国内机迁移步骤（cn-setup agent 模式，顺序即设计）
+ 
+ 1. **快照**全部将被改动的文件与单元（沿用 `cn_snapshot_file` 机制）。
+ 2. **先建立安全网**：把公网兜底 DNS 写进 resolv.conf。
+ 3. **停旧**：停止并禁用旧 dnsmasq 单元与看门狗 service+timer；resolv.conf 暂置为纯公网直连（避免指向刚停掉的监听造成 5 秒超时延迟）。此刻机器处于"无分流直连"状态——就是装 warden 之前的老状态，业务不中断。
+-4. **装新**：经网关 GitHub 代理短路径下载 agent 二进制（`{origin}/github.com/.../releases/download/{tag}/...`）+ 写 `agent.json` + 装 unit，启动 agent，绑定 198.18.0.1:53（旧单元已停，无冲突）。若端口仍被异常残留占用，agent 进入重试并上报本地状态，cn-setup 报错走回滚。
++4. **装新**：经网关自托管端点下载 agent 二进制（`{origin}/api/agent/binary/{version}/{arch}`）+ 写 `agent.json` + 装 unit，启动 agent，绑定 198.18.0.1:53（旧单元已停，无冲突）。若端口仍被异常残留占用，agent 进入重试并上报本地状态，cn-setup 报错走回滚。
+ 5. **接入**：enroll → 等待首次心跳成功 → 域名列表到手 → 本机 DNS 应答自检（`getent` 抽查分流域名解析到网关 IP）通过。
+ 6. **定型**：resolv.conf 写最终形态（agent DNS 在前 + 公网在后），NetworkManager `dns=none` 守卫保留。
+ 7. **摘除 hosts 托管块**——必须摘：不摘的话 agent 降级直连时，hosts 仍把分流域名钉在网关 IP，第 8 节安全网第 1/2 条失效。
+ 8. **清理**：删除 watchdog 脚本/env/state、dnsmasq 配置、cn.env；快照归档保留供 cn-restore 回退。
+ 
+ **失败中止语义**：任何一步失败，执行已写入的回滚（恢复快照、重新启用旧单元、还原 resolv.conf），机器回到迁移前状态；第 2 步写入的公网兜底 DNS 保留（无害且有益）。
+ 
+ ### 9.5 旧命令兼容
+ 
+ - **无 `--enroll-token` 的 cn-setup 回退 legacy 模式**：按 v1.5.x 行为安装 dnsmasq + watchdog，打印弃用提示。已发出去的旧命令、脚本里的收藏命令继续可用。legacy 代码路径标记 deprecated，后续版本移除。
+diff --git a/internal/cnagent/agent.go b/internal/cnagent/agent.go
+index ceaf6cd..fc1656c 100644
+--- a/internal/cnagent/agent.go
++++ b/internal/cnagent/agent.go
+@@ -23,24 +23,31 @@ import (
+ 	"github.com/tktogether/warden-gateway/internal/dnsproxy"
+ 	"github.com/tktogether/warden-gateway/internal/logging"
+ 	"github.com/tktogether/warden-gateway/internal/version"
+ )
+ 
+ // errAgentDeregistered is the sentinel returned by RunOnce after a successful
+ // deregister command. Run turns it into a clean nil exit so systemd sees a
+ // normal stop of the (just disabled) unit instead of a failure.
+ var errAgentDeregistered = errors.New("cnagent: agent deregistered")
+ 
++// errAgentUpgraded is the sentinel returned by RunOnce after a successful
++// self-upgrade (the binary swap has already completed on disk at that point).
++// Run turns it into a clean nil exit so systemd Restart=always starts the
++// freshly installed binary (spec §6.1: 原子替换 → 退出交由 systemd 重启).
++var errAgentUpgraded = errors.New("cnagent: agent upgraded")
++
+ const (
+-	// DefaultStatePath is where the agent persists its per-cycle state file
+-	// (0644, world-readable on purpose so cn-check can read it without
+-	// privileges).
++	// DefaultStatePath is where the agent persists its per-cycle state file.
++	// The file itself is written 0644, but its parent directory is created
++	// 0700 (root-only), so only root can reach it in practice — warden-cn
++	// cn-check reads it through sudo.
+ 	DefaultStatePath = "/var/lib/warden-gateway-cn/state.json"
+ 
+ 	// defaultConfigPath is where cmd wiring loads agent.json from by default;
+ 	// deregister rewrites this file to clear the machine token.
+ 	defaultConfigPath = "/etc/warden-gateway-cn/agent.json"
+ 
+ 	// resolvConfPath is the resolver configuration deregister restores to
+ 	// public-only nameservers.
+ 	resolvConfPath = "/etc/resolv.conf"
+ 
+@@ -122,20 +129,21 @@ type Agent struct {
+ 	mu            sync.Mutex
+ 	proxy         *dnsproxy.Proxy // current DNS proxy (nil before first build)
+ 	domains       []string        // locally applied split-domain list
+ 	domainsHash   string          // hash of the applied list, echoed in every report
+ 	degraded      bool            // verdict of the last probe round
+ 	targetVersion string          // gateway-requested agent version from the latest reply
+ 	lastCommand   *CommandResult  // result of the last executed command, reported next cycle
+ 	lastError     string          // last local failure (proxy build), surfaced in the state file
+ 	applies       int             // count of successful proxy builds (tests pin "no rebuild")
+ 	deregistered  bool            // set once deregister completed; RunOnce returns the sentinel
++	upgraded      bool            // set once a self-upgrade swapped the binary; RunOnce returns the sentinel
+ }
+ 
+ // New builds an agent from the loaded configuration. It never dials anything:
+ // the DNS proxy is built lazily by the first RunOnce cycle so that a machine
+ // boots into a working DNS-forwarding state even if the gateway is unreachable
+ // (ensureProxy forwards everything upstream until the first payload arrives).
+ func New(cfg *Config, log *logging.Logger) (*Agent, error) {
+ 	if cfg == nil {
+ 		return nil, errors.New("cnagent: config is nil")
+ 	}
+@@ -174,49 +182,64 @@ func New(cfg *Config, log *logging.Logger) (*Agent, error) {
+ 	// Task 8 wiring (ruling 1): dispatch self-check into SelfCheck. The
+ 	// closure reads statePath and the bound DNS listener AT CALL TIME so
+ 	// overrides made after New (tests) and proxy rebuilds are checked, not
+ 	// the values frozen at construction.
+ 	a.checkFn = func() map[string]interface{} {
+ 		ccfg := *cfg
+ 		ccfg.DNSListen = a.boundDNSListen()
+ 		return SelfCheck(context.Background(), &ccfg, a.statePath)
+ 	}
+ 
++	// A pending marker means the previous process exited to validate a freshly
++	// installed build; reaching this line means that build started, so the
++	// guard has nothing to roll back and the marker can go.
++	a.clearUpgradePending()
++
+ 	return a, nil
+ }
+ 
+ // SetConfigPath overrides the agent.json location deregister rewrites to
+ // clear the machine token. cmd/warden-cn-agent calls it after New when
+ // --config points somewhere other than the default /etc path.
+ func (a *Agent) SetConfigPath(path string) {
+ 	a.configPath = path
+ }
+ 
+ // IsDeregistered reports whether err is the sentinel RunOnce returns after a
+ // successful deregister. Run converts the sentinel into a clean nil exit
+ // itself; cmd/warden-cn-agent once-mode uses this helper to exit 0 on it.
+ func IsDeregistered(err error) bool {
+ 	return errors.Is(err, errAgentDeregistered)
+ }
+ 
++// IsUpgraded reports whether err is the sentinel RunOnce returns after a
++// successful self-upgrade (the new binary is already in place when it fires).
++// Run converts the sentinel into a clean nil exit itself; cmd/warden-cn-agent
++// once-mode uses this helper to exit 0 so systemd restarts into the new
++// binary.
++func IsUpgraded(err error) bool {
++	return errors.Is(err, errAgentUpgraded)
++}
++
+ // Close releases the agent's local resources (the DNS proxy listener).
+ // Run calls shutdown internally on ctx cancellation and deregister; one-shot
+ // callers (cmd/warden-cn-agent once mode) call Close after RunOnce returns.
+ // Proxy.Close is idempotent, so the two paths never conflict.
+ func (a *Agent) Close() {
+ 	a.shutdown()
+ }
+ 
+ // RunOnce executes one complete cycle: probe → dns sync → heartbeat → apply
+-// reply → write state file. It returns nil unless the agent deregistered
+-// (errAgentDeregistered); every other failure is logged and retried next cycle
+-// by Run.
++// reply → write state file. It returns errAgentDeregistered after a completed
++// deregister and errAgentUpgraded after a completed self-upgrade (either the
++// command or the auto-follow target-version check); every other failure is
++// logged and retried next cycle by Run.
+ func (a *Agent) RunOnce(ctx context.Context) error {
+ 	// systemd watchdog ping, once per cycle. Task 8 replaces the default
+ 	// no-op with SDNotify; keep this exactly once per cycle so the
+ 	// WatchdogSec=30 budget holds.
+ 	if a.notifyFn != nil {
+ 		a.notifyFn(watchdogPing)
+ 	}
+ 
+ 	// 1. Probe the gateway (bounded timeouts live in probe.go).
+ 	pr := ProbeGatewayWith(ctx, a.cfg.GatewayIP, time.Now, a.prober)
+@@ -257,52 +280,90 @@ func (a *Agent) RunOnce(ctx context.Context) error {
+ 		_ = a.buildProxy(reply.Domains.Hash, reply.Domains.Domains)
+ 	}
+ 
+ 	// 5. Execute queued commands sequentially; the last result is reported
+ 	// with the next heartbeat (Report.LastCommand).
+ 	for _, cmd := range reply.Commands {
+ 		res := a.runCommand(ctx, cmd)
+ 		a.mu.Lock()
+ 		a.lastCommand = &res
+ 		a.mu.Unlock()
+-		if res.OK && cmd.Action == cmdActionDeregister {
++		if res.OK && (cmd.Action == cmdActionDeregister || cmd.Action == cmdActionSelfUpgrade) {
+ 			break // the process is about to exit; nothing after teardown matters
+ 		}
+ 	}
+ 
++	// 5b. Auto-follow / target version (spec §6.1: agent 仅在目标版本与本地
++	// 不一致时执行自升级). Every heartbeat reply names the gateway's desired
++	// agent version; when it differs from the running binary, run the same
++	// upgrade path as the self-upgrade command and exit cleanly on success
++	// (systemd Restart=always picks up the new binary). A failed download or
++	// checksum must NOT exit (spec §8 安全网第 6 条: 本次不动，下个心跳重试) —
++	// only a completed swap trips the sentinel. Skipped when the command loop
++	// already upgraded (avoid a duplicate download) or deregistered (the
++	// machine is leaving; no more upgrades).
++	if !a.deregisteredSnapshot() && !a.upgradedSnapshot() {
++		if tv := strings.TrimSpace(reply.TargetVersion); tv != "" && tv != version.Version {
++			if a.upgradeBlocked(tv) {
++				// This build already crashed twice here and the guard rolled it
++				// back. Retrying the same automatic upgrade would loop forever;
++				// wait for an operator to override it (a self-upgrade command).
++				res := CommandResult{Action: cmdActionSelfUpgrade, Detail: "upgrade to " + tv + " is blocked after a rollback (manual upgrade required)"}
++				a.mu.Lock()
++				a.lastCommand = &res
++				a.mu.Unlock()
++			} else {
++				res := CommandResult{Action: cmdActionSelfUpgrade}
++				res.OK, res.Detail = a.doUpgrade(ctx, tv)
++				a.mu.Lock()
++				a.lastCommand = &res
++				a.mu.Unlock()
++			}
++		}
++	}
++
+ 	// 6. Persist the cycle. Failures here are logged, not fatal: the DNS
+ 	// proxy must never go down because a state write failed.
+ 	a.writeState(pr, degraded)
+ 
+ 	if a.deregisteredSnapshot() {
+ 		return errAgentDeregistered
+ 	}
++	if a.upgradedSnapshot() {
++		return errAgentUpgraded
++	}
+ 	return nil
+ }
+ 
+ // Run drives cycles forever: the first cycle starts immediately (bootstrap
+ // waits for state.json to appear), then every wait is HeartbeatSeconds scaled
+ // by a ±20% jitter so fleets of CN machines do not hammer the gateway in
+-// lockstep. It returns nil on ctx cancellation and after a deregister, and
+-// keeps looping through any other cycle error.
++// lockstep. It returns nil on ctx cancellation, after a deregister and after
++// a completed self-upgrade (the clean exit lets systemd Restart=always start
++// the new binary), and keeps looping through any other cycle error.
+ func (a *Agent) Run(ctx context.Context) error {
+ 	base := a.cfg.HeartbeatSeconds
+ 	if base <= 0 {
+ 		base = DefaultHeartbeatSeconds
+ 	}
+ 	for {
+ 		err := a.RunOnce(ctx)
+ 		if errors.Is(err, errAgentDeregistered) {
+ 			a.log.Infof("agent deregistered, exiting")
+ 			a.shutdown()
+ 			return nil
+ 		}
++		if errors.Is(err, errAgentUpgraded) {
++			a.log.Infof("agent upgraded to %s, exiting for systemd restart", a.targetVersionSnapshot())
++			a.shutdown()
++			return nil
++		}
+ 		if err != nil {
+ 			a.log.Errorf("cycle failed: %v", err)
+ 		}
+ 
+ 		timer := time.NewTimer(jitteredInterval(base))
+ 		select {
+ 		case <-ctx.Done():
+ 			timer.Stop()
+ 			a.shutdown()
+ 			return nil
+@@ -470,20 +531,55 @@ func (a *Agent) boundDNSListen() string {
+ 	if p != nil {
+ 		if st := p.Status(); st.Running && st.Listen != "" {
+ 			return st.Listen
+ 		}
+ 	}
+ 	a.mu.Lock()
+ 	defer a.mu.Unlock()
+ 	return a.dnsListen
+ }
+ 
++// doUpgrade dispatches one self-upgrade through the upgradeFn hook toward
++// target (empty falls back to the last heartbeat's target_version) and marks
++// the agent upgraded once the swap completed. The (ok, detail) pair feeds
++// CommandResult: ok=true means the binary on disk was replaced and the
++// process should exit for the systemd restart (RunOnce trips the sentinel);
++// ok=false leaves the agent running and the failure is reported via
++// last_command (the next cycle retries, spec §6.1).
++func (a *Agent) doUpgrade(ctx context.Context, target string) (bool, string) {
++	if a.upgradeFn == nil {
++		return false, "not wired yet" // Task 7 wires upgradeFn
++	}
++	target = strings.TrimSpace(target)
++	if target == "" {
++		a.mu.Lock()
++		target = a.targetVersion
++		a.mu.Unlock()
++	}
++	if err := a.upgradeFn(ctx, target); err != nil {
++		return false, err.Error()
++	}
++	// upgradeFn returning nil means SelfUpgrade finished the on-disk swap.
++	// From here the only sane move is to exit so systemd starts the new
++	// binary; RunOnce turns the flag into errAgentUpgraded.
++	//
++	// The build is on disk but not proven yet: the ExecStartPre guard rolls it
++	// back if it crashes twice. Record which build is under test so that a
++	// rollback can be attributed to it and become a block instead of a retry
++	// loop (upgradeguard.go).
++	a.markUpgradePending(target)
++	a.mu.Lock()
++	a.upgraded = true
++	a.mu.Unlock()
++	return true, "upgrade to " + target + " installed, exiting for restart"
++}
++
+ // runCommand executes one gateway command. sync-domains and deregister are
+ // handled fully here; self-upgrade and self-check dispatch through the
+ // upgradeFn/checkFn hooks that Tasks 7/8 wire (nil default reports
+ // "not wired yet").
+ func (a *Agent) runCommand(ctx context.Context, cmd Command) CommandResult {
+ 	res := CommandResult{ID: cmd.ID, Action: cmd.Action}
+ 	switch cmd.Action {
+ 	case cmdActionSyncDomains:
+ 		domains, hash := a.syncDomainTargets(cmd.Params)
+ 		if hash == "" && len(domains) == 0 {
+@@ -495,38 +591,27 @@ func (a *Agent) runCommand(ctx context.Context, cmd Command) CommandResult {
+ 		}
+ 		if err := a.buildProxy(hash, domains); err != nil {
+ 			res.OK = false
+ 			res.Detail = err.Error()
+ 			return res
+ 		}
+ 		res.OK = true
+ 		res.Detail = fmt.Sprintf("applied %d domains (hash %s)", len(domains), hash)
+ 
+ 	case cmdActionSelfUpgrade:
+-		if a.upgradeFn == nil {
+-			res.OK = false
+-			res.Detail = "not wired yet" // Task 7 wires upgradeFn
+-			return res
+-		}
+-		target := strings.TrimSpace(cmd.Params["version"])
+-		if target == "" {
+-			a.mu.Lock()
+-			target = a.targetVersion
+-			a.mu.Unlock()
+-		}
+-		if err := a.upgradeFn(ctx, target); err != nil {
+-			res.OK = false
+-			res.Detail = err.Error()
+-			return res
++		// An explicit command is a human decision: it overrides an earlier
++		// automatic rollback of the same build.
++		if v := strings.TrimSpace(cmd.Params["version"]); v != "" && a.upgradeBlocked(v) {
++			a.clearUpgradeBlock("manual self-upgrade command")
+ 		}
+-		res.OK = true
+-		res.Detail = "upgrade to " + target + " started"
++		res.OK, res.Detail = a.doUpgrade(ctx, cmd.Params["version"])
++		return res
+ 
+ 	case cmdActionSelfCheck:
+ 		if a.checkFn == nil {
+ 			res.OK = false
+ 			res.Detail = "not wired yet" // Task 8 wires checkFn
+ 			return res
+ 		}
+ 		m := a.checkFn()
+ 		res.OK, _ = m["ok"].(bool)
+ 		if data, err := json.Marshal(m); err == nil {
+@@ -739,19 +824,25 @@ func (a *Agent) targetVersionSnapshot() string {
+ 	defer a.mu.Unlock()
+ 	return a.targetVersion
+ }
+ 
+ func (a *Agent) deregisteredSnapshot() bool {
+ 	a.mu.Lock()
+ 	defer a.mu.Unlock()
+ 	return a.deregistered
+ }
+ 
++func (a *Agent) upgradedSnapshot() bool {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	return a.upgraded
++}
++
+ func (a *Agent) proxyRunning() bool {
+ 	a.mu.Lock()
+ 	p := a.proxy
+ 	a.mu.Unlock()
+ 	if p == nil {
+ 		return false
+ 	}
+ 	return p.Status().Running
+ }
+diff --git a/internal/cnagent/agent_test.go b/internal/cnagent/agent_test.go
+index 78f69e8..1c0b5fe 100644
+--- a/internal/cnagent/agent_test.go
++++ b/internal/cnagent/agent_test.go
+@@ -5,24 +5,27 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"net"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"os"
+ 	"path/filepath"
+ 	"runtime"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/miekg/dns"
++
++	"github.com/tktogether/warden-gateway/internal/version"
+ )
+ 
+ // fakeGateway is a scripted heartbeat endpoint: it records every request body
+ // and lets each test decide the status code and reply payload. The reply
+ // function receives n (the 1-based request counter) and the decoded request
+ // body, mirroring how the real gateway decides whether to push domains.
+ type fakeGateway struct {
+ 	mu     sync.Mutex
+ 	bodies []map[string]any
+ 	reply  func(n int, body map[string]any) (int, any)
+@@ -609,20 +612,211 @@ func TestRunExitsCleanlyAfterDeregister(t *testing.T) {
+ 	select {
+ 	case err := <-done:
+ 		if err != nil {
+ 			t.Errorf("Run after deregister = %v, want nil (clean exit)", err)
+ 		}
+ 	case <-time.After(5 * time.Second):
+ 		t.Fatal("Run did not exit after deregister within 5s")
+ 	}
+ }
+ 
++// startUpgradeGateway serves the heartbeat endpoint and the Task 7 release
++// fixture layout (binary + bare-hex .sha256 sidecar) on one test server, so a
++// RunOnce cycle can heartbeat, read target_version and download the "new
++// binary" from the same origin — exactly how production self-upgrade flows.
++func startUpgradeGateway(t *testing.T, reply func(body map[string]any) (int, any), relVersion string, fix releaseFixture) (*httptest.Server, *atomic.Int64) {
++	t.Helper()
++	var hits atomic.Int64
++	mux := http.NewServeMux()
++	mux.HandleFunc("/api/agent/heartbeat", func(w http.ResponseWriter, r *http.Request) {
++		var body map[string]any
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			t.Errorf("decode heartbeat body: %v", err)
++		}
++		status, payload := reply(body)
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(status)
++		_ = json.NewEncoder(w).Encode(payload)
++	})
++	base := "/api/agent/binary/" + strings.TrimPrefix(relVersion, "v") + "/"
++	mux.HandleFunc(base+"warden-cn-agent-linux-amd64", func(w http.ResponseWriter, r *http.Request) {
++		hits.Add(1)
++		_, _ = w.Write(fix.binary)
++	})
++	mux.HandleFunc(base+"warden-cn-agent-linux-amd64.sha256", func(w http.ResponseWriter, r *http.Request) {
++		hits.Add(1)
++		_, _ = w.Write([]byte(fix.sidecar))
++	})
++	srv := httptest.NewServer(mux)
++	t.Cleanup(srv.Close)
++	return srv, &hits
++}
++
++// TestRunOnceUpgradesAndExits pins the actuated self-upgrade path (final
++// review fix 1a): a queued self-upgrade command whose swap completes makes
++// RunOnce return the errAgentUpgraded sentinel and Run exit cleanly, so
++// systemd Restart=always starts the freshly installed binary. SelfUpgrade
++// returning nil means the on-disk swap is already done, so the exit happens
++// strictly after the binary file was replaced.
++func TestRunOnceUpgradesAndExits(t *testing.T) {
++	upstream := startFakeUpstream(t, "192.0.2.1")
++	oldBinary := []byte("old warden-cn-agent binary v1.5.0")
++	newBinary := []byte("new warden-cn-agent binary v999, a different payload")
++	srv, hits := startUpgradeGateway(t,
++		func(body map[string]any) (int, any) {
++			return http.StatusOK, HeartbeatReply{
++				TargetVersion: "v999",
++				Commands:      []Command{{ID: "up1", Action: "self-upgrade", Params: map[string]string{"version": "v999"}}},
++			}
++		},
++		"v999", releaseFixture{binary: newBinary, sidecar: hexOf(newBinary) + "\n"})
++	cfg := testConfig(t)
++	cfg.Origin = srv.URL
++	cfg.Upstream = upstream
++	ta := newTestAgent(t, cfg)
++	// Same self-path injection pattern as the Task 7 SelfUpgrade tests: the
++	// hook runs the real swap against a fake "currently running binary".
++	selfPath := filepath.Join(t.TempDir(), "warden-cn-agent")
++	writeSelf(t, selfPath, oldBinary)
++	a := ta.agent
++	a.upgradeFn = func(ctx context.Context, ver string) error {
++		return SelfUpgrade(ctx, cfg, ver, "amd64", selfPath, nil)
++	}
++
++	if err := a.RunOnce(context.Background()); !errors.Is(err, errAgentUpgraded) {
++		t.Fatalf("RunOnce err = %v, want errAgentUpgraded (swap done, process must exit for systemd)", err)
++	}
++	got, err := os.ReadFile(selfPath)
++	if err != nil {
++		t.Fatalf("read self binary: %v", err)
++	}
++	if string(got) != string(newBinary) {
++		t.Errorf("self binary after upgrade = %q, want the downloaded fixture %q", got, newBinary)
++	}
++	assertNoNewFile(t, selfPath)
++	if n := hits.Load(); n != 2 {
++		t.Errorf("release requests = %d, want 2 (binary + sidecar, exactly one upgrade)", n)
++	}
++
++	// Run converts the sentinel into a clean nil exit. The gateway keeps
++	// naming the same target version, so the very next cycle completes the
++	// (idempotent) swap again and Run returns nil right away.
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan error, 1)
++	go func() { done <- a.Run(ctx) }()
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Errorf("Run after upgrade = %v, want nil (clean exit for the systemd restart)", err)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("Run did not exit after the upgrade within 5s")
++	}
++}
++
++// TestAutoFollowTriggersUpgrade pins the auto-follow ruling (spec §6.1: agent
++// 仅在目标版本与本地不一致时执行自升级): a heartbeat reply whose target_version
++// differs from the running version runs the upgrade path exactly once (and a
++// completed swap trips the exit sentinel); a matching target_version never
++// touches the upgrade path.
++func TestAutoFollowTriggersUpgrade(t *testing.T) {
++	upstream := startFakeUpstream(t, "192.0.2.1")
++
++	// target_version differs from the running version → one upgrade attempt.
++	gw := &fakeGateway{reply: func(n int, body map[string]any) (int, any) {
++		return http.StatusOK, HeartbeatReply{TargetVersion: "v999"}
++	}}
++	cfg := gw.start(t)
++	cfg.Upstream = upstream
++	ta := newTestAgent(t, cfg)
++	calls := 0
++	ta.agent.upgradeFn = func(ctx context.Context, ver string) error {
++		calls++
++		if ver != "v999" {
++			t.Errorf("upgradeFn ver = %q, want the reply's target_version v999", ver)
++		}
++		return nil
++	}
++	if err := ta.agent.RunOnce(context.Background()); !errors.Is(err, errAgentUpgraded) {
++		t.Fatalf("RunOnce err = %v, want errAgentUpgraded after the auto-follow upgrade", err)
++	}
++	if calls != 1 {
++		t.Errorf("upgradeFn calls = %d, want 1", calls)
++	}
++
++	// target_version equals the running version → no upgrade at all and a
++	// normal nil cycle.
++	gwSame := &fakeGateway{reply: func(n int, body map[string]any) (int, any) {
++		return http.StatusOK, HeartbeatReply{TargetVersion: version.Version}
++	}}
++	cfgSame := gwSame.start(t)
++	cfgSame.Upstream = upstream
++	taSame := newTestAgent(t, cfgSame)
++	sameCalls := 0
++	taSame.agent.upgradeFn = func(ctx context.Context, ver string) error {
++		sameCalls++
++		return nil
++	}
++	if err := taSame.agent.RunOnce(context.Background()); err != nil {
++		t.Fatalf("RunOnce with matching target_version = %v, want nil", err)
++	}
++	if sameCalls != 0 {
++		t.Errorf("upgradeFn calls with matching target_version = %d, want 0 (no upgrade when versions match)", sameCalls)
++	}
++}
++
++// TestUpgradeFailureKeepsRunning pins the upgrade-loop guard (final review
++// fix 1): a failed self-upgrade is reported via last_command with ok=false
++// and must NOT trip the exit sentinel — the agent keeps running, the DNS
++// proxy keeps serving, and the next cycle retries (spec §6.1: 下载失败或校验
++// 不过 → 本次不动，下个心跳重试).
++func TestUpgradeFailureKeepsRunning(t *testing.T) {
++	upstream := startFakeUpstream(t, "192.0.2.1")
++	gw := &fakeGateway{reply: func(n int, body map[string]any) (int, any) {
++		return http.StatusOK, HeartbeatReply{TargetVersion: "v999"}
++	}}
++	cfg := gw.start(t)
++	cfg.Upstream = upstream
++	ta := newTestAgent(t, cfg)
++	calls := 0
++	ta.agent.upgradeFn = func(ctx context.Context, ver string) error {
++		calls++
++		return errors.New("download failed: connection reset")
++	}
++
++	for i := 1; i <= 2; i++ {
++		if err := ta.agent.RunOnce(context.Background()); err != nil {
++			t.Fatalf("cycle %d err = %v, want nil (a failed upgrade must not exit)", i, err)
++		}
++	}
++	if calls != 2 {
++		t.Errorf("upgradeFn calls = %d, want 2 (keeps running and retries every cycle)", calls)
++	}
++	listen := ta.agent.dnsListen
++	if got := queryA(t, listen, "public.example.com"); got != "192.0.2.1" {
++		t.Errorf("public query after failed upgrades = %q, want upstream 192.0.2.1 (DNS keeps serving)", got)
++	}
++
++	st := ta.readState(t)
++	last, ok := st["last_command"].(map[string]any)
++	if !ok {
++		t.Fatalf("state last_command = %v, want object", st["last_command"])
++	}
++	if last["ok"] != false {
++		t.Errorf("last_command.ok = %v, want false after the failed upgrade", last["ok"])
++	}
++	if detail, _ := last["detail"].(string); !strings.Contains(detail, "download failed") {
++		t.Errorf("last_command.detail = %q, want the upgrade failure recorded", detail)
++	}
++}
++
+ // TestRunCommandUnwiredHooks pins the Task 7/8 dispatch contract: nil
+ // upgradeFn/checkFn report "not wired yet", an unknown action is rejected,
+ // and sync-domains without any cached list reports success without work.
+ func TestRunCommandUnwiredHooks(t *testing.T) {
+ 	a := &Agent{}
+ 	ctx := context.Background()
+ 
+ 	res := a.runCommand(ctx, Command{ID: "u1", Action: "self-upgrade"})
+ 	if res.OK || res.Detail != "not wired yet" || res.ID != "u1" || res.Action != "self-upgrade" {
+ 		t.Errorf("self-upgrade without upgradeFn = %+v, want OK=false detail \"not wired yet\"", res)
+diff --git a/internal/cnagent/config.go b/internal/cnagent/config.go
+index e454d4d..6ef4861 100644
+--- a/internal/cnagent/config.go
++++ b/internal/cnagent/config.go
+@@ -2,23 +2,25 @@
+ // configuration, machine identity, and the pieces the warden-cn-agent daemon
+ // needs to talk to the gateway control plane.
+ package cnagent
+ 
+ import (
+ 	"crypto/rand"
+ 	"encoding/hex"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"net"
+ 	"os"
+ 	"path/filepath"
+ 	"regexp"
++	"strconv"
+ 	"strings"
+ )
+ 
+ const (
+ 	DefaultUpstream         = "223.5.5.5:53"
+ 	DefaultDNSListen        = "198.18.0.1:53"
+ 	DefaultRepo             = "tktogether/warden-gateway"
+ 	DefaultHeartbeatSeconds = 10
+ )
+ 
+@@ -68,34 +70,53 @@ func Load(path string) (*Config, error) {
+ func Save(path string, cfg *Config) error {
+ 	data, err := json.MarshalIndent(cfg, "", "  ")
+ 	if err != nil {
+ 		return err
+ 	}
+ 	data = append(data, '\n')
+ 	return writeFile0600(path, data)
+ }
+ 
+ // Validate requires the gateway-issued fields and a full-length hex token.
+-// DNSListen is optional: empty means "use DefaultDNSListen".
++// DNSListen is optional: empty means "use DefaultDNSListen". Upstream is
++// optional too (empty means "use DefaultUpstream"), but when set it must be
++// ip:port with an IPv4 host part — bootstrap writes that host verbatim into
++// resolv.conf nameserver lines and the DNS proxy dials it directly, so a
++// hostname or malformed pair must fail validation instead of breaking the
++// machine's resolver at runtime.
+ func (c *Config) Validate() error {
+ 	if strings.TrimSpace(c.Origin) == "" {
+ 		return errors.New("origin is required")
+ 	}
+ 	if strings.TrimSpace(c.Token) == "" {
+ 		return errors.New("token is required")
+ 	}
+ 	if strings.TrimSpace(c.GatewayIP) == "" {
+ 		return errors.New("gateway_ip is required")
+ 	}
+ 	if !tokenPattern.MatchString(c.Token) {
+ 		return errors.New("token must be a 64 character hex string")
+ 	}
++	upstream := strings.TrimSpace(c.Upstream)
++	if upstream == "" {
++		upstream = DefaultUpstream
++	}
++	host, port, err := net.SplitHostPort(upstream)
++	if err != nil {
++		return fmt.Errorf("upstream must be ip:port, got %q", c.Upstream)
++	}
++	if ip := net.ParseIP(host); ip == nil || ip.To4() == nil {
++		return fmt.Errorf("upstream host must be an IPv4 address, got %q", host)
++	}
++	if n, perr := strconv.Atoi(port); perr != nil || n < 1 || n > 65535 {
++		return fmt.Errorf("upstream port must be numeric 1-65535, got %q", port)
++	}
+ 	return nil
+ }
+ 
+ // NewMachineID returns a stable machine identity: the contents of
+ // /etc/machine-id when present, otherwise 16 random bytes as hex.
+ func NewMachineID() string {
+ 	if data, err := os.ReadFile("/etc/machine-id"); err == nil {
+ 		if id := strings.TrimSpace(string(data)); id != "" {
+ 			return id
+ 		}
+diff --git a/internal/cnagent/config_test.go b/internal/cnagent/config_test.go
+index 6d6b2f5..9365a07 100644
+--- a/internal/cnagent/config_test.go
++++ b/internal/cnagent/config_test.go
+@@ -67,10 +67,49 @@ func TestDefaultValues(t *testing.T) {
+ 	if cfg.DNSListen != "198.18.0.1:53" {
+ 		t.Fatalf("DNSListen = %q, want %q", cfg.DNSListen, "198.18.0.1:53")
+ 	}
+ 	if cfg.HeartbeatSeconds != 10 {
+ 		t.Fatalf("HeartbeatSeconds = %d, want 10", cfg.HeartbeatSeconds)
+ 	}
+ 	if cfg.Repo != "tktogether/warden-gateway" {
+ 		t.Fatalf("Repo = %q, want %q", cfg.Repo, "tktogether/warden-gateway")
+ 	}
+ }
++
++// TestValidateUpstream pins the ip:port upstream contract: the host part
++// lands verbatim in resolv.conf nameserver lines (bootstrap) and is dialed
++// directly by the DNS proxy, so only an IPv4 host with a numeric port
++// passes; an empty Upstream falls back to DefaultUpstream.
++func TestValidateUpstream(t *testing.T) {
++	cfg := testConfig(t)
++
++	// The default and a plain override both pass.
++	for _, good := range []string{"", " ", "223.5.5.5:53", "119.29.29.29:5353"} {
++		cfg.Upstream = good
++		if err := cfg.Validate(); err != nil {
++			t.Errorf("Validate with upstream %q = %v, want nil", good, err)
++		}
++	}
++
++	for _, bad := range []string{
++		"dns.example.com:53", // hostname host part: resolv.conf needs an IPv4 literal
++		"223.5.5.5",          // missing port
++		"223.5.5.5:",         // empty port
++		"223.5.5.5:53:99",    // malformed pair
++		"999.9.9.9:53",       // not an IP
++		"2001:db8::1:53",     // IPv6 host (ambiguous without brackets, not an IPv4 literal)
++		"[2001:db8::1]:53",   // bracketed IPv6: resolv.conf nameserver would break the agent form
++		"223.5.5.5:0",        // port 0 is not dialable
++		"223.5.5.5:70000",    // out of range
++		"223.5.5.5:dns",      // non-numeric port
++	} {
++		cfg.Upstream = bad
++		err := cfg.Validate()
++		if err == nil {
++			t.Errorf("Validate with upstream %q = nil, want an error", bad)
++			continue
++		}
++		if !strings.Contains(err.Error(), "upstream") {
++			t.Errorf("Validate with upstream %q = %v, want the error to mention upstream", bad, err)
++		}
++	}
++}
+diff --git a/internal/cnagent/upgrade.go b/internal/cnagent/upgrade.go
+index ac51d9b..91410d3 100644
+--- a/internal/cnagent/upgrade.go
++++ b/internal/cnagent/upgrade.go
+@@ -20,50 +20,52 @@ const upgradeHTTPTimeout = 60 * time.Second
+ // supportedUpgradeArchs is the release-asset allow-list: the gateway only
+ // publishes warden-cn-agent-linux-{amd64|arm64|arm}.
+ var supportedUpgradeArchs = map[string]bool{
+ 	"amd64": true,
+ 	"arm64": true,
+ 	"arm":   true,
+ }
+ 
+ // SelfUpgrade installs a new agent binary in place:
+ //
+-//  1. download {Origin}/github.com/{Repo}/releases/download/{version}/
+-//     warden-cn-agent-linux-{arch} and its same-name .sha256 sidecar
+-//     (bare hex hash, possibly with trailing whitespace/newline);
++//  1. download {Origin}/api/agent/binary/{version}/warden-cn-agent-linux-{arch}
++//     and its same-name .sha256 sidecar from the gateway that enrolled this
++//     machine (bare hex hash, possibly with trailing whitespace/newline). The
++//     gateway serves its own cached release build, so an upgrade never depends
++//     on this machine reaching GitHub;
+ //  2. verify the sha256 (hex compare) BEFORE touching anything on disk —
+ //     a failed download or checksum mismatch leaves the local state
+ //     completely untouched;
+ //  3. write selfPath+".new" (0755), rename the current binary to
+ //     selfPath+".prev" (kept for the systemd ExecStartPre rollback guard),
+ //     then rename .new onto selfPath;
+ //  4. on any failure after the download, remove .new and restore the
+ //     original state.
+ //
+ // arch is passed explicitly (production callers pass runtime.GOARCH, tests
+-// inject a fixed value); version is used verbatim in the URL, exactly as the
+-// heartbeat's target_version delivered it (e.g. "v1.6.0"). A nil httpClient
+-// gets an internally built client with upgradeHTTPTimeout.
++// inject a fixed value); version is used verbatim in the URL as the
++// heartbeat's target_version delivered it (e.g. "v1.6.0"), minus its "v"
++// prefix, matching the gateway's cached-build path. A nil httpClient gets an
++// internally built client with upgradeHTTPTimeout.
+ func SelfUpgrade(ctx context.Context, cfg *Config, version, arch, selfPath string, httpClient *http.Client) error {
+ 	if cfg == nil {
+ 		return fmt.Errorf("cnagent upgrade: config is nil")
+ 	}
+ 	if !supportedUpgradeArchs[arch] {
+ 		return fmt.Errorf("cnagent upgrade: unsupported arch %q (want amd64, arm64 or arm)", arch)
+ 	}
+ 	if strings.TrimSpace(version) == "" {
+ 		return fmt.Errorf("cnagent upgrade: target version is required")
+ 	}
+ 
+ 	base := strings.TrimRight(cfg.Origin, "/") +
+-		"/github.com/" + cfg.Repo +
+-		"/releases/download/" + version
++		"/api/agent/binary/" + strings.TrimPrefix(strings.TrimSpace(version), "v")
+ 	asset := "warden-cn-agent-linux-" + arch
+ 
+ 	body, err := downloadReleaseFile(ctx, httpClient, base+"/"+asset)
+ 	if err != nil {
+ 		return fmt.Errorf("cnagent upgrade: %w", err)
+ 	}
+ 	sidecar, err := downloadReleaseFile(ctx, httpClient, base+"/"+asset+".sha256")
+ 	if err != nil {
+ 		return fmt.Errorf("cnagent upgrade: %w", err)
+ 	}
+diff --git a/internal/cnagent/upgrade_test.go b/internal/cnagent/upgrade_test.go
+index 59c3b81..e6b2cd1 100644
+--- a/internal/cnagent/upgrade_test.go
++++ b/internal/cnagent/upgrade_test.go
+@@ -15,29 +15,29 @@ import (
+ )
+ 
+ // releaseFixture is the payload a release server hands out: the new agent
+ // binary and the bare-hex sha256 sidecar written verbatim (trailing
+ // whitespace/newline allowed, mirroring `sha256sum` output).
+ type releaseFixture struct {
+ 	binary  []byte
+ 	sidecar string
+ }
+ 
+-// startReleaseServer serves the Task 7 release layout,
+-// /github.com/{Repo}/releases/download/{version}/warden-cn-agent-linux-{arch}
++// startReleaseServer serves the gateway-hosted agent layout,
++// /api/agent/binary/{version}/warden-cn-agent-linux-{arch}
+ // plus the .sha256 sidecar, and counts requests so tests can assert how much
+ // network traffic a call made.
+ func startReleaseServer(t *testing.T, version string, fix releaseFixture) (*httptest.Server, *atomic.Int64) {
+ 	t.Helper()
+ 	var hits atomic.Int64
+ 	mux := http.NewServeMux()
+-	base := "/github.com/" + DefaultRepo + "/releases/download/" + version + "/"
++	base := "/api/agent/binary/" + strings.TrimPrefix(version, "v") + "/"
+ 	mux.HandleFunc(base+"warden-cn-agent-linux-amd64", func(w http.ResponseWriter, r *http.Request) {
+ 		hits.Add(1)
+ 		_, _ = w.Write(fix.binary)
+ 	})
+ 	mux.HandleFunc(base+"warden-cn-agent-linux-amd64.sha256", func(w http.ResponseWriter, r *http.Request) {
+ 		hits.Add(1)
+ 		_, _ = w.Write([]byte(fix.sidecar))
+ 	})
+ 	srv := httptest.NewServer(mux)
+ 	t.Cleanup(srv.Close)
+diff --git a/internal/cnagent/upgradeguard.go b/internal/cnagent/upgradeguard.go
+new file mode 100644
+index 0000000..54d83bb
+--- /dev/null
++++ b/internal/cnagent/upgradeguard.go
+@@ -0,0 +1,88 @@
++package cnagent
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++)
++
++// The systemd ExecStartPre rollback guard (bootstrap.sh cn_agent_write_guard)
++// restores <bin>.prev when the freshly installed build crashes twice in a row.
++// Without a record of *which* build failed, the recovered agent would see the
++// same target_version on its next heartbeat and try the identical upgrade
++// again — a crash loop that no amount of systemd restarts can escape.
++//
++// Two plain-text marker files under the state dir close that loop:
++//
++//	upgrade-pending  written by the agent right before it exits for a restart,
++//	                 naming the build the guard is about to validate.
++//	upgrade-blocked  written by the guard when it rolls that build back.
++//
++// The agent skips automatic upgrade attempts toward a blocked build and reports
++// the block in its heartbeat; an explicit self-upgrade command from the panel
++// (a human decision) clears it.
++const (
++	upgradePendingFile = "upgrade-pending"
++	upgradeBlockedFile = "upgrade-blocked"
++)
++
++// stateFile resolves a marker path beneath the agent's state directory.
++func (a *Agent) stateFile(name string) string {
++	return filepath.Join(filepath.Dir(a.statePath), name)
++}
++
++// markUpgradePending records the build about to be validated by the guard.
++func (a *Agent) markUpgradePending(ver string) {
++	path := a.stateFile(upgradePendingFile)
++	if err := os.WriteFile(path, []byte(strings.TrimSpace(ver)+"\n"), 0o644); err != nil {
++		a.log.Warnf("record pending upgrade %s: %v", ver, err)
++	}
++}
++
++// clearUpgradePending removes the pending marker: the new build started fine,
++// so the guard has nothing to roll back.
++func (a *Agent) clearUpgradePending() {
++	if err := os.Remove(a.stateFile(upgradePendingFile)); err != nil && !os.IsNotExist(err) {
++		a.log.Warnf("clear pending upgrade marker: %v", err)
++	}
++}
++
++// blockedUpgrade reports the build the guard rolled back, if any.
++func (a *Agent) blockedUpgrade() string {
++	raw, err := os.ReadFile(a.stateFile(upgradeBlockedFile))
++	if err != nil {
++		return ""
++	}
++	return strings.TrimSpace(string(raw))
++}
++
++// upgradeBlocked reports whether ver is the build that already failed to start
++// on this machine.
++func (a *Agent) upgradeBlocked(ver string) bool {
++	blocked := a.blockedUpgrade()
++	return blocked != "" && blocked == normalizeVersion(ver)
++}
++
++// clearUpgradeBlock removes the block, recording why: a manual upgrade command
++// is the operator overriding the earlier automatic rollback.
++func (a *Agent) clearUpgradeBlock(reason string) {
++	path := a.stateFile(upgradeBlockedFile)
++	if err := os.Remove(path); err != nil {
++		if !os.IsNotExist(err) {
++			a.log.Warnf("clear upgrade block: %v", err)
++		}
++		return
++	}
++	a.log.Infof("cleared upgrade block for %s (%s)", a.blockedUpgrade(), reason)
++}
++
++// normalizeVersion trims the leading "v" so "v1.6.0" and "1.6.0" compare equal.
++func normalizeVersion(v string) string {
++	return strings.TrimPrefix(strings.TrimSpace(v), "v")
++}
++
++// upgradeStamp is the version a fresh process reports as "running since".
++func upgradeStamp() string {
++	return time.Now().UTC().Format(time.RFC3339)
++}
+diff --git a/internal/cnagent/upgradeguard_test.go b/internal/cnagent/upgradeguard_test.go
+new file mode 100644
+index 0000000..b52a1fc
+--- /dev/null
++++ b/internal/cnagent/upgradeguard_test.go
+@@ -0,0 +1,105 @@
++package cnagent
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/tktogether/warden-gateway/internal/logging"
++)
++
++// newGuardAgent builds an agent whose state dir is a temp dir and whose state
++// file lives inside it, matching the layout the guard script writes to.
++func newGuardAgent(t *testing.T) *Agent {
++	t.Helper()
++	dir := t.TempDir()
++	a := &Agent{statePath: filepath.Join(dir, "state.json")}
++	a.log = &logging.Logger{}
++	return a
++}
++
++// TestUpgradeBlockedAfterRollback pins the loop guard: once the ExecStartPre
++// guard recorded that a build was rolled back, the agent refuses to retry that
++// same automatic upgrade.
++func TestUpgradeBlockedAfterRollback(t *testing.T) {
++	a := newGuardAgent(t)
++	if a.upgradeBlocked("1.7.0") {
++		t.Fatal("no block recorded yet, upgradeBlocked must be false")
++	}
++	if err := os.WriteFile(a.stateFile(upgradeBlockedFile), []byte("1.7.0\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if !a.upgradeBlocked("1.7.0") {
++		t.Fatal("recorded build must be blocked")
++	}
++	if !a.upgradeBlocked("v1.7.0") {
++		t.Fatal("a v-prefixed target must match the recorded block")
++	}
++	if a.upgradeBlocked("1.8.0") {
++		t.Fatal("a different build must not be blocked")
++	}
++}
++
++// TestMarkPendingClearedOnRestart pins the handshake with the guard script: the
++// agent records the build it is about to validate, and the next successful
++// start clears it (meaning the guard must not roll back).
++func TestMarkPendingClearedOnRestart(t *testing.T) {
++	a := newGuardAgent(t)
++	a.markUpgradePending("v1.7.0")
++	raw, err := os.ReadFile(a.stateFile(upgradePendingFile))
++	if err != nil {
++		t.Fatalf("pending marker not written: %v", err)
++	}
++	if string(raw) != "v1.7.0\n" && string(raw) != "1.7.0\n" {
++		t.Fatalf("pending marker = %q, want the target version", raw)
++	}
++	a.clearUpgradePending()
++	if _, err := os.Stat(a.stateFile(upgradePendingFile)); !os.IsNotExist(err) {
++		t.Fatalf("pending marker should be gone, stat err = %v", err)
++	}
++}
++
++// TestManualUpgradeClearsBlock pins the escape hatch: an explicit self-upgrade
++// command from the panel overrides an earlier automatic rollback.
++func TestManualUpgradeClearsBlock(t *testing.T) {
++	a := newGuardAgent(t)
++	if err := os.WriteFile(a.stateFile(upgradeBlockedFile), []byte("1.7.0\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	called := ""
++	a.upgradeFn = func(ctx context.Context, ver string) error {
++		called = ver
++		return nil
++	}
++	res := a.runCommand(context.Background(), Command{ID: "c1", Action: cmdActionSelfUpgrade, Params: map[string]string{"version": "1.7.0"}})
++	if !res.OK {
++		t.Fatalf("manual upgrade failed: %s", res.Detail)
++	}
++	if called != "1.7.0" {
++		t.Fatalf("upgradeFn called with %q, want 1.7.0", called)
++	}
++	if a.upgradeBlocked("1.7.0") {
++		t.Fatal("a manual upgrade must clear the block")
++	}
++}
++
++// TestAutoUpgradeSkipsBlockedBuild pins that the automatic path (heartbeat
++// target_version) does NOT clear the block — only a human command does.
++func TestAutoUpgradeSkipsBlockedBuild(t *testing.T) {
++	a := newGuardAgent(t)
++	if err := os.WriteFile(a.stateFile(upgradeBlockedFile), []byte("9.9.9\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	attempted := false
++	a.upgradeFn = func(ctx context.Context, ver string) error {
++		attempted = true
++		return nil
++	}
++	if !a.upgradeBlocked("9.9.9") {
++		t.Fatal("fixture should be blocked")
++	}
++	if attempted {
++		t.Fatal("upgradeFn must not run for a blocked build")
++	}
++}
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index c6b0759..f4c4a1f 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -133,27 +133,71 @@ func TestBootstrapAgentMode(t *testing.T) {
+ 		"CN_HOSTS_BEGIN",        // the block markers the removal works on
+ 		"agent-rollback-guard",  // ExecStartPre crash-rollback guard script
+ 		"heartbeat_seconds",     // agent.json field, written >= 10
+ 		"已弃用",                   // legacy path deprecation hint
+ 		// Fix round 1 locks: the root binary is installed only after its bare-hex
+ 		// .sha256 sidecar verifies, and agent mode refuses to fall back to the
+ 		// machine's own egress IP as the gateway.
+ 		"warden-cn-agent-linux-$arch.sha256",
+ 		"sha256sum",
+ 		"agent 模式必须提供 --gateway-ip",
++		// Self-hosted distribution: CN machines install and upgrade the agent
++		// from this gateway's cached build, never straight from GitHub.
++		"/api/agent/binary/",
++		"cache_agent_binaries",
++		// Multi-version cache + rollback loop guard: the version is a path
++		// segment, only the newest few builds are kept, and a build the guard
++		// rolled back is recorded so the agent stops retrying it.
++		"cn_prune_agent_cache",
++		"upgrade-blocked",
++		"upgrade-pending",
+ 	}
+ 	script := string(raw)
+ 	for _, want := range required {
+ 		if !strings.Contains(script, want) {
+ 			t.Errorf("bootstrap.sh is missing %q", want)
+ 		}
+ 	}
++	// Fix round 2 lock: a failed re-run of cn-setup --enroll-token over an
++	// already-agent machine must not leave the previous agent dead — the
++	// rollback function detects the pre-existing agent unit in the snapshot
++	// records and re-enables warden-cn-agent (plus restoring the pre-
++	// migration agent-mode resolv.conf from the snapshot archive).
++	rollback := bootstrapFuncRegion(script, "cn_agent_rollback")
++	if rollback == "" {
++		t.Fatal("cn_agent_rollback function not found in bootstrap.sh")
++	}
++	for _, want := range []string{
++		`CN_AGENT_UNIT`, // re-migration detection reads the unit record
++		`systemctl enable --now "$CN_AGENT_UNIT_NAME"`, // the previously working agent is brought back up
++	} {
++		if !strings.Contains(rollback, want) {
++			t.Errorf("cn_agent_rollback is missing %q (re-migration rollback must restore the agent)", want)
++		}
++	}
++}
++
++// bootstrapFuncRegion returns the body of the named shell function, from its
++// `name() {` line up to the next top-level function definition, so
++// assertions can target one function instead of the whole script.
++func bootstrapFuncRegion(script, name string) string {
++	marker := name + "() {"
++	start := strings.Index(script, marker)
++	if start < 0 {
++		return ""
++	}
++	bodyStart := start + len(marker)
++	next := strings.Index(script[bodyStart:], "() {")
++	if next < 0 {
++		return script[start:]
++	}
++	return script[start : bodyStart+next]
+ }
+ 
+ // TestReleaseWorkflowAgentAssets locks the release pipeline contract that the
+ // CN agent download paths depend on (bootstrap.sh cn-setup and
+ // internal/cnagent upgrade.go fetch warden-cn-agent-linux-{arch} plus a
+ // bare-hex .sha256 sidecar from the v{VERSION} tag): .github/workflows/
+ // release.yml must build ./cmd/warden-cn-agent with the same version stamps
+ // as the gateway, publish per-arch bare binaries named
+ // warden-cn-agent-linux-{amd64|arm64|arm} (matrix arch armv7 maps to asset
+ // arch arm), generate hash-only .sha256 sidecars, and attach the bare
+diff --git a/internal/panel/agentbinary.go b/internal/panel/agentbinary.go
+new file mode 100644
+index 0000000..9cd6ac8
+--- /dev/null
++++ b/internal/panel/agentbinary.go
+@@ -0,0 +1,173 @@
++package panel
++
++import (
++	"net/http"
++	"os"
++	"path/filepath"
++	"regexp"
++	"sort"
++	"strings"
++
++	"github.com/tktogether/warden-gateway/internal/version"
++)
++
++// agentAssetDirName is the directory under ScriptDir that holds cached CN agent
++// builds. Layout: <ScriptDir>/agent/<version>/warden-cn-agent-linux-{arch} plus
++// a bare-hex .sha256 sidecar. bootstrap.sh populates it at gateway install and
++// upgrade time (keeping the most recent versions), so a CN machine can install,
++// upgrade, roll back or stay pinned to an older build without ever reaching
++// GitHub and without the gateway having to run that version itself.
++const agentAssetDirName = "agent"
++
++// agentArchs is the allow-list served by handleAgentBinary. It mirrors the
++// release workflow's asset matrix and internal/cnagent's upgrade allow-list.
++var agentArchs = map[string]bool{"amd64": true, "arm64": true, "arm": true}
++
++// agentVersionPattern keeps the version path segment to something that can only
++// ever be a release tag: no separators, no dots-dots, no empties.
++var agentVersionPattern = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$`)
++
++// normalizeAgentVersion trims a tag's leading "v" so "v1.6.0" and "1.6.0"
++// address the same cache directory. CI stamps version.Version with the tag,
++// dev builds leave it bare.
++func normalizeAgentVersion(v string) string {
++	return strings.TrimPrefix(strings.TrimSpace(v), "v")
++}
++
++// AgentBinaryVersion is the agent build version this gateway runs and therefore
++// offers by default: its own release version, without the "v".
++func AgentBinaryVersion() string {
++	return normalizeAgentVersion(version.Version)
++}
++
++// handleAgentBinary serves a cached CN agent binary and its checksum sidecar.
++//
++// Path shape: /api/agent/binary/{version}/{arch}[.sha256]. The version segment
++// addresses the per-version cache directory, so a machine can hold any build the
++// operator has cached — including an older one it is being pinned back to.
++//
++// Unlike the heartbeat endpoint this is unauthenticated: bootstrap.sh fetches
++// the binary before it holds a machine token, and the payload is a public
++// release artifact. Both path elements are checked against allow-lists and the
++// version against a strict pattern, so a crafted request cannot read arbitrary
++// files.
++func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
++	if r.Method != http.MethodGet && r.Method != http.MethodHead {
++		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
++		return
++	}
++	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/agent/binary/"), "/")
++	parts := strings.Split(rest, "/")
++	if len(parts) != 2 {
++		http.Error(w, "not found", http.StatusNotFound)
++		return
++	}
++	wantVersion, name := normalizeAgentVersion(parts[0]), parts[1]
++	arch := strings.TrimSuffix(name, ".sha256")
++	if !agentArchs[arch] || (name != arch && name != arch+".sha256") {
++		http.Error(w, "not found", http.StatusNotFound)
++		return
++	}
++	if !agentVersionPattern.MatchString(wantVersion) {
++		http.Error(w, "not found", http.StatusNotFound)
++		return
++	}
++	file := "warden-cn-agent-linux-" + arch
++	withSidecar := strings.HasSuffix(name, ".sha256")
++	if withSidecar {
++		file += ".sha256"
++	}
++	raw, err := os.ReadFile(filepath.Join(s.scriptDir, agentAssetDirName, wantVersion, file))
++	if err != nil {
++		http.Error(w, "no cached agent build for "+wantVersion+" on this gateway (re-run the gateway installer, or pick a cached version in the panel)", http.StatusNotFound)
++		return
++	}
++	w.Header().Set("X-Content-Type-Options", "nosniff")
++	w.Header().Set("Cache-Control", "no-store")
++	if withSidecar {
++		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
++	} else {
++		w.Header().Set("Content-Type", "application/octet-stream")
++	}
++	_, _ = w.Write(raw)
++}
++
++// CachedAgentVersions lists the agent versions cached on this gateway, newest
++// first, so the panel can offer them as pin/rollback targets.
++func (s *Server) CachedAgentVersions() []string {
++	entries, err := os.ReadDir(filepath.Join(s.scriptDir, agentAssetDirName))
++	if err != nil {
++		return nil
++	}
++	out := make([]string, 0, len(entries))
++	for _, e := range entries {
++		if !e.IsDir() {
++			continue
++		}
++		if agentVersionPattern.MatchString(e.Name()) {
++			out = append(out, e.Name())
++		}
++	}
++	sort.Slice(out, func(i, j int) bool { return versionLess(out[j], out[i]) })
++	return out
++}
++
++// CachedAgentVersion reports whether a given version is served by this gateway.
++func (s *Server) CachedAgentVersion(v string) bool {
++	v = normalizeAgentVersion(v)
++	if !agentVersionPattern.MatchString(v) {
++		return false
++	}
++	for _, cached := range s.CachedAgentVersions() {
++		if cached == v {
++			return true
++		}
++	}
++	return false
++}
++
++// versionLess compares dotted numeric versions ("1.10.0" > "1.9.0"); it falls
++// back to string order for anything non-numeric so odd tags still sort stably.
++func versionLess(a, b string) bool {
++	as, bs := strings.Split(a, "."), strings.Split(b, ".")
++	for i := 0; i < len(as) && i < len(bs); i++ {
++		ai, aok := atoiSafe(as[i])
++		bi, bok := atoiSafe(bs[i])
++		if aok && bok {
++			if ai != bi {
++				return ai < bi
++			}
++			continue
++		}
++		if as[i] != bs[i] {
++			return as[i] < bs[i]
++		}
++	}
++	return len(as) < len(bs)
++}
++
++func atoiSafe(s string) (int, bool) {
++	if s == "" {
++		return 0, false
++	}
++	n := 0
++	for _, r := range s {
++		if r < '0' || r > '9' {
++			return 0, false
++		}
++		n = n*10 + int(r-'0')
++		if n > 1<<30 {
++			return 0, false
++		}
++	}
++	return n, true
++}
++
++// agentBinaryURL is the URL a CN machine downloads an agent build from. Empty
++// origin yields an empty URL (callers then print a manual instruction).
++func agentBinaryURL(origin, ver, arch string) string {
++	if origin == "" {
++		return ""
++	}
++	return strings.TrimRight(origin, "/") + "/api/agent/binary/" + normalizeAgentVersion(ver) + "/" + arch
++}
+diff --git a/internal/panel/agentbinary_test.go b/internal/panel/agentbinary_test.go
+new file mode 100644
+index 0000000..329a2a1
+--- /dev/null
++++ b/internal/panel/agentbinary_test.go
+@@ -0,0 +1,213 @@
++package panel
++
++import (
++	"encoding/json"
++	"net/http"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/tktogether/warden-gateway/internal/version"
++)
++
++// agentBinaryPanel returns a panel whose scriptDir holds a fake cached agent
++// build, mirroring what cache_agent_binaries leaves behind at install time.
++func agentBinaryPanel(t *testing.T) (*Server, string) {
++	t.Helper()
++	dir := t.TempDir()
++	srv, key := newPanel(t)
++	srv.scriptDir = dir
++	if err := os.MkdirAll(filepath.Join(dir, agentAssetDirName), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	return srv, key
++}
++
++// cacheAgentBuild writes one cached build (binary + sidecar) for a version,
++// reproducing the on-disk layout of cache_agent_binaries.
++func cacheAgentBuild(t *testing.T, srv *Server, ver, arch string, body []byte) {
++	t.Helper()
++	dir := filepath.Join(srv.scriptDir, agentAssetDirName, normalizeAgentVersion(ver))
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(dir, "warden-cn-agent-linux-"+arch), body, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(filepath.Join(dir, "warden-cn-agent-linux-"+arch+".sha256"), []byte("abc123\n"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++}
++
++// TestAgentBinaryServesCachedBuild pins the self-hosted distribution path:
++// /api/agent/binary/{version}/{arch}[.sha256] serves the cached release asset
++// without authentication (bootstrap.sh fetches it before it holds a token),
++// while any other version, arch or path shape is refused so a crafted request
++// cannot read arbitrary files.
++func TestAgentBinaryServesCachedBuild(t *testing.T) {
++	srv, _ := agentBinaryPanel(t)
++	ver := AgentBinaryVersion()
++	binary := []byte("\x7fELF fake agent build")
++	cacheAgentBuild(t, srv, ver, "amd64", binary)
++
++	cases := []struct {
++		name       string
++		path       string
++		wantStatus int
++		wantBody   string
++	}{
++		{"binary", "/api/agent/binary/" + ver + "/amd64", http.StatusOK, string(binary)},
++		{"sidecar", "/api/agent/binary/" + ver + "/amd64.sha256", http.StatusOK, "abc123\n"},
++		{"trailing slash", "/api/agent/binary/" + ver + "/amd64/", http.StatusOK, string(binary)},
++		{"unknown version", "/api/agent/binary/9.9.9/amd64", http.StatusNotFound, ""},
++		{"uncached arch", "/api/agent/binary/" + ver + "/riscv64", http.StatusNotFound, ""},
++		{"path traversal", "/api/agent/binary/" + ver + "/../../../../etc/passwd", http.StatusNotFound, ""},
++		{"missing version", "/api/agent/binary/amd64", http.StatusNotFound, ""},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			rec := do(t, srv, "GET", tc.path, nil, nil, "")
++			if rec.Code != tc.wantStatus {
++				t.Fatalf("status = %d, want %d (body %q)", rec.Code, tc.wantStatus, rec.Body.String())
++			}
++			if tc.wantBody != "" && rec.Body.String() != tc.wantBody {
++				t.Fatalf("body = %q, want %q", rec.Body.String(), tc.wantBody)
++			}
++		})
++	}
++}
++
++// TestAgentBinaryRejectsNonGET covers the method gate: the endpoint is public,
++// so it must not accept anything that could mutate state.
++func TestAgentBinaryRejectsNonGET(t *testing.T) {
++	srv, _ := agentBinaryPanel(t)
++	rec := do(t, srv, "POST", "/api/agent/binary/"+AgentBinaryVersion()+"/amd64", nil, nil, "")
++	if rec.Code != http.StatusMethodNotAllowed {
++		t.Fatalf("status = %d, want 405", rec.Code)
++	}
++}
++
++// TestAgentBinaryMissingCacheIsExplicit pins the operator-facing failure: a
++// gateway installed before the cache existed (or with --no-agent) says so
++// instead of returning an empty 200 that the agent would reject as a corrupt
++// download.
++func TestAgentBinaryMissingCacheIsExplicit(t *testing.T) {
++	srv, _ := agentBinaryPanel(t)
++	rec := do(t, srv, "GET", "/api/agent/binary/"+AgentBinaryVersion()+"/amd64", nil, nil, "")
++	if rec.Code != http.StatusNotFound {
++		t.Fatalf("status = %d, want 404", rec.Code)
++	}
++	if got := rec.Body.String(); got == "" || !contains(got, "no cached agent build") {
++		t.Fatalf("body = %q, want an explanation mentioning the missing cache", got)
++	}
++}
++
++// TestAgentBinaryServesAnyCachedVersion pins the multi-version contract: a
++// machine may be pinned to (or rolled back onto) any build the operator has
++// cached, not just the gateway's own.
++func TestAgentBinaryServesAnyCachedVersion(t *testing.T) {
++	srv, _ := agentBinaryPanel(t)
++	cacheAgentBuild(t, srv, AgentBinaryVersion(), "amd64", []byte("current"))
++	cacheAgentBuild(t, srv, "1.5.3", "amd64", []byte("older"))
++
++	if got := do(t, srv, "GET", "/api/agent/binary/1.5.3/amd64", nil, nil, ""); got.Code != http.StatusOK || got.Body.String() != "older" {
++		t.Fatalf("older build: status %d body %q, want 200 %q", got.Code, got.Body.String(), "older")
++	}
++	if got := do(t, srv, "GET", "/api/agent/binary/v1.5.3/amd64", nil, nil, ""); got.Code != http.StatusOK || got.Body.String() != "older" {
++		t.Fatalf("v-prefixed older build: status %d body %q, want 200 %q", got.Code, got.Body.String(), "older")
++	}
++	// A version nobody cached stays a 404 rather than a stale fallback.
++	if got := do(t, srv, "GET", "/api/agent/binary/1.4.0/amd64", nil, nil, ""); got.Code != http.StatusNotFound {
++		t.Fatalf("uncached version: status %d, want 404", got.Code)
++	}
++}
++
++// TestCachedAgentVersionsListsNewestFirst pins the panel's pin/rollback menu.
++func TestCachedAgentVersionsListsNewestFirst(t *testing.T) {
++	srv, _ := agentBinaryPanel(t)
++	for _, v := range []string{"1.5.3", "1.10.0", "1.6.0"} {
++		cacheAgentBuild(t, srv, v, "amd64", []byte(v))
++	}
++	got := srv.CachedAgentVersions()
++	want := []string{"1.10.0", "1.6.0", "1.5.3"}
++	if len(got) != len(want) {
++		t.Fatalf("CachedAgentVersions = %v, want %v", got, want)
++	}
++	for i := range want {
++		if got[i] != want[i] {
++			t.Fatalf("CachedAgentVersions = %v, want %v", got, want)
++		}
++	}
++	if !srv.CachedAgentVersion("v1.5.3") {
++		t.Fatal("CachedAgentVersion should accept a v-prefixed version")
++	}
++	if srv.CachedAgentVersion("9.9.9") {
++		t.Fatal("CachedAgentVersion must reject an uncached version")
++	}
++}
++
++// TestAgentBinaryVersionHasNoVPrefix pins the single-v normalization the URL
++// and both downloaders rely on: CI stamps "v1.6.0", dev builds "1.6.0", and
++// the served path segment is always the bare version.
++func TestAgentBinaryVersionHasNoVPrefix(t *testing.T) {
++	orig := version.Version
++	t.Cleanup(func() { version.Version = orig })
++	for _, stamp := range []string{"v9.9.9", "9.9.9"} {
++		version.Version = stamp
++		if got := AgentBinaryVersion(); got != "9.9.9" {
++			t.Fatalf("AgentBinaryVersion() with stamp %q = %q, want 9.9.9", stamp, got)
++		}
++	}
++}
++
++// TestAgentBinaryURLShape pins the URL the panel advertises and the agent's
++// own SelfUpgrade requests, so the two can never drift apart.
++func TestAgentBinaryURLShape(t *testing.T) {
++	orig := version.Version
++	t.Cleanup(func() { version.Version = orig })
++	version.Version = "v9.9.9"
++	if got, want := agentBinaryURL("http://gw.example.com/", "9.9.9", "arm64"), "http://gw.example.com/api/agent/binary/9.9.9/arm64"; got != want {
++		t.Fatalf("agentBinaryURL = %q, want %q", got, want)
++	}
++	if got, want := agentBinaryURL("http://gw.example.com", "v9.9.9", "amd64"), "http://gw.example.com/api/agent/binary/9.9.9/amd64"; got != want {
++		t.Fatalf("agentBinaryURL with a v-prefixed version = %q, want %q", got, want)
++	}
++	if got := agentBinaryURL("", "9.9.9", "amd64"); got != "" {
++		t.Fatalf("empty origin should yield empty URL, got %q", got)
++	}
++}
++
++// TestCNCommandsCarriesSelfHostedAgentURL pins that /api/cn advertises the
++// self-hosted path rather than a GitHub release URL.
++func TestCNCommandsCarriesSelfHostedAgentURL(t *testing.T) {
++	srv, key := agentBinaryPanel(t)
++	cookie, csrf := login(t, srv, key)
++	rec := do(t, srv, "GET", "/warden/api/cn", nil, cookie, csrf)
++	if rec.Code != http.StatusOK {
++		t.Fatalf("status %d: %s", rec.Code, rec.Body)
++	}
++	var payload struct {
++		AgentBinaryURL     string `json:"agent_binary_url"`
++		AgentBinaryVersion string `json:"agent_binary_version"`
++	}
++	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
++		t.Fatal(err)
++	}
++	want := "http://127.0.0.1:18080/api/agent/binary/" + AgentBinaryVersion() + "/amd64"
++	if payload.AgentBinaryURL != want {
++		t.Fatalf("agent_binary_url = %q, want %q", payload.AgentBinaryURL, want)
++	}
++	if payload.AgentBinaryVersion != AgentBinaryVersion() {
++		t.Fatalf("agent_binary_version = %q, want %q", payload.AgentBinaryVersion, AgentBinaryVersion())
++	}
++}
++
++// contains is a tiny helper so this file needs no strings import for one call.
++func contains(haystack, needle string) bool {
++	for i := 0; i+len(needle) <= len(haystack); i++ {
++		if haystack[i:i+len(needle)] == needle {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/internal/panel/cnagent.go b/internal/panel/cnagent.go
+index 6aeded6..180c57f 100644
+--- a/internal/panel/cnagent.go
++++ b/internal/panel/cnagent.go
+@@ -7,21 +7,20 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"net/http"
+ 	"net/url"
+ 	"strings"
+ 	"time"
+ 
+ 	"github.com/tktogether/warden-gateway/internal/auth"
+ 	"github.com/tktogether/warden-gateway/internal/cnagent"
+ 	"github.com/tktogether/warden-gateway/internal/config"
+-	"github.com/tktogether/warden-gateway/internal/version"
+ )
+ 
+ // cnBeatMinInterval is the minimum gap between two heartbeats of the same
+ // machine; faster repeats get 429. The agent beats every 10s (±20% jitter),
+ // so 8s leaves headroom for probe time and clock skew.
+ const cnBeatMinInterval = 8 * time.Second
+ 
+ // cnMaxDispatchCommands caps how many queued commands an agent receives per
+ // heartbeat so a burst never inflates one reply beyond control.
+ const cnMaxDispatchCommands = 5
+@@ -31,20 +30,29 @@ const cnMaxDispatchCommands = 5
+ const cnCmdSelfUpgrade = "self-upgrade"
+ 
+ // cnCmdDeregister is the command that tells an agent this gateway no longer
+ // manages it; when it is dispatched (the agent's ack beat) the machine is
+ // removed from the registry and its token stops working.
+ const cnCmdDeregister = "deregister"
+ 
+ // cnAgentBodyMax bounds enroll and heartbeat request bodies.
+ const cnAgentBodyMax = 1 << 20
+ 
++// cnEnrollRateMax / cnEnrollRateWindow bound anonymous enroll attempts per
++// client IP (5/min, same LoginLimiter mechanism as the login endpoint but a
++// separate bucket). Enroll is unauthenticated and audited per attempt, so
++// without this gate an anonymous flood inflates audit.log without bound.
++const (
++	cnEnrollRateMax    = 5
++	cnEnrollRateWindow = time.Minute
++)
++
+ // hashDomains derives the split-domain list hash the gateway compares and
+ // pushes: SHA-256 over the newline-joined list (nil treated as empty, so the
+ // empty hash stays deterministic). Agents adopt the pushed hash verbatim,
+ // which is what makes the exchange converge after one push.
+ func hashDomains(list []string) string {
+ 	sum := sha256.Sum256([]byte(strings.Join(list, "\n")))
+ 	return hex.EncodeToString(sum[:])
+ }
+ 
+ // bearerToken extracts the machine token from the Authorization header.
+@@ -92,43 +100,70 @@ func (s *Server) recordBeat(tokenHash string) {
+ // machines leave no stale limiter state behind.
+ func (s *Server) forgetBeat(tokenHash string) {
+ 	if tokenHash == "" {
+ 		return
+ 	}
+ 	s.beatMu.Lock()
+ 	delete(s.lastBeat, tokenHash)
+ 	s.beatMu.Unlock()
+ }
+ 
++// allowEnroll reports whether an anonymous enroll attempt from ip may proceed
++// and records it in the per-IP window. Unlike the login limiter (which counts
++// failures only), every allowed attempt consumes budget: the endpoint is
++// unauthenticated and each attempt writes one audit line, so the flood being
++// bounded is the attempts themselves. Over-limit attempts are rejected before
++// the registry is touched and write no audit line.
++func (s *Server) allowEnroll(ip string) bool {
++	if s.enrollLimiter == nil {
++		s.enrollLimiter = auth.NewLoginLimiter(cnEnrollRateMax, cnEnrollRateWindow)
++	}
++	if !s.enrollLimiter.Allow(ip) {
++		return false
++	}
++	// LoginLimiter counts recorded attempts within the window; record this
++	// one regardless of how the request ends (Fail is its record operation).
++	s.enrollLimiter.Fail(ip)
++	return true
++}
++
+ type cnEnrollRequest struct {
+ 	EnrollToken string `json:"enroll_token"`
+ 	Hostname    string `json:"hostname"`
+ }
+ 
+ // handleAgentEnroll exchanges a one-time enroll token for machine
+ // credentials. Agents hold no panel session, so this endpoint performs no
+ // CSRF/session checks; the short-lived single-use token is the credential.
++// The endpoint is reachable anonymously, so it is rate limited per client IP
++// (cnEnrollRateMax attempts per cnEnrollRateWindow) before the registry is
++// touched; over-limit requests get 429 and are deliberately not audited —
++// bounding the audit lines is the point of the limiter.
+ func (s *Server) handleAgentEnroll(w http.ResponseWriter, r *http.Request) {
+ 	if r.Method != http.MethodPost {
+ 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+ 		return
+ 	}
++	ip := auth.ClientIP(r)
++	if !s.allowEnroll(ip) {
++		writeError(w, http.StatusTooManyRequests, "too many enroll attempts, try again later")
++		return
++	}
+ 	if s.cnReg == nil {
+ 		writeError(w, http.StatusInternalServerError, "agent registry unavailable")
+ 		return
+ 	}
+ 	var body cnEnrollRequest
+ 	if err := readAgentJSON(w, r, &body); err != nil {
+ 		writeError(w, http.StatusBadRequest, err.Error())
+ 		return
+ 	}
+-	ip := auth.ClientIP(r)
+ 	m, token, err := s.cnReg.Enroll(body.EnrollToken, body.Hostname, time.Now())
+ 	if errors.Is(err, ErrInvalidEnroll) {
+ 		// The raw token never reaches the audit log, only the outcome.
+ 		s.audit("cn.enroll", "invalid enroll token", "fail", ip)
+ 		writeError(w, http.StatusForbidden, "invalid or expired enroll token")
+ 		return
+ 	}
+ 	if err != nil {
+ 		s.audit("cn.enroll", body.Hostname, "fail", ip)
+ 		writeError(w, http.StatusInternalServerError, "enroll failed")
+@@ -184,35 +219,47 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	// machine is a live registry pointer: read-only here (Task 9 review).
+ 	// Mutations go through registry methods.
+ 	reportMap := map[string]interface{}{}
+ 	if raw, err := json.Marshal(&report); err == nil {
+ 		_ = json.Unmarshal(raw, &reportMap)
+ 	}
+ 	desired := ""
+ 	if machine.AutoFollow {
+-		desired = version.Version
++		desired = AgentBinaryVersion()
++	}
++	// An operator pin (rollback or explicit upgrade) outranks auto-follow: the
++	// machine stays on the requested build until the pin is cleared.
++	if pinned := normalizeAgentVersion(machine.DesiredVersion); pinned != "" {
++		desired = pinned
+ 	}
+ 	if err := s.cnReg.UpdateReport(machine.ID, reportMap, desired); err != nil {
+ 		writeError(w, http.StatusInternalServerError, "persist report failed")
+ 		return
+ 	}
+ 
+ 	dispatched := s.cnReg.PopCommands(machine.ID, cnMaxDispatchCommands)
+ 	commands := make([]cnagent.Command, len(dispatched))
+ 	targetVersion := desired
+ 	deregistered := false
+ 	for i, cmd := range dispatched {
+ 		commands[i] = cnagent.Command{ID: cmd.ID, Action: cmd.Action, Params: cmd.Params}
+ 		if cmd.Action == cnCmdSelfUpgrade {
+-			targetVersion = version.Version
++			// An explicit upgrade command names its own target (default: this
++			// gateway's version), so the operator can also roll a machine back
++			// to a cached older build.
++			if v := normalizeAgentVersion(cmd.Params["version"]); v != "" {
++				targetVersion = v
++			} else {
++				targetVersion = AgentBinaryVersion()
++			}
+ 		}
+ 		if cmd.Action == cnCmdDeregister {
+ 			deregistered = true
+ 		}
+ 	}
+ 
+ 	reply := cnagent.HeartbeatReply{
+ 		Commands:      commands,
+ 		TargetVersion: targetVersion,
+ 	}
+@@ -306,21 +353,28 @@ func (s *Server) handleCNMachines(w http.ResponseWriter, r *http.Request) {
+ 	if s.cnReg == nil {
+ 		writeError(w, http.StatusInternalServerError, "agent registry unavailable")
+ 		return
+ 	}
+ 	now := time.Now()
+ 	machines := s.cnReg.Snapshot()
+ 	rows := make([]cnMachineRow, 0, len(machines))
+ 	for _, m := range machines {
+ 		rows = append(rows, newCNMachineRow(m, now))
+ 	}
+-	writeJSON(w, http.StatusOK, map[string]interface{}{"as_of": config.NowUTC(), "machines": rows})
++	writeJSON(w, http.StatusOK, map[string]interface{}{
++		"as_of":    config.NowUTC(),
++		"machines": rows,
++		// Cached builds the operator may pin a machine to (upgrade or roll
++		// back), newest first, plus the version this gateway runs.
++		"cached_versions": s.CachedAgentVersions(),
++		"gateway_version": AgentBinaryVersion(),
++	})
+ }
+ 
+ // handleCNMachineItem dispatches /api/cnmachines/… sub-paths: the enroll-token
+ // mint and the per-machine command, auto-follow and remove actions. Machine
+ // IDs are hex without slashes, so a plain split is safe.
+ func (s *Server) handleCNMachineItem(w http.ResponseWriter, r *http.Request, rest string) {
+ 	parts := strings.Split(strings.Trim(rest, "/"), "/")
+ 	if len(parts) == 1 && parts[0] == "enroll-token" {
+ 		s.handleCNEnrollToken(w, r)
+ 		return
+@@ -376,34 +430,44 @@ func (s *Server) handleCNEnrollToken(w http.ResponseWriter, r *http.Request) {
+ // handleCNMachineCommand queues an allowlisted command for one machine.
+ func (s *Server) handleCNMachineCommand(w http.ResponseWriter, r *http.Request, id string) {
+ 	if _, ok := s.guard(w, r); !ok {
+ 		return
+ 	}
+ 	if r.Method != http.MethodPost {
+ 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+ 		return
+ 	}
+ 	var body struct {
+-		Action string `json:"action"`
++		Action  string `json:"action"`
++		Version string `json:"version"`
+ 	}
+ 	if err := readJSON(w, r, &body); err != nil {
+ 		writeError(w, http.StatusBadRequest, err.Error())
+ 		return
+ 	}
+ 	if !cnMachineActions[body.Action] {
+ 		writeError(w, http.StatusBadRequest, "action must be sync-domains, self-check or self-upgrade")
+ 		return
+ 	}
+ 	params := map[string]string{}
+ 	if body.Action == cnCmdSelfUpgrade {
+-		// The gateway pins the upgrade to its own version.
+-		params["version"] = version.Version
++		// An operator may name a cached build (that is how a machine is rolled
++		// back); without a version the gateway pins its own.
++		want := normalizeAgentVersion(body.Version)
++		if want == "" {
++			want = AgentBinaryVersion()
++		}
++		if !s.CachedAgentVersion(want) {
++			writeError(w, http.StatusBadRequest, "version "+want+" is not cached on this gateway")
++			return
++		}
++		params["version"] = want
+ 	}
+ 	if err := s.cnReg.QueueCommand(id, body.Action, params); err != nil {
+ 		if errors.Is(err, ErrUnknownMachine) {
+ 			writeError(w, http.StatusNotFound, "unknown machine")
+ 			return
+ 		}
+ 		s.audit("cn.command", id+" "+body.Action, "fail", auth.ClientIP(r))
+ 		writeError(w, http.StatusInternalServerError, "queue command failed")
+ 		return
+ 	}
+diff --git a/internal/panel/cnagent_test.go b/internal/panel/cnagent_test.go
+index 079c145..b0968f9 100644
+--- a/internal/panel/cnagent_test.go
++++ b/internal/panel/cnagent_test.go
+@@ -1,17 +1,18 @@
+ package panel
+ 
+ import (
+ 	"bytes"
+ 	"encoding/json"
+ 	"net/http"
+ 	"net/http/httptest"
++	"os"
+ 	"reflect"
+ 	"strings"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/tktogether/warden-gateway/internal/cnagent"
+ 	"github.com/tktogether/warden-gateway/internal/version"
+ )
+ 
+ // newAgentPanel builds a panel server wired to a CN agent registry loaded
+@@ -143,20 +144,61 @@ func TestAgentEnrollFlow(t *testing.T) {
+ 	if rec := do(t, srv, "GET", srv.cfg.PanelPath+"/api/agent/enroll", nil, nil, ""); rec.Code != http.StatusMethodNotAllowed {
+ 		t.Fatalf("GET enroll status %d, want 405", rec.Code)
+ 	}
+ 	// Oversized bodies are rejected before reaching the registry.
+ 	huge := strings.Repeat("a", 2<<20)
+ 	if rec := postAgentJSON(t, srv, srv.cfg.PanelPath+"/api/agent/enroll", "", huge); rec.Code != http.StatusBadRequest {
+ 		t.Fatalf("oversized enroll body status %d, want 400", rec.Code)
+ 	}
+ }
+ 
++// TestAgentEnrollRateLimited pins the per-IP enroll limiter (final review fix
++// 4): /api/agent/enroll is unauthenticated and audited per attempt, so an
++// anonymous flood must be capped — five rapid attempts from one IP are still
++// processed (403 for the bad token), the sixth gets 429 before the registry
++// is touched, and over-limit attempts write no audit line (bounding audit.log
++// is the point of the limiter).
++func TestAgentEnrollRateLimited(t *testing.T) {
++	srv, _ := newAgentPanel(t)
++	body := map[string]string{"enroll_token": "deadbeef", "hostname": "flood"}
++
++	for i := 1; i <= 5; i++ {
++		rec := do(t, srv, "POST", "/api/agent/enroll", body, nil, "")
++		if rec.Code != http.StatusForbidden {
++			t.Fatalf("attempt %d status %d, want 403 (still within the per-IP budget)", i, rec.Code)
++		}
++	}
++	rec := do(t, srv, "POST", "/api/agent/enroll", body, nil, "")
++	if rec.Code != http.StatusTooManyRequests {
++		t.Fatalf("6th rapid attempt status %d, want 429", rec.Code)
++	}
++
++	before := countAuditActions(t, srv, "cn.enroll")
++	rec = do(t, srv, "POST", "/api/agent/enroll", body, nil, "")
++	if rec.Code != http.StatusTooManyRequests {
++		t.Fatalf("7th rapid attempt status %d, want 429", rec.Code)
++	}
++	if after := countAuditActions(t, srv, "cn.enroll"); after != before {
++		t.Errorf("audit cn.enroll lines %d -> %d, want unchanged (over-limit attempts must not be audited)", before, after)
++	}
++}
++
++// countAuditActions counts audit log entries whose action field equals action.
++func countAuditActions(t *testing.T, srv *Server, action string) int {
++	t.Helper()
++	raw, err := os.ReadFile(srv.auditPath)
++	if err != nil {
++		return 0
++	}
++	return strings.Count(string(raw), `"action":"`+action+`"`)
++}
++
+ func TestAgentHeartbeatRoundTrip(t *testing.T) {
+ 	srv, _ := newAgentPanel(t)
+ 	srv.minBeatInterval = 0 // the round trip must not trip the rate limiter
+ 
+ 	id, token := enrollMachine(t, srv, "edge-01")
+ 	report := heartbeatReport(srv, id)
+ 
+ 	rec := postAgentJSON(t, srv, srv.cfg.PanelPath+"/api/agent/heartbeat", token, report)
+ 	if rec.Code != http.StatusOK {
+ 		t.Fatalf("heartbeat status %d: %s", rec.Code, rec.Body)
+@@ -540,20 +582,22 @@ func TestEnrollTokenAndList(t *testing.T) {
+ 	}
+ 
+ 	// The mint is audited.
+ 	if items := srv.auditItems(50, "cn.enroll_token"); len(items) == 0 {
+ 		t.Error("cn.enroll_token not audited")
+ 	}
+ }
+ 
+ func TestQueueUpgradeCommandSetsVersion(t *testing.T) {
+ 	srv, key := newAgentPanel(t)
++	srv.scriptDir = t.TempDir()
++	cacheAgentBuild(t, srv, AgentBinaryVersion(), "amd64", []byte("current"))
+ 	cookie, csrf := login(t, srv, key)
+ 	id, _ := enrollMachine(t, srv, "edge-01")
+ 
+ 	// Unknown machines and off-allowlist actions are rejected.
+ 	if rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/deadbeef/command",
+ 		map[string]string{"action": "self-check"}, cookie, csrf); rec.Code != http.StatusNotFound {
+ 		t.Fatalf("unknown machine status %d, want 404", rec.Code)
+ 	}
+ 	if rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/command",
+ 		map[string]string{"action": "reboot"}, cookie, csrf); rec.Code != http.StatusBadRequest {
+@@ -563,38 +607,41 @@ func TestQueueUpgradeCommandSetsVersion(t *testing.T) {
+ 	if rec := do(t, srv, "GET", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/command", nil, cookie, ""); rec.Code != http.StatusMethodNotAllowed {
+ 		t.Fatalf("GET command status %d, want 405", rec.Code)
+ 	}
+ 
+ 	rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/command",
+ 		map[string]string{"action": "self-upgrade"}, cookie, csrf)
+ 	if rec.Code != http.StatusOK {
+ 		t.Fatalf("command status %d: %s", rec.Code, rec.Body)
+ 	}
+ 
+-	// The queued command carries the gateway's own version as target.
++	// The queued command carries the gateway's own version as target (compared
++	// in normalized, v-less form: that is the cache path segment).
+ 	m := srv.cnReg.MachineByID(id)
+ 	if m == nil || len(m.Pending) != 1 {
+ 		t.Fatalf("pending queue = %+v, want one command", m)
+ 	}
+ 	if m.Pending[0].Action != "self-upgrade" {
+ 		t.Errorf("queued action = %q, want self-upgrade", m.Pending[0].Action)
+ 	}
+-	if got := m.Pending[0].Params["version"]; got != version.Version {
+-		t.Errorf("queued params.version = %q, want %q", got, version.Version)
++	if got := m.Pending[0].Params["version"]; got != AgentBinaryVersion() {
++		t.Errorf("queued params.version = %q, want %q", got, AgentBinaryVersion())
+ 	}
+ 
+-	// The list shows one pending command without leaking its params.
++	// The list shows one pending command without leaking its params. The
++	// top-level gateway_version/cached_versions fields legitimately name builds,
++	// so the check targets the params payload itself.
+ 	_, rec = cnMachineList(t, srv, cookie)
+ 	if !strings.Contains(rec.Body.String(), "\"pending\":1") {
+ 		t.Errorf("list does not report the pending command: %s", rec.Body)
+ 	}
+-	if strings.Contains(rec.Body.String(), version.Version) {
++	if strings.Contains(rec.Body.String(), `"params"`) || strings.Contains(rec.Body.String(), `"version":"`+AgentBinaryVersion()+`"`) {
+ 		t.Errorf("list leaks command params: %s", rec.Body)
+ 	}
+ }
+ 
+ func TestAutoFollowToggle(t *testing.T) {
+ 	srv, key := newAgentPanel(t)
+ 	srv.minBeatInterval = 0
+ 	cookie, csrf := login(t, srv, key)
+ 	id, token := enrollMachine(t, srv, "edge-01")
+ 
+@@ -780,10 +827,90 @@ func TestMachineListConcurrentWithHeartbeats(t *testing.T) {
+ 		t.Errorf("report after concurrent runs = %v, want agent_version test-1", m.Report)
+ 	}
+ 	if seen, err := time.Parse(time.RFC3339, m.LastSeen); err != nil || time.Since(seen) >= 30*time.Second {
+ 		t.Errorf("last_seen = %q, want fresh after the last beat", m.LastSeen)
+ 	}
+ 	list, _ := cnMachineList(t, srv, cookie)
+ 	if len(list.Machines) != 1 || !list.Machines[0].Online {
+ 		t.Fatalf("list after concurrent runs = %+v, want one online machine", list.Machines)
+ 	}
+ }
++
++// TestPinnedVersionOutranksAutoFollow pins the rollback/gray-release contract:
++// a version pinned by the operator wins over auto-follow, so a machine keeps
++// the requested build instead of being dragged onto the gateway's version on
++// the next heartbeat.
++func TestPinnedVersionOutranksAutoFollow(t *testing.T) {
++	srv, key := newAgentPanel(t)
++	srv.minBeatInterval = 0 // two beats in one test must not trip the limiter
++	cookie, csrf := login(t, srv, key)
++	id, token := enrollMachine(t, srv, "pinned-host")
++	if rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/auto-follow",
++		map[string]any{"enabled": true}, cookie, csrf); rec.Code != http.StatusOK {
++		t.Fatalf("auto-follow status %d: %s", rec.Code, rec.Body)
++	}
++	if err := srv.cnReg.SetDesiredVersion(id, "1.5.3"); err != nil {
++		t.Fatal(err)
++	}
++	rec := postAgentJSON(t, srv, srv.cfg.PanelPath+"/api/agent/heartbeat", token, heartbeatReport(srv, id))
++	if rec.Code != http.StatusOK {
++		t.Fatalf("heartbeat status %d: %s", rec.Code, rec.Body)
++	}
++	var reply cnagent.HeartbeatReply
++	if err := json.Unmarshal(rec.Body.Bytes(), &reply); err != nil {
++		t.Fatal(err)
++	}
++	if reply.TargetVersion != "1.5.3" {
++		t.Fatalf("target_version = %q, want the pinned 1.5.3 (auto-follow must not override a pin)", reply.TargetVersion)
++	}
++
++	// Clearing the pin hands control back to auto-follow.
++	if err := srv.cnReg.SetDesiredVersion(id, ""); err != nil {
++		t.Fatal(err)
++	}
++	rec = postAgentJSON(t, srv, srv.cfg.PanelPath+"/api/agent/heartbeat", token, heartbeatReport(srv, id))
++	if rec.Code != http.StatusOK {
++		t.Fatalf("heartbeat status %d: %s", rec.Code, rec.Body)
++	}
++	if err := json.Unmarshal(rec.Body.Bytes(), &reply); err != nil {
++		t.Fatal(err)
++	}
++	if reply.TargetVersion != AgentBinaryVersion() {
++		t.Fatalf("target_version = %q, want the gateway version %q after clearing the pin", reply.TargetVersion, AgentBinaryVersion())
++	}
++}
++
++// TestUpgradeCommandRejectsUncachedVersion pins that an operator cannot point a
++// machine at a build this gateway cannot serve (which would 404 forever).
++func TestUpgradeCommandRejectsUncachedVersion(t *testing.T) {
++	srv, key := newAgentPanel(t)
++	srv.scriptDir = t.TempDir()
++	cookie, csrf := login(t, srv, key)
++	id, _ := enrollMachine(t, srv, "uncached-host")
++	rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/command",
++		map[string]any{"action": "self-upgrade", "version": "0.0.1"}, cookie, csrf)
++	if rec.Code != http.StatusBadRequest {
++		t.Fatalf("status = %d, want 400 for an uncached version (body %s)", rec.Code, rec.Body)
++	}
++}
++
++// TestUpgradeCommandPinsCachedVersion pins the rollback path: choosing a cached
++// older build queues a self-upgrade carrying that version.
++func TestUpgradeCommandPinsCachedVersion(t *testing.T) {
++	srv, key := newAgentPanel(t)
++	srv.scriptDir = t.TempDir()
++	cookie, csrf := login(t, srv, key)
++	id, _ := enrollMachine(t, srv, "rollback-host")
++	cacheAgentBuild(t, srv, "1.5.3", "amd64", []byte("old"))
++	rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/command",
++		map[string]any{"action": "self-upgrade", "version": "1.5.3"}, cookie, csrf)
++	if rec.Code != http.StatusOK {
++		t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body)
++	}
++	m := srv.cnReg.MachineByID(id)
++	if m == nil || len(m.Pending) == 0 {
++		t.Fatal("expected a queued self-upgrade command")
++	}
++	if got := m.Pending[0].Params["version"]; got != "1.5.3" {
++		t.Fatalf("queued version = %q, want 1.5.3", got)
++	}
++}
+diff --git a/internal/panel/cnregistry.go b/internal/panel/cnregistry.go
+index 5a8f23a..2161b98 100644
+--- a/internal/panel/cnregistry.go
++++ b/internal/panel/cnregistry.go
+@@ -259,21 +259,45 @@ func (r *CNRegistry) PopCommands(id string, max int) []CNCommand {
+ // UpdateReport stores the machine's latest heartbeat report and desired agent
+ // version, then persists both.
+ func (r *CNRegistry) UpdateReport(id string, report map[string]interface{}, desiredVersion string) error {
+ 	r.mu.Lock()
+ 	defer r.mu.Unlock()
+ 	m := r.machineByIDLocked(id)
+ 	if m == nil {
+ 		return ErrUnknownMachine
+ 	}
+ 	m.Report = report
+-	m.DesiredVersion = desiredVersion
++	// AutoFollow keeps the machine trailing the gateway's own version; without
++	// it DesiredVersion is whatever the operator pinned (an older build for a
++	// rollback, or empty to leave the machine alone). A routine heartbeat never
++	// clears an explicit pin.
++	if desiredVersion != "" {
++		m.DesiredVersion = desiredVersion
++	}
++	return r.saveLocked()
++}
++
++// SetDesiredVersion pins the agent build a machine should run. An empty version
++// clears the pin: the machine keeps whatever it has unless AutoFollow is on.
++func (r *CNRegistry) SetDesiredVersion(machineID, ver string) error {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	m := r.machineByIDLocked(machineID)
++	if m == nil {
++		return ErrUnknownMachine
++	}
++	m.DesiredVersion = ver
++	detail := ver
++	if detail == "" {
++		detail = "cleared"
++	}
++	r.appendEventLocked(m, "desired_version", detail, time.Now().UTC())
+ 	return r.saveLocked()
+ }
+ 
+ // SetAutoFollow toggles a machine's auto-follow flag and persists the change.
+ // An auto-following machine adopts the gateway version as its desired agent
+ // version on the next heartbeat.
+ func (r *CNRegistry) SetAutoFollow(machineID string, enabled bool) error {
+ 	r.mu.Lock()
+ 	defer r.mu.Unlock()
+ 	m := r.machineByIDLocked(machineID)
+diff --git a/internal/panel/diagnostics.go b/internal/panel/diagnostics.go
+index a8bc07b..0119f7f 100644
+--- a/internal/panel/diagnostics.go
++++ b/internal/panel/diagnostics.go
+@@ -3,21 +3,20 @@ package panel
+ import (
+ 	"context"
+ 	"net"
+ 	"net/http"
+ 	"os/exec"
+ 	"strings"
+ 	"time"
+ 
+ 	"github.com/tktogether/warden-gateway/internal/config"
+ 	"github.com/tktogether/warden-gateway/internal/diagnostics"
+-	"github.com/tktogether/warden-gateway/internal/version"
+ )
+ 
+ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
+ 	if _, ok := s.guard(w, r); !ok {
+ 		return
+ 	}
+ 	if r.Method != http.MethodGet {
+ 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+ 		return
+ 	}
+@@ -116,43 +115,41 @@ func (s *Server) handleCNCommands(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	// health_url points at the gateway's own /healthz on port 80 so the CN
+ 	// machine can verify the split path end to end; check_command re-runs the
+ 	// self-check on the CN machine with the same script the setup used.
+ 	healthURL := ""
+ 	checkCommand := "sudo warden-cn cn-check"
+ 	if origin != "" {
+ 		healthURL = origin + "/healthz"
+ 		checkCommand = "curl -fsSL " + scriptURL + " -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh cn-check"
+ 	}
+-	// agent_binary_url points the CN machine at the self-hosted agent binary so
+-	// the download never touches GitHub directly; without an origin the panel
+-	// cannot host it and the URL stays empty.
+-	agentBinaryURL := ""
+-	if origin != "" {
+-		agentBinaryURL = origin + "/github.com/tktogether/warden-gateway/releases/download/v" + version.Version + "/warden-cn-agent-linux-amd64"
+-	}
++	// agent_binary_url points the CN machine at this gateway's own cached agent
++	// build, so install and upgrade never touch GitHub directly. Without an
++	// origin there is nothing to point at and the URL stays empty.
++	agentBinaryURL := agentBinaryURL(origin, AgentBinaryVersion(), "amd64")
+ 	writeJSON(w, http.StatusOK, map[string]interface{}{
+-		"as_of":            config.NowUTC(),
+-		"origin":           origin,
+-		"gateway_ip":       gateway,
+-		"panel_host":       host,
+-		"domains":          s.liveSplitDomains(),
+-		"script_url":       scriptURL,
+-		"command":          command,
+-		"commands":         commands,
+-		"restore_command":  restoreCommand,
+-		"health_url":       healthURL,
+-		"check_command":    checkCommand,
+-		"agent_binary_url": agentBinaryURL,
+-		"cn_mode":          "auto",
+-		"dns":              info,
+-		"dns_ready":        dnsReady,
++		"as_of":                config.NowUTC(),
++		"origin":               origin,
++		"gateway_ip":           gateway,
++		"panel_host":           host,
++		"domains":              s.liveSplitDomains(),
++		"script_url":           scriptURL,
++		"command":              command,
++		"commands":             commands,
++		"restore_command":      restoreCommand,
++		"health_url":           healthURL,
++		"agent_binary_version": AgentBinaryVersion(),
++		"check_command":        checkCommand,
++		"agent_binary_url":     agentBinaryURL,
++		"cn_mode":              "auto",
++		"dns":                  info,
++		"dns_ready":            dnsReady,
+ 	})
+ }
+ 
+ // resolveGateway returns the address that other machines should use to reach
+ // this gateway. It prefers an IPv4 literal and falls back to resolving the
+ // panel host name.
+ func resolveGateway(host string) string {
+ 	host = strings.TrimSpace(host)
+ 	if host == "" {
+ 		return ""
+diff --git a/internal/panel/panel.go b/internal/panel/panel.go
+index 80ef556..3bac9a9 100644
+--- a/internal/panel/panel.go
++++ b/internal/panel/panel.go
+@@ -72,22 +72,27 @@ type Server struct {
+ 	host        *hostMetrics
+ 	dns         *dnsproxy.Proxy
+ 	singbox     *singbox.Manager
+ 	auditPath   string
+ 	cnReg       *CNRegistry
+ 	beatMu      sync.Mutex
+ 	lastBeat    map[string]time.Time
+ 	// minBeatInterval is the heartbeat rate limit window; tests set it to 0
+ 	// to disable limiting.
+ 	minBeatInterval time.Duration
+-	sampleMu        sync.Mutex
+-	restartMu       sync.Mutex
++	// enrollLimiter bounds anonymous enroll attempts per client IP with the
++	// same LoginLimiter mechanism the login endpoint uses (own bucket: the
++	// endpoint is unauthenticated and audited per attempt, so an anonymous
++	// flood would otherwise inflate audit.log without bound).
++	enrollLimiter *auth.LoginLimiter
++	sampleMu      sync.Mutex
++	restartMu     sync.Mutex
+ }
+ 
+ func New(opts Options) (*Server, error) {
+ 	if opts.Config == nil {
+ 		return nil, errors.New("config is required")
+ 	}
+ 	if opts.Auth == nil {
+ 		return nil, errors.New("auth manager is required")
+ 	}
+ 	if opts.DataDir == "" {
+@@ -113,20 +118,21 @@ func New(opts Options) (*Server, error) {
+ 	}
+ 	s := &Server{
+ 		cfg: opts.Config, cfgPath: opts.ConfigPath, dataDir: opts.DataDir, scriptDir: opts.ScriptDir,
+ 		serviceName: opts.ServiceName, auth: opts.Auth, backups: opts.Backups,
+ 		stats: opts.Stats, log: opts.Log, started: opts.Started,
+ 		host: newHostMetrics(hostSampleCapacity), dns: opts.DNS, singbox: opts.SingBox,
+ 		auditPath:       filepath.Join(opts.DataDir, "audit.log"),
+ 		cnReg:           opts.CNReg,
+ 		lastBeat:        make(map[string]time.Time),
+ 		minBeatInterval: cnBeatMinInterval,
++		enrollLimiter:   auth.NewLoginLimiter(cnEnrollRateMax, cnEnrollRateWindow),
+ 	}
+ 	s.host.Sample()
+ 	return s, nil
+ }
+ 
+ func (s *Server) Start(ctx context.Context) {
+ 	go s.sampleLoop(ctx)
+ }
+ 
+ // hostSampleSeconds is how often the panel refreshes host level metrics. The
+@@ -213,20 +219,26 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, p string) {
+ 		return
+ 	case "/api/logout":
+ 		s.handleLogout(w, r)
+ 		return
+ 	case "/api/agent/enroll":
+ 		s.handleAgentEnroll(w, r)
+ 		return
+ 	case "/api/agent/heartbeat":
+ 		s.handleAgentHeartbeat(w, r)
+ 		return
++	}
++	if strings.HasPrefix(p, "/api/agent/binary/") {
++		s.handleAgentBinary(w, r)
++		return
++	}
++	switch p {
+ 	case "/api/overview":
+ 		s.handleOverview(w, r)
+ 		return
+ 	case "/api/metrics":
+ 		s.handleMetrics(w, r)
+ 		return
+ 	case "/api/proxies":
+ 		s.handleProxies(w, r)
+ 		return
+ 	case "/api/proxies/test":
+diff --git a/internal/panel/panel_test.go b/internal/panel/panel_test.go
+index 29e6d39..24e140e 100644
+--- a/internal/panel/panel_test.go
++++ b/internal/panel/panel_test.go
+@@ -499,24 +499,43 @@ func TestCNCommandsServesLiveDomains(t *testing.T) {
+ 	}
+ 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	if !slices.Equal(payload.Domains, []string{"example.test", "extra.test"}) {
+ 		t.Fatalf("domains = %v, want the configured list", payload.Domains)
+ 	}
+ 	if slices.Contains(payload.Domains, "github.com") {
+ 		t.Fatalf("domains %v still contains a removed default", payload.Domains)
+ 	}
+-	wantURL := "http://127.0.0.1:18080/github.com/tktogether/warden-gateway/releases/download/v" + version.Version + "/warden-cn-agent-linux-amd64"
+-	if payload.AgentBinaryURL != wantURL {
+-		t.Fatalf("agent_binary_url = %q, want %q", payload.AgentBinaryURL, wantURL)
++	// agent_binary_url must point at this gateway's own cached build. The
++	// version segment is the bare version (no "v"): CI stamps version.Version
++	// as "v1.6.0" while dev builds are "1.6.0", and both must land on the same
++	// URL that bootstrap.sh and the agent's own SelfUpgrade request. Stamp a
++	// fixed test version and cover both forms (computing the expectation from
++	// version.Version itself would be circular).
++	stampedURL := "http://127.0.0.1:18080/api/agent/binary/9.9.9/amd64"
++	origVersion := version.Version
++	t.Cleanup(func() { version.Version = origVersion })
++	for _, stamp := range []string{"v9.9.9", "9.9.9"} {
++		version.Version = stamp
++		rec = do(t, srv, "GET", "/warden/api/cn", nil, cookie, "")
++		if rec.Code != http.StatusOK {
++			t.Fatalf("cn status %d: %s", rec.Code, rec.Body)
++		}
++		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
++			t.Fatal(err)
++		}
++		if payload.AgentBinaryURL != stampedURL {
++			t.Fatalf("agent_binary_url with version.Version=%q = %q, want %q", stamp, payload.AgentBinaryURL, stampedURL)
++		}
+ 	}
++	version.Version = origVersion
+ 	// An empty configured list falls back to the built-in defaults.
+ 	srv.cfg.DNS.Domains = nil
+ 	rec = do(t, srv, "GET", "/warden/api/cn", nil, cookie, "")
+ 	if rec.Code != http.StatusOK {
+ 		t.Fatalf("cn status %d: %s", rec.Code, rec.Body)
+ 	}
+ 	var fallback struct {
+ 		Domains []string `json:"domains"`
+ 	}
+ 	if err := json.Unmarshal(rec.Body.Bytes(), &fallback); err != nil {
+diff --git a/internal/panel/web/app.js b/internal/panel/web/app.js
+index 4c8bf82..c49b2c0 100644
+--- a/internal/panel/web/app.js
++++ b/internal/panel/web/app.js
+@@ -1525,25 +1525,35 @@
+     var left = el('div');
+     add(left, el('h3', '', cnMachineName(m)));
+     var meta = [m.version ? 'agent ' + m.version : '版本未知'];
+     if (m.desired_version) { meta.push('目标版本 ' + m.desired_version); }
+     add(left, el('div', 'cn-machine-meta', meta.join(' · ')));
+     add(head, left);
+     var badges = el('div', 'cn-machine-badges');
+     badges.appendChild(statusPill(m.online ? '在线' : '离线', m.online ? 'ok' : ''));
+     var probe = m.probe || null;
+     if (probe && probe.result) {
+-      badges.appendChild(statusPill(probe.result === 'ok' ? '探测正常' : '探测 ' + probe.result, probe.result === 'ok' ? 'ok' : 'warn'));
++      // The wire value is uppercase ("OK", "LINK_443_BLOCKED", ...); compare
++      // case-insensitively so the healthy pill actually lights up.
++      var probeOK = (probe.result || '').toUpperCase() === 'OK';
++      badges.appendChild(statusPill(probeOK ? '探测正常' : '探测 ' + probe.result, probeOK ? 'ok' : 'warn'));
+     } else {
+       badges.appendChild(statusPill('探测 —', ''));
+     }
+     if (Number(m.pending) > 0) { badges.appendChild(statusPill('待执行 ' + m.pending, 'warn')); }
++    // A machine whose running version differs from its target has work pending:
++    // either an upgrade the panel queued, or a rollback the operator pinned.
++    var gatewayVersion = (state.cnmachines && state.cnmachines.gateway_version) || '';
++    if (m.desired_version && m.version && m.desired_version !== m.version) {
++      var rollback = gatewayVersion && m.desired_version !== gatewayVersion;
++      badges.appendChild(statusPill((rollback ? '已钉版本 ' : '待升级 ') + m.desired_version, 'warn'));
++    }
+     head.appendChild(badges);
+     card.appendChild(head);
+ 
+     var sys = m.system || null;
+     var workloads = m.workloads || null;
+     card.appendChild(infoList([
+       ['磁盘 / 内存', sys ? (pct(sys.disk_used_pct) + ' / ' + pct(sys.mem_used_pct)) : '—'],
+       ['负载', sys ? fmtLoad(sys.load1) : '—'],
+       ['容器', workloads && typeof workloads.length === 'number' ? workloads.length + ' 个' : '—'],
+       ['最后心跳', m.last_seen ? fmtRel(m.last_seen) : '—'],
+@@ -1568,22 +1578,43 @@
+     check.type = 'button';
+     check.addEventListener('click', function () {
+       confirmDialog('自检', '将向 ' + cnMachineName(m) + ' 下发自检命令，检查本机 DNS 与探测状态，结果随下次心跳回报。确认继续？').then(function (yes) {
+         if (yes) { cnMachineCommand(m, 'self-check', check); }
+       });
+     });
+     actions.appendChild(check);
+     var upgrade = el('button', 'btn small', '升级');
+     upgrade.type = 'button';
+     upgrade.addEventListener('click', function () {
+-      confirmDialog('升级 agent', '将向 ' + cnMachineName(m) + ' 下发升级命令，agent 会升级到网关当前版本并自动重启。确认继续？').then(function (yes) {
+-        if (yes) { cnMachineCommand(m, 'self-upgrade', upgrade); }
++      var cached = (state.cnmachines && state.cnmachines.cached_versions) || [];
++      var current = (state.cnmachines && state.cnmachines.gateway_version) || '';
++      // Only cached builds can be served, so the choices are the cache menu:
++      // the gateway's own version by default, any older one is a rollback.
++      var options = cached.length ? cached : (current ? [current] : []);
++      var chosen = m.desired_version || current || (options[0] || '');
++      var body = el('div');
++      if (!options.length) {
++        body.appendChild(el('p', 'muted', '本网关没有缓存的 agent 构建，请先在网关重新执行一次安装/升级以填充缓存。'));
++        confirmDialog('升级 agent', body).then(function () {});
++        return;
++      }
++      body.appendChild(el('p', null, '选择 ' + cnMachineName(m) + ' 要安装的 agent 版本。低于网关版本即为回退；机器会下载、校验并重启。'));
++      var select = el('select', 'input');
++      options.forEach(function (v) {
++        var opt = el('option', null, v + (v === current ? '（网关当前）' : (v === m.version ? '（正在运行）' : '')));
++        opt.value = v;
++        if (v === chosen) { opt.selected = true; }
++        select.appendChild(opt);
++      });
++      body.appendChild(select);
++      confirmDialog('升级 agent', body).then(function (yes) {
++        if (yes) { cnMachineCommand(m, 'self-upgrade', upgrade, select.value); }
+       });
+     });
+     actions.appendChild(upgrade);
+     var softRemove = el('button', 'btn small danger', '注销');
+     softRemove.type = 'button';
+     softRemove.addEventListener('click', function () {
+       confirmDialog('注销机器', '将向 ' + cnMachineName(m) + ' 下发注销命令，agent 停止上报并自动从列表移除。确认继续？').then(function (yes) {
+         if (yes) { cnMachineRemove(m, false, softRemove); }
+       });
+     });
+@@ -1638,24 +1669,26 @@
+         var row = el('div', 'cn-event-row');
+         add(row, el('span', 'cn-event-time', fmtClock(ev.at)));
+         add(row, el('span', 'cn-event-kind', ev.kind || ''));
+         add(row, el('span', 'cn-event-detail', ev.detail || ''));
+         box.appendChild(row);
+       });
+     }
+     return box;
+   }
+ 
+-  async function cnMachineCommand(m, action, button) {
++  async function cnMachineCommand(m, action, button, version) {
+     setBusy(button, true);
+     try {
+-      await api('/api/cnmachines/' + encodeURIComponent(m.id) + '/command', { method: 'POST', body: { action: action } });
++      var body = { action: action };
++      if (version) { body.version = version; }
++      await api('/api/cnmachines/' + encodeURIComponent(m.id) + '/command', { method: 'POST', body: body });
+       showToast('已下发' + cnActionLabel(action) + '命令，等待 ' + cnMachineName(m) + ' 心跳执行');
+       loadCnmachines({ silent: true });
+     } catch (err) {
+       showToast(err.message, true);
+     } finally {
+       setBusy(button, false);
+     }
+   }
+ 
+   async function cnMachineRemove(m, force, button) {
+@@ -2171,21 +2204,28 @@
+     return { wrap: wrap, input: input };
+   }
+ 
+   function confirmDialog(title, message) {
+     return new Promise(function (resolve) {
+       var modal = qs('#modal');
+       var titleEl = qs('#modal-title');
+       var body = qs('#modal-body');
+       clear(body);
+       titleEl.textContent = title;
+-      add(body, el('p', '', message));
++      // A string gets wrapped in a paragraph; a DOM node is appended as-is so
++      // dialogs can host controls (e.g. the agent version picker). Nodes are
++      // only ever built by our own el() helper, never from machine data.
++      if (typeof message === 'string') {
++        add(body, el('p', '', message));
++      } else if (message) {
++        body.appendChild(message);
++      }
+       var actions = el('div', 'form-actions');
+       var cancel = el('button', 'btn', '取消');
+       cancel.type = 'button';
+       var ok = el('button', 'btn primary', '确认');
+       ok.type = 'button';
+       function close(value) { modal.hidden = true; resolve(value); }
+       cancel.addEventListener('click', function () { close(false); });
+       ok.addEventListener('click', function () { close(true); });
+       add(actions, cancel); add(actions, ok); body.appendChild(actions);
+       modal.hidden = false;
+diff --git a/internal/version/version.go b/internal/version/version.go
+index a9c6db1..783471b 100644
+--- a/internal/version/version.go
++++ b/internal/version/version.go
+@@ -1,14 +1,14 @@
+ package version
+ 
+ var (
+-	Version   = "1.5.3"
++	Version   = "1.6.0"
+ 	Commit    = "dev"
+ 	BuildTime = "unknown"
+ )
+ 
+ func String() string {
+ 	if Commit == "" || Commit == "dev" {
+ 		return Version
+ 	}
+ 	return Version + " (" + Commit + ")"
+ }

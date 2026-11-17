@@ -228,7 +228,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, p string) {
 		return
 	}
 	if strings.HasPrefix(p, "/api/agent/binary/") {
-		s.handleAgentBinary(w, r)
+		s.handleAgentBinary(w, r, p)
 		return
 	}
 	switch p {

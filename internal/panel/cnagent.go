@@ -38,11 +38,11 @@ const cnCmdDeregister = "deregister"
 const cnAgentBodyMax = 1 << 20
 
 // cnEnrollRateMax / cnEnrollRateWindow bound anonymous enroll attempts per
-// client IP (5/min, same LoginLimiter mechanism as the login endpoint but a
+// client IP (10/min, same LoginLimiter mechanism as the login endpoint but a
 // separate bucket). Enroll is unauthenticated and audited per attempt, so
 // without this gate an anonymous flood inflates audit.log without bound.
 const (
-	cnEnrollRateMax    = 5
+	cnEnrollRateMax    = 10
 	cnEnrollRateWindow = time.Minute
 )
 
@@ -114,9 +114,6 @@ func (s *Server) forgetBeat(tokenHash string) {
 // bounded is the attempts themselves. Over-limit attempts are rejected before
 // the registry is touched and write no audit line.
 func (s *Server) allowEnroll(ip string) bool {
-	if s.enrollLimiter == nil {
-		s.enrollLimiter = auth.NewLoginLimiter(cnEnrollRateMax, cnEnrollRateWindow)
-	}
 	if !s.enrollLimiter.Allow(ip) {
 		return false
 	}
@@ -145,6 +142,7 @@ func (s *Server) handleAgentEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	ip := auth.ClientIP(r)
 	if !s.allowEnroll(ip) {
+		w.Header().Set("Retry-After", "60")
 		writeError(w, http.StatusTooManyRequests, "too many enroll attempts, try again later")
 		return
 	}
@@ -218,40 +216,36 @@ func (s *Server) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// machine is a live registry pointer: read-only here (Task 9 review).
-	// Mutations go through registry methods.
+	// machine is a live registry pointer; only its immutable ID is read here.
+	// The effective target version is computed inside UpdateReport (F2/F10):
+	// pin > AutoFollow > empty, all under the registry lock.
 	reportMap := map[string]interface{}{}
 	if raw, err := json.Marshal(&report); err == nil {
 		_ = json.Unmarshal(raw, &reportMap)
 	}
-	desired := ""
-	if machine.AutoFollow {
-		desired = AgentBinaryVersion()
-	}
-	// An operator pin (rollback or explicit upgrade) outranks auto-follow: the
-	// machine stays on the requested build until the pin is cleared.
-	if pinned := normalizeAgentVersion(machine.DesiredVersion); pinned != "" {
-		desired = pinned
-	}
-	if err := s.cnReg.UpdateReport(machine.ID, reportMap, desired); err != nil {
+	targetVersion, err := s.cnReg.UpdateReport(machine.ID, reportMap, AgentBinaryVersion())
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "persist report failed")
 		return
 	}
 
 	dispatched := s.cnReg.PopCommands(machine.ID, cnMaxDispatchCommands)
 	commands := make([]cnagent.Command, len(dispatched))
-	targetVersion := desired
 	deregistered := false
 	for i, cmd := range dispatched {
 		commands[i] = cnagent.Command{ID: cmd.ID, Action: cmd.Action, Params: cmd.Params}
 		if cmd.Action == cnCmdSelfUpgrade {
 			// An explicit upgrade command names its own target (default: this
 			// gateway's version), so the operator can also roll a machine back
-			// to a cached older build.
-			if v := normalizeAgentVersion(cmd.Params["version"]); v != "" {
-				targetVersion = v
-			} else {
-				targetVersion = AgentBinaryVersion()
+			// to a cached older build. The choice persists as the pin, so the
+			// next routine heartbeat cannot silently revert it.
+			v := normalizeAgentVersion(cmd.Params["version"])
+			if v == "" {
+				v = AgentBinaryVersion()
+			}
+			targetVersion = v
+			if err := s.cnReg.SetPinnedVersion(machine.ID, v); err != nil {
+				s.audit("cn.pin", machine.ID+" "+v, "fail: "+err.Error(), auth.ClientIP(r))
 			}
 		}
 		if cmd.Action == cnCmdDeregister {
@@ -321,7 +315,7 @@ func newCNMachineRow(m CNMachine, now time.Time) cnMachineRow {
 	}
 	reportVersion := ""
 	if v, ok := m.Report["agent_version"].(string); ok {
-		reportVersion = v
+		reportVersion = normalizeReportedAgentVersion(v)
 	}
 	probe, _ := m.Report["probe"].(map[string]interface{})
 	system, _ := m.Report["system"].(map[string]interface{})
@@ -393,6 +387,8 @@ func (s *Server) handleCNMachineItem(w http.ResponseWriter, r *http.Request, res
 		s.handleCNMachineCommand(w, r, id)
 	case "auto-follow":
 		s.handleCNMachineAutoFollow(w, r, id)
+	case "pin":
+		s.handleCNMachinePin(w, r, id)
 	case "remove":
 		s.handleCNMachineRemove(w, r, id)
 	default:
@@ -506,6 +502,50 @@ func (s *Server) handleCNMachineAutoFollow(w http.ResponseWriter, r *http.Reques
 	}
 	s.audit("cn.auto_follow", id+" "+state, "ok", auth.ClientIP(r))
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "auto_follow": body.Enabled})
+}
+
+// handleCNMachinePin sets or clears a machine's explicit version pin. An empty
+// version clears it (the panel's "follow gateway" choice): the next heartbeat
+// recomputes the target from AutoFollow. A non-empty version must be cached on
+// this gateway, because the machine would otherwise retry a 404 forever.
+func (s *Server) handleCNMachinePin(w http.ResponseWriter, r *http.Request, id string) {
+	if _, ok := s.guard(w, r); !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Version string `json:"version"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ver := normalizeAgentVersion(body.Version)
+	if ver != "" && !s.CachedAgentVersion(ver) {
+		writeError(w, http.StatusBadRequest, "version "+ver+" is not cached on this gateway")
+		return
+	}
+	if err := s.cnReg.SetPinnedVersion(id, ver); err != nil {
+		if errors.Is(err, ErrUnknownMachine) {
+			writeError(w, http.StatusNotFound, "unknown machine")
+			return
+		}
+		s.audit("cn.pin", id+" "+pinDetail(ver), "fail", auth.ClientIP(r))
+		writeError(w, http.StatusInternalServerError, "update pin failed")
+		return
+	}
+	s.audit("cn.pin", id+" "+pinDetail(ver), "ok", auth.ClientIP(r))
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "pinned_version": ver})
+}
+
+func pinDetail(ver string) string {
+	if ver == "" {
+		return "cleared"
+	}
+	return ver
 }
 
 // handleCNMachineRemove revokes a machine outright (force) or queues a

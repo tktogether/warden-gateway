@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -182,6 +183,14 @@ func TestPlainHTTPServesShortGitHubPath(t *testing.T) {
 
 func newTestApp(t *testing.T) *App {
 	t.Helper()
+	return newTestAppWithScriptDir(t, "")
+}
+
+// newTestAppWithScriptDir builds the same runtime as newTestApp with an
+// optional script directory, so tests can plant cached CN agent builds where
+// the panel serves them.
+func newTestAppWithScriptDir(t *testing.T, scriptDir string) *App {
+	t.Helper()
 	cfg := config.Default()
 	cfg.PublicURL = "http://127.0.0.1:18080/warden"
 	cfg.TLS.Mode = "self"
@@ -198,10 +207,42 @@ func newTestApp(t *testing.T) *App {
 	cfg.Backup.Dir = filepath.Join(dir, "backups")
 	cfg.Normalize()
 	a, err := New(Options{Config: &cfg, Paths: Paths{
-		ConfigPath: filepath.Join(dir, "config.json"), DataDir: dir,
+		ConfigPath: filepath.Join(dir, "config.json"), DataDir: dir, ScriptDir: scriptDir,
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return a
+}
+
+// TestHandlerAgentBinaryRootAndPrefixedRoutes pins F3 end-to-end: the URL the
+// agent/bootstrap actually fetches (origin root, no /warden prefix) and the
+// panel-prefixed spelling both reach the cached build through App.Handler.
+func TestHandlerAgentBinaryRootAndPrefixedRoutes(t *testing.T) {
+	scriptDir := t.TempDir()
+	ver := "1.6.0"
+	assetDir := filepath.Join(scriptDir, "agent", ver)
+	if err := os.MkdirAll(assetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binary := []byte("\x7fELF fake agent build")
+	if err := os.WriteFile(filepath.Join(assetDir, "warden-cn-agent-linux-amd64"), binary, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a := newTestAppWithScriptDir(t, scriptDir)
+	h := a.Handler()
+
+	for _, path := range []string{
+		"/api/agent/binary/" + ver + "/amd64",
+		"/warden/api/agent/binary/" + ver + "/amd64",
+	} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status %d: %s", path, rec.Code, rec.Body)
+		}
+		if rec.Body.String() != string(binary) {
+			t.Fatalf("%s body = %q, want the cached build", path, rec.Body.String())
+		}
+	}
 }

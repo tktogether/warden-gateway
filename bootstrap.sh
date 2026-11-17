@@ -495,16 +495,47 @@ install_binary() {
   mv -f "$BIN_PATH.new" "$BIN_PATH"
 }
 
-# cache_agent_binaries 把本版本的 agent 构建（三种架构 + 裸 hex sha256 侧车）
-# 预取到 $SCRIPT_DIR/agent/，由面板 /api/agent/binary/{version}/{arch} 对外提供。
-# 国内机的安装与自升级因此只连本网关，不必访问 GitHub；预取失败不阻塞网关安装
-# （面板会返回 404 并提示重跑安装器），但会在输出里明确告警。
+# cache_agent_version 解析本次要缓存的具体版本（裸版本，无 v 前缀）。
+# VERSION=latest 时必须先读已安装二进制的版本（write_version_from_binary 在
+# 缓存之后才跑），再退回 $SCRIPT_DIR/VERSION；都拿不到就返回非零，由调用方
+# 跳过缓存——绝不能建出 $SCRIPT_DIR/agent/latest/ 这种永远匹配不上的目录。
+cache_agent_version() {
+  local ver=""
+  if [ "$VERSION" != "latest" ]; then
+    ver="${VERSION#v}"
+  else
+    if [ -x "$BIN_PATH" ]; then
+      ver="$("$BIN_PATH" version 2>/dev/null | awk 'NR == 1 {print $1}' | sed 's/^v//')"
+    fi
+    if [ -z "$ver" ] || [ "$ver" = "latest" ]; then
+      if [ -f "$SCRIPT_DIR/VERSION" ]; then
+        ver="$(tr -d ' \r\n' < "$SCRIPT_DIR/VERSION" | sed 's/^v//')"
+      fi
+    fi
+  fi
+  case "$ver" in
+    ''|latest|*[!0-9A-Za-z._-]*) return 1;;
+  esac
+  printf '%s\n' "$ver"
+}
+
+# cache_agent_binaries 把本版本的 agent 构建（三种架构 + CI 发布的 sha256
+# 侧车）预取到 $SCRIPT_DIR/agent/<version>/，由面板
+# /api/agent/binary/{version}/{arch} 对外提供。国内机的安装与自升级因此只连
+# 本网关，不必访问 GitHub；预取失败不阻塞网关安装（面板会返回 404 并提示重跑
+# 安装器），但会在输出里明确告警。
+# 侧车必须来自 CI（同一 release 的 $asset.sha256），不能用刚下载的字节现算：
+# 现算只能发现损坏，发现不了网关侧被替换；校验不过/缺侧车就跳过该架构。
 cache_agent_binaries() {
-  local arch asset tmp ok_flag=0 ver_dir
-  [ "$DRY_RUN" -eq 1 ] && { printf '  + 预取 agent 构建到 %s/agent/%s/\n' "$SCRIPT_DIR" "${VERSION#v}"; return 0; }
+  local arch asset tmp sidecar expected actual ok_flag=0 ver ver_dir
+  if ! ver="$(cache_agent_version)"; then
+    warn "无法解析具体 agent 版本（VERSION=$VERSION），跳过 agent 构建预取"
+    return 1
+  fi
+  [ "$DRY_RUN" -eq 1 ] && { printf '  + 预取 agent 构建到 %s/agent/%s/\n' "$SCRIPT_DIR" "$ver"; return 0; }
   # 每个版本一个目录：/agent/<version>/<asset>[.sha256]。多版本才能支持灰度与
   # 回退——把某台机器钉在旧构建上，或回滚到已缓存的版本。
-  ver_dir="$SCRIPT_DIR/agent/${VERSION#v}"
+  ver_dir="$SCRIPT_DIR/agent/$ver"
   mkdir -p "$ver_dir" 2>/dev/null || { warn "创建 agent 缓存目录失败：$ver_dir"; return 1; }
   local base
   if [ "$VERSION" = "latest" ]; then
@@ -515,22 +546,39 @@ cache_agent_binaries() {
   for arch in amd64 arm64 arm; do
     asset="warden-cn-agent-linux-$arch"
     tmp="$ver_dir/.$asset.$$"
+    sidecar="$tmp.sha256"
     if ! download "$base/$asset" "$tmp"; then
-      rm -f "$tmp"
+      rm -f "$tmp" "$sidecar"
       warn "预取 agent 构建失败：$asset（面板将无法分发该架构的 agent）"
       continue
     fi
     if [ ! -s "$tmp" ]; then
-      rm -f "$tmp"
+      rm -f "$tmp" "$sidecar"
       warn "预取的 agent 构建为空：$asset"
       continue
     fi
-    mv -f "$tmp" "$ver_dir/$asset"
-    sha256sum "$ver_dir/$asset" 2>/dev/null | awk '{print $1}' > "$ver_dir/$asset.sha256" || {
-      rm -f "$ver_dir/$asset" "$ver_dir/$asset.sha256"
-      warn "生成 agent 校验和失败：$asset"
+    if ! download "$base/$asset.sha256" "$sidecar"; then
+      rm -f "$tmp" "$sidecar"
+      warn "预取 agent 校验和失败：$asset.sha256（跳过该架构，面板不会分发未经 CI 签发的构建）"
       continue
-    }
+    fi
+    expected="$(awk 'NR == 1 {print $1}' "$sidecar" 2>/dev/null | tr 'A-F' 'a-f')"
+    case "$expected" in
+      ''|*[!0-9a-f]*)
+        rm -f "$tmp" "$sidecar"
+        warn "agent 校验和格式无效：$asset.sha256"
+        continue;;
+    esac
+    actual="$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}' | tr 'A-F' 'a-f' || true)"
+    if [ "${#expected}" -ne 64 ] || [ "$actual" != "$expected" ]; then
+      rm -f "$tmp" "$sidecar"
+      warn "agent 构建校验和不匹配：$asset（期望 $expected，实际 ${actual:-空}），已跳过"
+      continue
+    fi
+    mv -f "$tmp" "$ver_dir/$asset"
+    # 缓存 CI 发布的侧车（只留裸 hex 一行），而不是从下载字节现算。
+    printf '%s\n' "$expected" > "$ver_dir/$asset.sha256"
+    rm -f "$sidecar"
     chmod 0755 "$ver_dir/$asset"
     chmod 0644 "$ver_dir/$asset.sha256"
     ok_flag=1
@@ -549,9 +597,11 @@ cn_prune_agent_cache() {
   local root="$SCRIPT_DIR/agent" keep=3
   [ -d "$root" ] || return 0
   # 按版本号排序（sort -V 可用时用它，否则退化为字典序），删除第 keep 个之后的。
+  # 先显式探测 find 是否支持 -printf：把探测结果当 if 条件，BusyBox find 不
+  # 支持时会安静地走 else，而不是让 sort 的空输出假装成功。
   local dirs
-  if dirs="$(find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V)"; then
-    :
+  if find "$root" -maxdepth 0 -printf '' >/dev/null 2>&1; then
+    dirs="$(find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V)"
   else
     dirs="$(find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sed 's#.*/##' | sort)"
   fi
@@ -2118,8 +2168,12 @@ cn_agent_download() {
 }
 
 # cn_agent_write_guard 生成 agent-rollback-guard.sh（unit 的 ExecStartPre）：
-# warden-cn-agent 连续重启 >= 2 次时，若存在自升级备份 .prev，则换回旧二进制
-# 并清掉失败计数（spec §8 安全网：新版本启动失败自动回退），结果记入日志文件。
+# upgrade-pending 存在且当前 NRestarts 比写入基线多 >= 2（即新版本启动后又
+# 崩了两次）时，若有自升级备份 .prev 就换回旧二进制并清掉失败计数
+# （spec §8 安全网：新版本启动失败自动回退），结果记入日志文件。
+# 基线来自 agent 退出前写入的 "<version> <nrestarts>"：升级自身的干净
+# exit-0 重启也会 +1，绝不能把这次算成崩溃（旧版按绝对 NRestarts>=2 判断，
+# 第二次升级在还没跑起来前就被回滚）。没有 pending 标记时一律不动。
 cn_agent_write_guard() {
   cn_snapshot_file "$CN_AGENT_ROLLBACK_GUARD"
   cn_put_file "$CN_AGENT_ROLLBACK_GUARD" 0755 <<GUARDEOF
@@ -2129,19 +2183,27 @@ set -u
 BIN="$CN_AGENT_BIN"
 LOG="$CN_AGENT_GUARD_LOG"
 STATE_DIR="$CN_AGENT_STATE_DIR"
+PENDING="\$STATE_DIR/upgrade-pending"
 nrestarts="\$(systemctl show warden-cn-agent -p NRestarts --value 2>/dev/null || printf '0')"
 case "\$nrestarts" in ''|*[!0-9]*) nrestarts=0;; esac
-[ "\$nrestarts" -ge 2 ] || exit 0
+[ -f "\$PENDING" ] || exit 0
+baseline="\$(awk '{print \$2; exit}' "\$PENDING" 2>/dev/null || printf '0')"
+case "\$baseline" in ''|*[!0-9]*) baseline=0;; esac
+delta=\$((nrestarts - baseline))
+[ "\$delta" -ge 2 ] || exit 0
 [ -e "\$BIN.prev" ] || exit 0
 # 回滚前先把「待验证版本」转成「已阻止版本」：恢复后的旧 agent 下次心跳会
 # 看到同一个 target_version，没有这个标记就会再装一次、再崩一次（升级回滚
 # 循环）。只有面板显式下发的 self-upgrade 命令才会清掉它。
-if [ -f "\$STATE_DIR/upgrade-pending" ]; then
-  tr -d ' \r\n' < "\$STATE_DIR/upgrade-pending" > "\$STATE_DIR/upgrade-blocked" 2>/dev/null || true
-  rm -f "\$STATE_DIR/upgrade-pending"
+pending_version="\$(awk '{print \$1; exit}' "\$PENDING" 2>/dev/null || true)"
+if [ -f "\$PENDING" ]; then
+  if [ -n "\$pending_version" ]; then
+    printf '%s\n' "\$pending_version" > "\$STATE_DIR/upgrade-blocked" 2>/dev/null || true
+  fi
+  rm -f "\$PENDING"
 fi
 if mv -f "\$BIN.prev" "\$BIN"; then
-  printf '%s warden-cn-agent 连续崩溃 %s 次，已回退到上一个二进制\n' "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" "\$nrestarts" >> "\$LOG" 2>/dev/null || true
+  printf '%s warden-cn-agent 升级后重启 %s 次未成功，已回退到上一个二进制\n' "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" "\$delta" >> "\$LOG" 2>/dev/null || true
   if [ -s "\$STATE_DIR/upgrade-blocked" ]; then
     printf '%s 已阻止版本 %s 的自动升级（需面板手动升级）\n' "\$(date -u +%Y-%m-%dT%H:%M:%SZ)" "\$(cat "\$STATE_DIR/upgrade-blocked")" >> "\$LOG" 2>/dev/null || true
   fi
@@ -2258,15 +2320,24 @@ cn_agent_enroll() {
 
 # cn_agent_start_and_wait 启动 agent 并等待 state.json 出现且 probe_result=OK。
 # 状态文件只在心跳成功后落盘（Task 8 ruling 7），probe=OK 即"接入成功"。
+# 启动前先删除旧 state.json：重跑 cn-setup 时旧文件会让等待逻辑把"上次的
+# 成功状态"误当成这次启动成功（F8）。先 enable 再 restart，确保对已在运行的
+# 单元也真正换成新配置/新二进制。
 # 超时 60s 视为迁移失败（spec §9.4：超时 → 回滚）。
 cn_agent_start_and_wait() {
   local i
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf '  + systemctl daemon-reload && systemctl enable --now %s\n' "$CN_AGENT_UNIT_NAME"
+    printf '  + systemctl daemon-reload && systemctl enable %s && rm -f %s && systemctl restart %s\n' \
+      "$CN_AGENT_UNIT_NAME" "$CN_AGENT_STATE_DIR/state.json" "$CN_AGENT_UNIT_NAME"
     return 0
   fi
   systemctl daemon-reload >/dev/null 2>&1 || true
-  if ! systemctl enable --now "$CN_AGENT_UNIT_NAME" >/dev/null 2>&1; then
+  if ! systemctl enable "$CN_AGENT_UNIT_NAME" >/dev/null 2>&1; then
+    warn "agent 服务启用失败：journalctl -u $CN_AGENT_UNIT_NAME -n 30"
+    return 1
+  fi
+  rm -f "$CN_AGENT_STATE_DIR/state.json"
+  if ! systemctl restart "$CN_AGENT_UNIT_NAME" >/dev/null 2>&1; then
     warn "agent 服务启动失败：journalctl -u $CN_AGENT_UNIT_NAME -n 30"
     return 1
   fi
@@ -2503,6 +2574,13 @@ cn_setup_agent() {
     machine_id="(dry-run)"
   else
     machine_id="$(tr -d ' \r\n' < /etc/machine-id)"
+  fi
+  # 重跑 cn-setup 的机器上旧 agent 可能仍在运行：先停掉再写新配置/装新单元，
+  # 否则后面的 restart 还没到、旧进程已经用旧 token 继续心跳（F8）。
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  + systemctl stop %s（若在运行）\n' "$CN_AGENT_UNIT_NAME"
+  elif have systemctl && systemctl is-active --quiet "$CN_AGENT_UNIT_NAME"; then
+    systemctl stop "$CN_AGENT_UNIT_NAME" >/dev/null 2>&1 || true
   fi
   if ! cn_agent_write_config "" "$machine_id"; then
     cn_agent_fail
@@ -3175,17 +3253,20 @@ cmd_install() {
     pull_docker_image
     init_docker_config
     run_docker_container
+    # Prefetch after the service is running: three downloads can take minutes
+    # and must never extend the install/upgrade downtime window (F7).
+    cache_agent_binaries || true
   else
     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
     install_binary
     init_config
     install_scripts
-    cache_agent_binaries || true
     install_cli
     write_version_from_binary
     install_unit
     install_logrotate
     install_service
+    cache_agent_binaries || true
   fi
   if wait_health "$PUBLIC_URL"; then
     ok "健康检查通过"
@@ -3243,13 +3324,15 @@ cmd_update() {
     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
     install_binary
     install_scripts
-    cache_agent_binaries || true
     install_cli
     write_version_from_binary
     install_unit
     install_logrotate
     systemctl daemon-reload
     systemctl start "$SERVICE"
+    # Prefetch only after the gateway is back up: the cache downloads must not
+    # sit inside the stopped-service window (F7).
+    cache_agent_binaries || true
   fi
   sleep 2
   if [ -n "$PUBLIC_URL" ] && wait_health "$PUBLIC_URL" 1; then ok "升级完成"; else warn "升级后健康检查未通过"; fi

@@ -945,6 +945,9 @@ func TestBuildReportFillsWireFields(t *testing.T) {
 	if rep.AgentVersion == "" {
 		t.Error("report agent_version empty")
 	}
+	if want := normalizeVersion(version.Version); rep.AgentVersion != want {
+		t.Errorf("report agent_version = %q, want the bare running version %q", rep.AgentVersion, want)
+	}
 	if rep.Probe.Result != ProbeOK || rep.Probe.CheckedAt == "" {
 		t.Errorf("report probe = %+v, want result and RFC3339 checked_at", rep.Probe)
 	}

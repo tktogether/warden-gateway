@@ -1427,6 +1427,17 @@
   function cnActionLabel(action) { return cnActionLabels[action] || action; }
   function cnMachineName(m) { return (m && (m.hostname || m.id)) || '未知机器'; }
 
+  // cnNormVersion collapses a version string to the bare form the gateway
+  // compares: strips a leading "v" and an old-style " (commit)" suffix
+  // ("v1.6.0 (abc1234)" → "1.6.0"). Recent agents already report the bare
+  // version; this keeps old reports and pinned targets comparable.
+  function cnNormVersion(v) {
+    var s = String(v == null ? '' : v).trim();
+    if (!s) { return ''; }
+    s = s.split(/\s+/)[0];
+    return s.replace(/^v/, '');
+  }
+
   async function loadCnmachines(opts) {
     opts = opts || {};
     var silent = !!opts.silent;
@@ -1524,8 +1535,10 @@
     var head = el('div', 'cn-machine-head');
     var left = el('div');
     add(left, el('h3', '', cnMachineName(m)));
-    var meta = [m.version ? 'agent ' + m.version : '版本未知'];
-    if (m.desired_version) { meta.push('目标版本 ' + m.desired_version); }
+    var runningVersion = cnNormVersion(m.version);
+    var desiredVersion = cnNormVersion(m.desired_version);
+    var meta = [runningVersion ? 'agent ' + runningVersion : '版本未知'];
+    if (desiredVersion) { meta.push('目标版本 ' + desiredVersion); }
     add(left, el('div', 'cn-machine-meta', meta.join(' · ')));
     add(head, left);
     var badges = el('div', 'cn-machine-badges');
@@ -1542,10 +1555,11 @@
     if (Number(m.pending) > 0) { badges.appendChild(statusPill('待执行 ' + m.pending, 'warn')); }
     // A machine whose running version differs from its target has work pending:
     // either an upgrade the panel queued, or a rollback the operator pinned.
-    var gatewayVersion = (state.cnmachines && state.cnmachines.gateway_version) || '';
-    if (m.desired_version && m.version && m.desired_version !== m.version) {
-      var rollback = gatewayVersion && m.desired_version !== gatewayVersion;
-      badges.appendChild(statusPill((rollback ? '已钉版本 ' : '待升级 ') + m.desired_version, 'warn'));
+    // Compare normalized forms so "v1.6.0 (sha)" and "1.6.0" are equal.
+    var gatewayVersion = cnNormVersion(state.cnmachines && state.cnmachines.gateway_version);
+    if (desiredVersion && runningVersion && desiredVersion !== runningVersion) {
+      var rollback = gatewayVersion && desiredVersion !== gatewayVersion;
+      badges.appendChild(statusPill((rollback ? '已钉版本 ' : '待升级 ') + desiredVersion, 'warn'));
     }
     head.appendChild(badges);
     card.appendChild(head);
@@ -1586,11 +1600,11 @@
     upgrade.type = 'button';
     upgrade.addEventListener('click', function () {
       var cached = (state.cnmachines && state.cnmachines.cached_versions) || [];
-      var current = (state.cnmachines && state.cnmachines.gateway_version) || '';
+      var current = cnNormVersion(state.cnmachines && state.cnmachines.gateway_version);
       // Only cached builds can be served, so the choices are the cache menu:
       // the gateway's own version by default, any older one is a rollback.
       var options = cached.length ? cached : (current ? [current] : []);
-      var chosen = m.desired_version || current || (options[0] || '');
+      var chosen = cnNormVersion(m.desired_version) || current || (options[0] || '');
       var body = el('div');
       if (!options.length) {
         body.appendChild(el('p', 'muted', '本网关没有缓存的 agent 构建，请先在网关重新执行一次安装/升级以填充缓存。'));
@@ -1600,14 +1614,24 @@
       body.appendChild(el('p', null, '选择 ' + cnMachineName(m) + ' 要安装的 agent 版本。低于网关版本即为回退；机器会下载、校验并重启。'));
       var select = el('select', 'input');
       options.forEach(function (v) {
-        var opt = el('option', null, v + (v === current ? '（网关当前）' : (v === m.version ? '（正在运行）' : '')));
+        var opt = el('option', null, v + (v === current ? '（网关当前）' : (v === runningVersion ? '（正在运行）' : '')));
         opt.value = v;
         if (v === chosen) { opt.selected = true; }
         select.appendChild(opt);
       });
+      // Empty value clears the pin and lets the machine follow AutoFollow /
+      // keep its current build, which is the operator's way out of a rollback.
+      var follow = el('option', null, '跟随网关版本（清除钉选）');
+      follow.value = '';
+      select.appendChild(follow);
       body.appendChild(select);
       confirmDialog('升级 agent', body).then(function (yes) {
-        if (yes) { cnMachineCommand(m, 'self-upgrade', upgrade, select.value); }
+        if (!yes) { return; }
+        if (select.value === '') {
+          cnMachinePinClear(m, upgrade);
+        } else {
+          cnMachineCommand(m, 'self-upgrade', upgrade, select.value);
+        }
       });
     });
     actions.appendChild(upgrade);
@@ -1683,6 +1707,19 @@
       if (version) { body.version = version; }
       await api('/api/cnmachines/' + encodeURIComponent(m.id) + '/command', { method: 'POST', body: body });
       showToast('已下发' + cnActionLabel(action) + '命令，等待 ' + cnMachineName(m) + ' 心跳执行');
+      loadCnmachines({ silent: true });
+    } catch (err) {
+      showToast(err.message, true);
+    } finally {
+      setBusy(button, false);
+    }
+  }
+
+  async function cnMachinePinClear(m, button) {
+    setBusy(button, true);
+    try {
+      await api('/api/cnmachines/' + encodeURIComponent(m.id) + '/pin', { method: 'POST', body: { version: '' } });
+      showToast('已清除 ' + cnMachineName(m) + ' 的钉选版本，机器将按自动跟随设置运行');
       loadCnmachines({ silent: true });
     } catch (err) {
       showToast(err.message, true);
