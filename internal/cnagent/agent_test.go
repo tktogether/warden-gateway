@@ -134,6 +134,15 @@ func newTestAgent(t *testing.T, cfg *Config) *testAgent {
 	}
 	ta := &testAgent{statePath: filepath.Join(t.TempDir(), "state.json")}
 	a.statePath = ta.statePath
+	// Deregister rewrites the agent config (it clears the token), so the test
+	// agent must own a writable config path. The production default is
+	// /etc/warden-gateway-cn/agent.json, which an unprivileged CI runner cannot
+	// write — leaving it in place made these tests pass only on machines where
+	// that path happened to be writable.
+	a.configPath = filepath.Join(t.TempDir(), "agent.json")
+	if err := Save(a.configPath, cfg); err != nil {
+		t.Fatalf("seed agent config: %v", err)
+	}
 	// dnsListen is the injectable field (ruling 1); resolveListen rewrites
 	// "127.0.0.1:0" to the concrete bound address once, so reading the field
 	// after a cycle yields the address the proxy is serving on.
