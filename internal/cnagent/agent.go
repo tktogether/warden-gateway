@@ -213,7 +213,35 @@ func newAgent(cfg *Config, log *logging.Logger, statePath string) (*Agent, error
 	// cycle is still attributable to the systemd guard.
 	a.pendingAtStart = a.upgradePendingExists()
 
+	// Serve the last known split list immediately: a restart (upgrade, unit
+	// restart, reboot) would otherwise resolve everything upstream for one
+	// heartbeat interval. The first reply still wins — a different hash
+	// rebuilds the proxy.
+	a.seedDomainsFromState()
+
 	return a, nil
+}
+
+// seedDomainsFromState loads the persisted split list into the in-memory cache
+// so the first cycle can answer split queries before the heartbeat reply
+// arrives. It is a no-op when the state file is missing, unparsable, empty, or
+// when a list is already loaded.
+func (a *Agent) seedDomainsFromState() {
+	raw, err := os.ReadFile(a.statePath)
+	if err != nil {
+		return
+	}
+	var st agentState
+	if err := json.Unmarshal(raw, &st); err != nil || len(st.Domains) == 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.domains) != 0 {
+		return
+	}
+	a.domains = append([]string(nil), st.Domains...)
+	a.domainsHash = st.DomainsHash
 }
 
 // SetConfigPath overrides the agent.json location deregister rewrites to
@@ -765,18 +793,23 @@ func (a *Agent) restoreResolvConfCmd() string {
 // agentState is the on-disk state file (mode 0644) consumed by warden-cn
 // cn-check and by Task 8's SelfCheck (freshness via updated_at).
 type agentState struct {
-	UpdatedAt      string         `json:"updated_at"`
-	ProbeResult    string         `json:"probe_result"`
-	ProbeCheckedAt string         `json:"probe_checked_at"`
-	ProbeDetail    string         `json:"probe_detail,omitempty"`
-	DNSListen      string         `json:"dns_listen"`
-	DNSRunning     bool           `json:"dns_running"`
-	DNSDegraded    bool           `json:"dns_degraded"`
-	DomainsHash    string         `json:"domains_hash"`
-	DomainsCount   int            `json:"domains_count"`
-	HeartbeatOK    bool           `json:"heartbeat_ok"`
-	LastCommand    *CommandResult `json:"last_command,omitempty"`
-	LastError      string         `json:"last_error,omitempty"`
+	UpdatedAt      string `json:"updated_at"`
+	ProbeResult    string `json:"probe_result"`
+	ProbeCheckedAt string `json:"probe_checked_at"`
+	ProbeDetail    string `json:"probe_detail,omitempty"`
+	DNSListen      string `json:"dns_listen"`
+	DNSRunning     bool   `json:"dns_running"`
+	DNSDegraded    bool   `json:"dns_degraded"`
+	DomainsHash    string `json:"domains_hash"`
+	DomainsCount   int    `json:"domains_count"`
+	// Domains persists the split list so a restarted agent can serve it before
+	// the first heartbeat reply arrives (an upgrade restart would otherwise
+	// cost one heartbeat interval of unsplit resolution). The first reply still
+	// wins: a differing hash rebuilds the proxy.
+	Domains     []string       `json:"domains,omitempty"`
+	HeartbeatOK bool           `json:"heartbeat_ok"`
+	LastCommand *CommandResult `json:"last_command,omitempty"`
+	LastError   string         `json:"last_error,omitempty"`
 }
 
 // writeState overwrites the state file for this cycle (ruling 1: mode 0644).
@@ -787,6 +820,7 @@ func (a *Agent) writeState(pr ProbeResult, degraded bool) error {
 	st := agentState{
 		ProbeResult:  pr.Result,
 		DomainsHash:  a.domainsHash,
+		Domains:      append([]string(nil), a.domains...),
 		DomainsCount: len(a.domains),
 		LastCommand:  a.lastCommand,
 		LastError:    a.lastError,

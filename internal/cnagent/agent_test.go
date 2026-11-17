@@ -961,3 +961,43 @@ func TestBuildReportFillsWireFields(t *testing.T) {
 		t.Errorf("report last_command = %+v, want nil before any command ran", rep.LastCommand)
 	}
 }
+
+// TestSeedDomainsFromState pins the cold-start contract: after a restart the
+// agent serves the last persisted split list immediately, before the first
+// heartbeat reply arrives. A missing, empty or unparsable state file leaves the
+// cache untouched.
+func TestSeedDomainsFromState(t *testing.T) {
+	dir := t.TempDir()
+	a := &Agent{statePath: filepath.Join(dir, "state.json")}
+	a.dnsListen = "127.0.0.1:0"
+	st := agentState{DomainsHash: "abc", Domains: []string{"github.com", "ghcr.io"}}
+	raw, err := json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(a.statePath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a.seedDomainsFromState()
+	a.mu.Lock()
+	got, hash := append([]string(nil), a.domains...), a.domainsHash
+	a.mu.Unlock()
+	if hash != "abc" || len(got) != 2 || got[0] != "github.com" || got[1] != "ghcr.io" {
+		t.Fatalf("seeded domains = %v hash %q, want [github.com ghcr.io] abc", got, hash)
+	}
+
+	// An already-populated cache is never overwritten by stale state.
+	a2 := &Agent{statePath: a.statePath}
+	a2.domains = []string{"fresh.example"}
+	a2.seedDomainsFromState()
+	if len(a2.domains) != 1 || a2.domains[0] != "fresh.example" {
+		t.Fatalf("seed overwrote a loaded list: %v", a2.domains)
+	}
+
+	// Missing file is a no-op.
+	a3 := &Agent{statePath: filepath.Join(dir, "missing.json")}
+	a3.seedDomainsFromState()
+	if len(a3.domains) != 0 {
+		t.Fatalf("missing state seeded %v", a3.domains)
+	}
+}
