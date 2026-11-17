@@ -59,6 +59,10 @@ INTERACTIVE_SETUP=1
 CN_BACKUP_DIR=""
 CN_CREATED_FILES=""
 CN_CHANGED=0
+# 仅当 cn_docker_cache_agent 在本次运行中从运行中的容器解析出真实版本并写入
+# $SCRIPT_DIR/VERSION 后置 1。缓存选版本时只认本次写入的文件，避免上次运行
+# 或旧二进制留下的版本号污染缓存。
+CN_DOCKER_VERSION_FRESH=0
 
 CN_ORIGIN=""
 TLS_MODE="auto"
@@ -505,12 +509,19 @@ install_binary() {
 # 缓存之后才跑），再退回 $SCRIPT_DIR/VERSION；都拿不到就返回非零，由调用方
 # 跳过缓存——绝不能建出 $SCRIPT_DIR/agent/latest/ 这种永远匹配不上的目录。
 # Docker 模式例外：宿主机上的 $BIN_PATH 可能是不再运行的旧二进制，脚本版本
-# 文件由 cn_docker_cache_agent 从运行中的容器刷新，优先级必须高于它。
+# 文件由 cn_docker_cache_agent 在本次运行中从运行中的容器刷新并置位
+# CN_DOCKER_VERSION_FRESH；只有本次写入的版本文件才可信（旧文件可能是上次
+# 运行或旧版本留下的）。
 cache_agent_version() {
   local ver=""
   if [ "$VERSION" != "latest" ]; then
     ver="${VERSION#v}"
-  elif [ "$MODE" = "docker" ] && [ -f "$SCRIPT_DIR/VERSION" ]; then
+  elif [ "$MODE" = "docker" ]; then
+    # 只认本次运行从容器解析后写入的版本文件；宿主机旧二进制和上次运行留下
+    # 的 VERSION 文件都不可信（缓存缺失可恢复，缓存错版本不可恢复）。
+    if [ "${CN_DOCKER_VERSION_FRESH:-0}" != "1" ] || [ ! -f "$SCRIPT_DIR/VERSION" ]; then
+      return 1
+    fi
     ver="$(tr -d ' \r\n' < "$SCRIPT_DIR/VERSION" | sed 's/^v//')"
   else
     if [ -x "$BIN_PATH" ]; then
@@ -627,46 +638,91 @@ cn_prune_agent_cache() {
   return 0
 }
 
+# cn_version_ok 校验裸版本号（已去掉 v 前缀）：只允许数字和点，且必须以
+# 数字开头/结尾、不含连续的 ".."。dev/garbage/latest 一律拒绝。
+cn_version_ok() {
+  case "$1" in
+    ''|latest|*[!0-9.]*|.*|*.|*..*) return 1;;
+  esac
+  return 0
+}
+
+# cn_docker_container_version 读取正在运行的容器自报的版本（container-first）。
+# 单脚本 Docker 安装没有宿主机二进制，容器内的二进制是唯一权威来源；任何
+# HTTP 源（尤其是 PUBLIC_URL）都可能还指向升级前的旧网关，不能先于它使用。
+cn_docker_container_version() {
+  local raw
+  have docker || return 0
+  raw="$(docker exec "$SERVICE" /usr/local/bin/warden-gateway version 2>/dev/null | head -n 1 || true)"
+  raw="$(printf '%s' "$raw" | awk '{print $1}' | sed 's/^v//' | tr -d ' \r\n')"
+  cn_version_ok "$raw" && printf '%s\n' "$raw"
+}
+
+# cn_docker_wait_version 在容器启动窗口内重试容器自报版本（默认 30 次 x 2s
+# ≈ 60s）。返回裸版本；容器始终不报告就返回非零，由调用方决定后续来源。
+# 测试可用 CN_DOCKER_VERSION_ATTEMPTS / CN_DOCKER_VERSION_DELAY 缩短等待。
+cn_docker_wait_version() {
+  local i v="" attempts="${CN_DOCKER_VERSION_ATTEMPTS:-30}" delay="${CN_DOCKER_VERSION_DELAY:-2}"
+  # 没有 docker CLI 就没有容器自报来源，不必空转 60 秒。
+  have docker || return 1
+  for i in $(seq 1 "$attempts"); do
+    v="$(cn_docker_container_version || true)"
+    if [ -n "$v" ]; then
+      printf '%s\n' "$v"
+      return 0
+    fi
+    if [ "$i" -lt "$attempts" ]; then sleep "$delay"; fi
+  done
+  return 1
+}
+
+# cn_docker_http_version 从容器发布到宿主机的明文 HTTP 监听读取版本。
+# 该监听上 /api/health 是 301 跳转（只有 /healthz 返回 {"ok":true,"version":...}），
+# 所以必须用 /healthz；地址取自配置的 listen.http，其次本脚本的 HTTP_LISTEN。
+cn_docker_http_version() {
+  local addr="$1" v
+  [ -n "$addr" ] || return 1
+  v="$(curl -fsS --connect-timeout 3 --max-time 8 "http://$addr/healthz" 2>/dev/null \
+    | sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' | head -n 1 || true)"
+  v="$(printf '%s' "$v" | tr -d ' \r\n')"
+  v="${v#v}"
+  cn_version_ok "$v" && printf '%s\n' "$v"
+}
+
 # cn_docker_cache_agent Docker 安装/升级后的 agent 构建预取。单脚本 Docker
-# 安装既没有 $BIN_PATH version，也没有 $SCRIPT_DIR/VERSION，版本只能从正在
-# 运行的网关解析：优先本机 HTTP 健康端点（listen.http 来自配置，其次 CLI
-# 值），再退到容器内二进制的 version，最后 -k 访问 PUBLIC_URL。解析成功后
-# 先写 $SCRIPT_DIR/VERSION（cache_agent_version 在 Docker 模式优先读它），
-# 再走统一的 cache_agent_binaries；任何失败只告警，不影响安装/升级。
+# 安装既没有 $BIN_PATH version，也没有可信的 $SCRIPT_DIR/VERSION，版本只能
+# 从正在运行的网关解析：
+#   1. 容器自报（docker exec ... version，启动窗口内重试约 60s）；
+#   2. 容器发布到宿主机的明文 HTTP /healthz。
+# PUBLIC_URL 不再是来源：升级窗口内它可能仍指向旧网关，把它写进缓存会把
+# agent 钉在错误版本上——缓存缺失可恢复，缓存错版本不可恢复。两者都拿不到
+# 就告警并跳过预取。解析成功后先写 $SCRIPT_DIR/VERSION 并置位
+# CN_DOCKER_VERSION_FRESH（cache_agent_version 只认本次写入的文件），再走
+# 统一的 cache_agent_binaries；任何失败只告警，不影响安装/升级。
 cn_docker_cache_agent() {
-  local v="" http_addr raw
+  local v="" http_addr
   if [ -f "$CONFIG_FILE" ]; then
     http_addr="$(sed -n '/"listen"[[:space:]]*:[[:space:]]*{/,/}/p' "$CONFIG_FILE" \
       | sed -n 's/.*"http"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
   fi
   [ -n "$http_addr" ] || http_addr="$HTTP_LISTEN"
-  if [ -n "$http_addr" ]; then
-    v="$(curl -fsS --connect-timeout 3 --max-time 8 "http://$http_addr/api/health" 2>/dev/null \
-      | sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' | head -n 1 || true)"
-  fi
-  if [ -z "$v" ] && have docker; then
-    raw="$(docker exec "$SERVICE" /usr/local/bin/warden-gateway version 2>/dev/null | head -n 1 || true)"
-    v="$(printf '%s' "$raw" | awk '{print $1}' | sed 's/^v//')"
-  fi
-  if [ -z "$v" ] && [ -n "$PUBLIC_URL" ]; then
-    v="$(curl -kfsS --connect-timeout 3 --max-time 8 "$PUBLIC_URL/api/health" 2>/dev/null \
-      | sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' | head -n 1 || true)"
-  fi
-  v="$(printf '%s' "$v" | tr -d ' \r\n')"
-  v="${v#v}"
-  case "$v" in
-    ''|latest|*[!0-9.]*)
-      warn "无法从运行中的 Docker 网关解析具体版本，跳过 agent 构建预取"
-      return 1;;
-  esac
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf '  + 从运行中的网关解析版本 %s，并预取 agent 构建\n' "$v"
+    printf '  + 从运行中的网关解析版本并预取 agent 构建（预览不下载）\n'
     return 0
+  fi
+  v="$(cn_docker_wait_version || true)"
+  if [ -z "$v" ]; then
+    v="$(cn_docker_http_version "$http_addr" || true)"
+  fi
+  if [ -z "$v" ]; then
+    warn "无法从运行中的 Docker 网关解析具体版本（容器未报告，本地 http://$http_addr/healthz 也无应答），跳过 agent 构建预取；网关就绪后可重跑 install/update"
+    return 1
   fi
   if ! printf '%s\n' "$v" > "$SCRIPT_DIR/VERSION"; then
     warn "写入 $SCRIPT_DIR/VERSION 失败，跳过 agent 构建预取"
     return 1
   fi
+  CN_DOCKER_VERSION_FRESH=1
   cache_agent_binaries || true
   return 0
 }
@@ -3350,11 +3406,6 @@ cmd_install() {
     pull_docker_image
     init_docker_config
     run_docker_container
-    # Prefetch after the service is running: three downloads can take minutes
-    # and must never extend the install/upgrade downtime window (F7). Docker
-    # installs have no host binary/version file, so resolve the running
-    # gateway's version first (R2).
-    cn_docker_cache_agent || true
   else
     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
     install_binary
@@ -3372,6 +3423,13 @@ cmd_install() {
   else
     journalctl -u "$SERVICE" -n 40 --no-pager || true
     die "健康检查未通过"
+  fi
+  if [ "$MODE" = "docker" ]; then
+    # Resolve+cache only after the container passed its health check: during
+    # the startup window neither the container nor the local listener can
+    # report a version yet (R2). The prefetch downloads must also stay outside
+    # the install/upgrade downtime window (F7).
+    cn_docker_cache_agent || true
   fi
   ensure_certificate "$DOMAIN" "$PUBLIC_URL" || true
   title "安装完成"
@@ -3418,9 +3476,6 @@ cmd_update() {
     install_cli
     pull_docker_image
     run_docker_container
-    # Same as install: only the running container knows its version; prefetch
-    # after it is up so the cache never holds a host binary's version (R2).
-    cn_docker_cache_agent || true
   else
     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
     install_binary
@@ -3437,6 +3492,11 @@ cmd_update() {
   fi
   sleep 2
   if [ -n "$PUBLIC_URL" ] && wait_health "$PUBLIC_URL" 1; then ok "升级完成"; else warn "升级后健康检查未通过"; fi
+  if [ "$MODE" = "docker" ]; then
+    # Same as install: only the running container knows its version, so resolve
+    # and prefetch after the health check, never before/during the restart (R2).
+    cn_docker_cache_agent || true
+  fi
 }
 
 cmd_uninstall() {

@@ -291,11 +291,13 @@ func TestBootstrapRollbackGuardBaseline(t *testing.T) {
 }
 
 // TestBootstrapDockerAgentCache locks the Docker install/update fix (review
-// R2): a single-script Docker install has neither a host binary nor a
-// VERSION file, so the version must come from the RUNNING gateway and land in
-// $SCRIPT_DIR/VERSION before the shared prefetch runs. Both Docker branches
-// must go through the one resolver (cn_docker_cache_agent), and the Docker
-// resolver must never trust a stale host binary.
+// R2, fixwave 5): a single-script Docker install has neither a host binary nor
+// a trustworthy VERSION file, so the version must come from the RUNNING
+// gateway and land in $SCRIPT_DIR/VERSION before the shared prefetch runs.
+// The container's own report is authoritative; the plain-HTTP listener only
+// answers /healthz (its /api/health is a 301), and PUBLIC_URL is never a
+// source. Both Docker branches must go through the one resolver
+// (cn_docker_cache_agent) only after the health check.
 func TestBootstrapDockerAgentCache(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "bootstrap.sh"))
 	if err != nil {
@@ -308,14 +310,50 @@ func TestBootstrapDockerAgentCache(t *testing.T) {
 		t.Fatal("cn_docker_cache_agent function not found in bootstrap.sh")
 	}
 	for _, want := range []string{
-		"/api/health",          // version comes from the running gateway
-		`"http"`,               // listen.http parsed from config.json
-		"docker exec",          // fallback: the container's own binary
-		`$SCRIPT_DIR/VERSION`,  // resolved version handed to cache_agent_version
-		"cache_agent_binaries", // one shared prefetch path
+		"/healthz",                // plain-HTTP listener only reports a version there
+		`"http"`,                  // listen.http parsed from config.json
+		"cn_docker_wait_version",  // container-first, retried through startup
+		"cn_docker_http_version",  // local /healthz fallback
+		`$SCRIPT_DIR/VERSION`,     // resolved version handed to cache_agent_version
+		"CN_DOCKER_VERSION_FRESH", // only a same-run write is trusted
+		"cache_agent_binaries",    // one shared prefetch path
 	} {
 		if !strings.Contains(fn, want) {
 			t.Errorf("cn_docker_cache_agent is missing %q", want)
+		}
+	}
+	// Container-first policy: the container's own report is attempted before
+	// the plain-HTTP fallback.
+	if c, h := strings.Index(fn, "cn_docker_wait_version"), strings.Index(fn, "cn_docker_http_version"); c < 0 || h < 0 || c > h {
+		t.Errorf("cn_docker_cache_agent does not try the container before local /healthz (container=%d http=%d)", c, h)
+	}
+	for _, forbidden := range []string{
+		`http://$http_addr/api/health`, // 301 on the plain-HTTP listener
+		`$PUBLIC_URL/api/health`,       // may be a stale gateway during upgrade
+	} {
+		if strings.Contains(fn, forbidden) {
+			t.Errorf("cn_docker_cache_agent still references %q", forbidden)
+		}
+	}
+
+	retry := bootstrapFuncRegion(script, "cn_docker_wait_version")
+	if retry == "" {
+		t.Fatal("cn_docker_wait_version function not found in bootstrap.sh")
+	}
+	if !strings.Contains(retry, "docker exec") && !strings.Contains(retry, "cn_docker_container_version") {
+		t.Error("cn_docker_wait_version does not poll the container's own version report")
+	}
+	if !strings.Contains(retry, "sleep") {
+		t.Error("cn_docker_wait_version does not wait between retries")
+	}
+
+	container := bootstrapFuncRegion(script, "cn_docker_container_version")
+	if container == "" {
+		t.Fatal("cn_docker_container_version function not found in bootstrap.sh")
+	}
+	for _, want := range []string{"docker exec", "/usr/local/bin/warden-gateway version", "cn_version_ok"} {
+		if !strings.Contains(container, want) {
+			t.Errorf("cn_docker_container_version is missing %q", want)
 		}
 	}
 
@@ -324,13 +362,19 @@ func TestBootstrapDockerAgentCache(t *testing.T) {
 		if region == "" {
 			t.Fatalf("%s function not found in bootstrap.sh", cmd)
 		}
-		if !strings.Contains(region, "cn_docker_cache_agent") {
+		call := strings.Index(region, "cn_docker_cache_agent")
+		if call < 0 {
 			t.Errorf("%s Docker branch does not call cn_docker_cache_agent", cmd)
+			continue
+		}
+		if health := strings.Index(region, "wait_health"); health < 0 || call < health {
+			t.Errorf("%s runs cn_docker_cache_agent before wait_health (call=%d health=%d)", cmd, call, health)
 		}
 	}
 
-	// Docker mode must prefer $SCRIPT_DIR/VERSION over a possibly stale host
-	// $BIN_PATH; the non-Docker path keeps the existing binary-first order.
+	// Docker mode must prefer a same-run $SCRIPT_DIR/VERSION over a possibly
+	// stale host $BIN_PATH; the non-Docker path keeps the existing
+	// binary-first order.
 	versionFn := bootstrapFuncRegion(script, "cache_agent_version")
 	if versionFn == "" {
 		t.Fatal("cache_agent_version function not found in bootstrap.sh")
@@ -340,6 +384,9 @@ func TestBootstrapDockerAgentCache(t *testing.T) {
 		t.Fatal("cache_agent_version has no Docker-specific precedence branch")
 	}
 	dockerBranch := versionFn[dockerMode:]
+	if !strings.Contains(dockerBranch, "CN_DOCKER_VERSION_FRESH") {
+		t.Error("cache_agent_version Docker branch does not require a same-run VERSION write")
+	}
 	vIdx := strings.Index(dockerBranch, `$SCRIPT_DIR/VERSION`)
 	bIdx := strings.Index(dockerBranch, `"$BIN_PATH" version`)
 	if vIdx < 0 || bIdx < 0 {
