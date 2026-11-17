@@ -1,5 +1,18 @@
 # 更新记录
 
+## v1.6.1
+
+### 修复
+
+- 面板「设置」页与「诊断」页的国内机卡片改为 agent 流程：主推「国内机」页生成一次性注册命令，v1.5.x 的 legacy 命令（hosts 托管块 + dnsmasq + 看门狗）收进折叠的「旧版模式命令（已弃用）」，不再作为默认操作展示。
+- 面板生成的注册命令在自签名/IP 面板上自动追加 `--insecure-tls`：面板通过 `/api/cn` 新增的 `tls_mode` 字段告知自身证书方式，避免 agent 首次心跳因 x509 失败而回滚。
+
+### 文档
+
+- `docs/API.md` 补充 agent 端点（enroll/heartbeat/binary）与管理端点（cnmachines/pin/auto-follow/remove），`/api/cn` 标注为历史接口并说明新增字段。
+- `docs/TOOLBOX.md` 的国内机示例改为 `cn-setup --origin ... --gateway-ip ... --enroll-token ...`，legacy 模式标注为已弃用。
+- `README.md` 补充 `--insecure-tls` 说明与 systemd-resolved 守卫（`resolved.conf.d` drop-in）。
+
 ## v1.6.0
 
 ### 新增

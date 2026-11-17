@@ -285,6 +285,7 @@ func TestCNCommandsCarriesSelfHostedAgentURL(t *testing.T) {
 	var payload struct {
 		AgentBinaryURL     string `json:"agent_binary_url"`
 		AgentBinaryVersion string `json:"agent_binary_version"`
+		TLSMode            string `json:"tls_mode"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
@@ -295,6 +296,11 @@ func TestCNCommandsCarriesSelfHostedAgentURL(t *testing.T) {
 	}
 	if payload.AgentBinaryVersion != AgentBinaryVersion() {
 		t.Fatalf("agent_binary_version = %q, want %q", payload.AgentBinaryVersion, AgentBinaryVersion())
+	}
+	// tls_mode tells the panel whether the enrollment command needs
+	// --insecure-tls; the test panel is configured with a self-signed cert.
+	if payload.TLSMode != "self" {
+		t.Fatalf("tls_mode = %q, want self (test panel uses a self-signed cert)", payload.TLSMode)
 	}
 }
 

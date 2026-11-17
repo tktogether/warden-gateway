@@ -61,14 +61,18 @@ sudo bash toolbox.sh bbr benchmark --peer 203.0.113.10 --seconds 10 --schemes bb
 
 ## 国内机设置
 
-国内机设置不在工具箱和维护命令中执行。网关只生成命令，需在国内机上运行 `bootstrap.sh cn-setup`；执行后脚本保存为 `warden-cn`，之后用 `sudo warden-cn cn-restore` 恢复：
+国内机设置不在工具箱和维护命令中执行。**推荐用 agent 模式**：在面板「国内机」页点「生成注册命令」，把它复制到国内机上以 root 执行即可（令牌一次性、15 分钟有效）：
 
 ```bash
 curl -fsSL https://panel.example.com/bootstrap.sh -o /tmp/wg-bootstrap.sh
-sudo bash /tmp/wg-bootstrap.sh cn-setup --gateway-ip 192.0.2.10 --cn-mode auto --yes
+sudo bash /tmp/wg-bootstrap.sh cn-setup \
+  --origin https://panel.example.com --gateway-ip 192.0.2.10 \
+  --enroll-token <面板生成的令牌> --yes
 ```
 
-`--cn-mode` 只有 `auto`（默认，前置 hosts 托管块 + 本地 dnsmasq + resolver 指向本机 DNS + NetworkManager 守卫）和 `none`（关闭分流，只做 APT/BBR/Docker/Git 镜像）。旧值 `hosts`、`dns`、`both` 会提示弃用并按 `auto` 处理。
+面板为自签名/IP 面板时命令会自带 `--insecure-tls`。迁移完成后脚本保存为 `warden-cn`，用 `sudo warden-cn cn-check` 体检、`sudo warden-cn cn-restore` 恢复。
+
+旧版模式（**已弃用**，无 agent、hosts 托管块 + 本地 dnsmasq + 看门狗）仍可显式触发：不带 `--enroll-token` 或加 `--no-agent`。此时 `--cn-mode` 只有 `auto`（默认）和 `none`（关闭分流，只做 APT/BBR/Docker/Git 镜像），旧值 `hosts`、`dns`、`both` 会提示弃用并按 `auto` 处理。
 
 `warden-cn` 只提供 `cn-setup`、`cn-check`、`cn-status`、`cn-restore`、`version`、`help`；安装、升级、卸载网关等代理机操作会以退出码 2 拒绝。
 

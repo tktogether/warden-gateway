@@ -1403,19 +1403,29 @@
 
   function cnCommandPanel(cn) {
     var p = el('div', 'panel');
-    add(p, el('h3', '', '给国内机使用的命令'));
-    add(p, el('p', 'muted', '这些命令由其他服务器（国内机）执行，网关本身不执行国内机设置。命令会写入 hosts 或 DNS、配置 Docker 与 Git 镜像，修改前自动备份。'));
+    add(p, el('h3', '', '国内机接入'));
+    // v1.6.0: the supported path is the agent enrollment flow on the 国内机
+    // page. The legacy cn-setup command is kept visible only as a labeled
+    // fallback, so nobody copies it by mistake expecting the agent.
+    var goAgent = el('button', 'btn small primary', '生成注册命令');
+    goAgent.type = 'button';
+    goAgent.addEventListener('click', function () { navigate('cnmachines'); });
+    var row = el('div', 'alert');
+    add(row, el('span', '', '推荐：由 warden-cn-agent 接管分流（面板可看状态、下发域名、升级与回退）。以下旧版命令不含 agent 注册。'));
+    row.appendChild(goAgent);
+    p.appendChild(row);
     var commands = cn.commands || {};
-    p.appendChild(commandRow('在国内机上执行', cn.command || commands.auto || ''));
-    p.appendChild(commandRow('自检命令', cn.check_command || ''));
-    p.appendChild(commandRow('恢复命令', cn.restore_command || ''));
+    var legacy = el('details');
+    add(legacy, el('summary', '', '旧版模式命令（已弃用）'));
+    legacy.appendChild(commandRow('在国内机上执行', cn.command || commands.auto || ''));
+    legacy.appendChild(commandRow('自检命令', cn.check_command || ''));
+    legacy.appendChild(commandRow('恢复命令', cn.restore_command || ''));
+    p.appendChild(legacy);
     var dns = cn.dns || {};
     add(p, infoList([
       ['网关地址', cn.gateway_ip || '—'],
       ['面板域名', cn.panel_host || '—'],
       ['健康接口', cn.health_url || '—'],
-      ['网关 DNS 服务', dns.running ? ('运行中 · ' + (dns.active_listen || dns.listen || '')) : (dns.enabled ? '已启用但未监听' : '未启用')],
-      ['网关内置 DNS', cn.dns_ready ? '可用' : '未启用（不影响国内机本地 DNS）'],
       ['分流域名', ((cn.domains || []).join(', ') || '—')]
     ]));
     return p;
@@ -1492,17 +1502,22 @@
         var origin = window.location.origin;
         // The agent probes the gateway address, so the command must carry the
         // gateway IP explicitly; without it bootstrap falls back to the CN
-        // machine's own egress IP and the probe can never succeed.
+        // machine's own egress IP and the probe can never succeed. The panel
+        // also knows its own TLS mode: a self-signed/IP panel needs
+        // --insecure-tls or the first heartbeat dies on x509.
         var gatewayIP = (state.cn && state.cn.gateway_ip) || '';
-        if (!gatewayIP) {
+        var tlsMode = (state.cn && state.cn.tls_mode) || '';
+        if (!gatewayIP || !tlsMode) {
           try {
             var cn = await api('/api/cn');
             state.cn = cn || {};
             gatewayIP = cn.gateway_ip || '';
+            tlsMode = cn.tls_mode || '';
           } catch (cnErr) { /* surfaced as the manual --gateway-ip warning below */ }
         }
         var cmd = 'curl -fsSL ' + origin + '/bootstrap.sh -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh cn-setup --origin ' + origin;
         if (gatewayIP) { cmd += ' --gateway-ip ' + gatewayIP; }
+        if (tlsMode === 'self') { cmd += ' --insecure-tls'; }
         cmd += ' --enroll-token ' + token + ' --yes';
         state.cnEnroll = { command: cmd, expires_at: (out && out.expires_at) || '', gateway_missing: !gatewayIP };
         renderCnmachines(state.cnmachines, true);
@@ -1956,7 +1971,21 @@
     var wrap = el('div', 'stack');
     var cn = state.cn || {};
     var commands = cn.commands || {};
-    add(wrap, el('p', 'muted', '国内机执行下面这条命令即可：写入 hosts 托管块并启动本机 DNS（198.18.0.1:53）。容器只读 /etc/resolv.conf，所以必须走本机 DNS，单纯改 hosts 对 Coolify 构建容器无效。'));
+    // v1.6.0 moved CN onboarding to the agent flow: a one-time enroll token
+    // generated on the 国内机 page. The commands below are the deprecated
+    // legacy mode (hosts block + dnsmasq + watchdog) and must not be presented
+    // as the default path anymore.
+    var goAgent = el('button', 'btn primary', '前往「国内机」页生成注册命令');
+    goAgent.type = 'button';
+    goAgent.addEventListener('click', function () { navigate('cnmachines'); });
+    var recommend = el('div', 'alert');
+    add(recommend, el('span', '', '推荐方式：在「国内机」页生成一次性注册命令，机器执行后由 warden-cn-agent 接管分流；升级、回退与域名下发都在面板完成。'));
+    recommend.appendChild(goAgent);
+    wrap.appendChild(recommend);
+
+    var legacy = el('details');
+    add(legacy, el('summary', '', '旧版模式命令（无 agent，已弃用）'));
+    add(legacy, el('p', 'muted', '仅用于确认要回到 v1.5.x 行为（hosts 托管块 + 本机 dnsmasq + 看门狗）。执行后不会注册到面板，也不会自动跟随分流域名。'));
     var commandBox = el('div', 'stack');
     commandBox.appendChild(commandRow('在国内机上执行', cn.command || ''));
     commandBox.appendChild(commandRow('自检命令', cn.check_command || ''));
@@ -1964,14 +1993,15 @@
     if (commands.none) {
       commandBox.appendChild(commandRow('仅关闭分流（降级）', commands.none));
     }
-    wrap.appendChild(commandBox);
+    legacy.appendChild(commandBox);
+    wrap.appendChild(legacy);
+
     var dns = cn.dns || {};
     wrap.appendChild(infoList([
       ['网关地址', cn.gateway_ip || '—'],
       ['面板域名', cn.panel_host || '—'],
       ['健康接口', cn.health_url || '—'],
       ['网关 DNS 服务', dns.running ? ('运行中 · ' + (dns.active_listen || dns.listen || '')) : (dns.enabled ? '已启用但未监听' : '未启用')],
-      ['网关内置 DNS', cn.dns_ready ? '可用' : '未启用（不影响国内机本地 DNS）'],
       ['分流域名', ((cn.domains || []).join(', ') || '—')]
     ]));
     return wrap;
@@ -2211,8 +2241,8 @@
     grid.appendChild(certPanel);
 
     var cnPanel = el('div', 'panel span-2');
-    add(cnPanel, el('h3', '', '国内机设置命令'));
-    add(cnPanel, el('p', 'muted', '网关本身不执行国内机设置。选择分发方式后，把生成的命令复制到需要走网关的服务器上执行；命令会配置 hosts 或 DNS、Docker 与 Git 镜像，修改前自动备份。'));
+    add(cnPanel, el('h3', '', '国内机接入'));
+    add(cnPanel, el('p', 'muted', '由「国内机」页生成一次性注册命令，目标机器执行后接入 agent；本卡片只保留旧版模式命令作回退。'));
     cnPanel.appendChild(cnSettingsBody());
     grid.appendChild(cnPanel);
 

@@ -141,8 +141,12 @@ func (s *Server) handleCNCommands(w http.ResponseWriter, r *http.Request) {
 		"check_command":        checkCommand,
 		"agent_binary_url":     agentBinaryURL,
 		"cn_mode":              "auto",
-		"dns":                  info,
-		"dns_ready":            dnsReady,
+		// The panel knows whether its own certificate is self-signed; the agent
+		// enrollment command must carry --insecure-tls for those deployments or
+		// the first heartbeat fails x509 verification.
+		"tls_mode":  s.cfg.TLS.Mode,
+		"dns":       info,
+		"dns_ready": dnsReady,
 	})
 }
 

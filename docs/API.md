@@ -123,17 +123,42 @@ GET 请求，返回最近 `minutes`（5 到 60，默认 60）的承载统计。�
 
 `install` 与 `update` 从 GitHub 发布页下载对应架构压缩包，解压后执行 `sing-box version` 核对版本再原子替换；`rollback-previous` 恢复上一份内核备份；`rollback-preinstall` 精确恢复首次安装前的内核、单元与服务状态；`uninstall` 把内核与单元归档到数据目录，节点配置保留。
 
-## 国内机设置
+## 国内机接入与 agent
+
+v1.6.0 起推荐流程是 **agent 模式**：面板签发一次性 enroll token，国内机执行 `cn-setup --enroll-token`，随后由 `warden-cn-agent` 常驻接管分流并每 10 秒心跳上报；面板可查看状态、下发分流域名、升级或回退 agent。`/api/cn` 保留的 `command` / `commands` 是 **legacy 模式**（无 agent、hosts 托管块 + 本地 dnsmasq + 看门狗）的兼容命令，已弃用。
+
+### agent 端点（无需会话，token 认证）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/agent/enroll` | 一次性 enroll token 换发 machine token；按 hostname 去重（同机重装取代旧记录） |
+| POST | `/api/agent/heartbeat` | Bearer machine token；上报状态、领取命令、按 hash 增量下发分流域名 |
+| GET | `/api/agent/binary/{version}/{arch}[.sha256]` | 自托管的 agent 缓存构建（`warden-cn-agent-linux-{amd64,arm64,arm}`）；未缓存版本 404 |
+
+`/api/agent/binary/...` 同时接受 `{arch}` 与 `warden-cn-agent-linux-{arch}` 两种文件名形态，版本段为裸版本（`1.6.0`，无 `v`）。这些路径在面板前缀下和根路径都可访问；网关安装/升级时把三种架构预取到 `$SCRIPT_DIR/agent/<version>/`（保留最近 3 个版本）。
+
+### 管理端点（需要会话与 CSRF）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/cnmachines` | 机器列表、在线状态、版本/目标版本、探测与资源摘要、事件；附 `cached_versions`、`gateway_version` |
+| POST | `/api/cnmachines/enroll-token` | 签发一次性注册令牌（15 分钟） |
+| POST | `/api/cnmachines/{id}/command` | `sync-domains` / `self-check` / `self-upgrade`（可带 `version` 指定已缓存版本，低于网关版本即回退；未缓存版本 400） |
+| POST | `/api/cnmachines/{id}/auto-follow` | 开关自动跟随网关版本（打开会清除操作员钉选） |
+| POST | `/api/cnmachines/{id}/pin` | 钉选/清除机器目标版本（`{"version":""}` 清除） |
+| POST | `/api/cnmachines/{id}/remove` | 注销（`force=false` 下发 deregister，`force=true` 立即移除并吊销） |
+
+### `/api/cn`（历史接口）
 
 `/api/cn` 只生成给国内机使用的命令，网关本身不执行国内机设置。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/cn` | 返回国内机命令（auto/none）、自检命令、恢复命令、网关地址、分流域名与 DNS 服务状态 |
+| GET | `/api/cn` | 返回 legacy 命令（auto/none）、自检/恢复命令、网关地址、分流域名、agent 二进制地址与 TLS 模式 |
 
-响应字段：`as_of`、`origin`、`gateway_ip`、`panel_host`、`domains`、`script_url`、`command`、`commands`（`auto`、`none`）、`restore_command`、`health_url`、`check_command`、`cn_mode`、`dns`、`dns_ready`。
+响应字段：`as_of`、`origin`、`gateway_ip`、`panel_host`、`domains`、`script_url`、`command`、`commands`（`auto`、`none`）、`restore_command`、`health_url`、`check_command`、`agent_binary_url`、`agent_binary_version`、`cn_mode`、`tls_mode`、`dns`、`dns_ready`。
 
-`command` 恒等于 `commands.auto`，`cn_mode` 恒为 `auto`：分流方式不再根据网关自身的 DNS 状态推断，国内机侧统一用 `auto`（hosts 托管块 + 本地 dnsmasq）。`commands.none` 是显式关闭分流的降级命令。
+`command` 恒等于 `commands.auto`，`cn_mode` 恒为 `auto`；这些都是 legacy 模式命令。`tls_mode` 为 `self` 时说明面板使用自签名证书，agent 注册命令需要 `--insecure-tls`（面板生成的命令会自动带上）。
 
 `health_url` 指向网关 80 端口的 `/healthz`，`check_command` 在 `origin` 非空时重新下载脚本执行 `cn-check`，`origin` 为空时退化为 `sudo warden-cn cn-check`。
 

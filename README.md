@@ -278,7 +278,7 @@ curl -fsSL https://panel.example.com/bootstrap.sh -o /tmp/wg-bootstrap.sh && sud
 1. 快照所有将被改动的文件；resolv.conf 先写入公网兜底 DNS 作为安全网。
 2. 停止并禁用旧 dnsmasq 与看门狗单元，resolv.conf 暂置纯公网直连——此刻就是装 warden 之前的老状态，业务不中断。
 3. 从网关自托管端点下载 agent 二进制（网关安装/升级时已预取三种架构的构建到 `$SCRIPT_DIR/agent/`），安装 `warden-cn-agent` systemd 服务（`Restart=always` + `WatchdogSec=60` + 内存约束），注册（enroll）并等待首次心跳成功，抽检分流域名在本机解析到网关 IP。
-4. resolv.conf 定型为 agent DNS（`198.18.0.1`）在前 + 公网 DNS 兜底在后：agent 进程整体死亡时解析落到公网 DNS，退化为无分流但绝不断网。NetworkManager `dns=none` 守卫保留。
+4. resolv.conf 定型为 agent DNS（`198.18.0.1`）在前 + 公网 DNS 兜底在后：agent 进程整体死亡时解析落到公网 DNS，退化为无分流但绝不断网。NetworkManager `dns=none` 守卫保留；`/etc/resolv.conf` 由 systemd-resolved 托管的机器额外写入 `/etc/systemd/resolved.conf.d/99-warden-gateway-cn.conf`（`DNS=198.18.0.1`、`Domains=~.`），否则 resolved 会用自己的上游绕过分流。
 5. 摘除 `/etc/hosts` 托管块，清理旧 dnsmasq 配置与看门狗脚本。任何一步失败自动回滚快照，机器回到迁移前状态。
 
 ### agent 提供什么
