@@ -1,5 +1,33 @@
 # 更新记录
 
+## v1.6.0
+
+### 新增
+
+- 国内机常驻 agent `warden-cn-agent`（新 `cmd/warden-cn-agent`，`internal/cnagent`）：单二进制 systemd 常驻服务，接管国内机分流。内置 DNS 监听 `198.18.0.1:53`（复用 `internal/dnsproxy`，地址与 v1.5.x 的 dnsmasq 一致）：分流域名答网关 IP，其余转发上游；健康探测判定网关不可达时逐查询降级为直连解析，不再有"60 秒一次摘 hosts 块"的状态机延迟。健康探测沿用 `OK` / `LINK_443_BLOCKED` / `LINK_PORTS_BLOCKED` / `C_DOWN` / `LOCAL_BROKEN` 分类，先确认本机外网正常再判定网关故障。通过 docker socket 自动发现容器（名称、镜像、状态、启动时间），带 Coolify 标签的容器归组为应用上报，只采集元数据。
+- agent 心跳：默认每 10 秒（±20% 抖动避免多台机器同拍）`POST /api/agent/heartbeat`，Bearer machine token 认证。一个心跳往返完成三件事：上报状态、健康探测结果与容器/资源摘要，领命令（`sync-domains`、`self-check`、`self-upgrade`、`deregister`），拿最新分流域名列表——网关侧带版本 hash，hash 没变不下发全量。网关连续 30 秒（3 个周期）无心跳判定离线；每个 token 按 8 秒间隔限流（心跳间隔最低 10 秒）。心跳失败时本地维持现状运行，绝不因远端异常清空本地配置。
+- agent 自升级：经网关的 GitHub 代理短路径 `{origin}/github.com/tktogether/warden-gateway/releases/download/{tag}/...` 下载目标版本二进制，同源拉取 `.sha256` 侧车校验，通过后临时文件写入、原子 rename 替换自身、退出交 systemd 重启；下载或校验失败本次不动，下个心跳重试。新版本连续崩溃时 systemd 自动回退到备份的旧二进制。systemd 单元为 `Restart=always` + `WatchdogSec=60`（agent 周期性 sd_notify，卡死强杀重启）加 `MemoryMax` 资源约束。
+- 网关 `/api/agent/*`：`POST /api/agent/enroll` 用一次性 enroll token 换发 machine token（随机 32 字节，网关只存 SHA-256 摘要，agent 端 0600）；`POST /api/agent/heartbeat` 返回命令队列、域名列表与目标版本。注册表、token 摘要、待执行命令、机器快照与事件 journal 持久化到 `<DataDir>/cn-agents.json`（0600），网关重启或升级不丢已注册机器，纳入现有备份/恢复；所有 agent 管理操作进审计日志。
+- 面板新增「国内机」页：每台机器的在线/离线状态、健康分类、版本、磁盘/内存/负载、容器与应用摘要、最后心跳时间；操作按钮为立即同步、自检、升级、注销——没有远程重启或整机 reboot 入口。注册流程：面板生成一次性 enroll token 与安装命令，国内机执行后自动出现在列表。
+- 分流域名在线编辑：面板「设置」页新增分流域名编辑器，保存后写入 `cfg.DNS.Domains` 成为运行时唯一事实源，自动补进 SNI 透传列表保证每个分流域名都被覆盖，随服务重启生效并在心跳周期内下发到所有在线 agent，全程无需发版。
+- CI：GitHub Release 在网关二进制之外同时发布 `warden-cn-agent-linux-amd64` / `-arm64` 二进制、`.sha256` 侧车与 tar.gz。agent 二进制经网关 GitHub 代理短路径分发，网关不为它设托管端点。
+
+### 改进
+
+- `bootstrap.sh cn-setup` 新增 agent 模式（`--enroll-token` 触发），按固定顺序迁移：快照 → resolv.conf 先写公网兜底 → 停止旧 dnsmasq 与看门狗 → 经网关短路径下载 agent 并启动 → enroll 并等待首次心跳成功 → `getent` 抽检分流域名解析到网关 IP → resolv.conf 定型为 agent DNS 在前 + 公网 DNS 兜底在后 → 摘除 hosts 托管块 → 清理旧脚本、dnsmasq 配置与 watchdog 状态。任何一步失败回滚快照，机器回到迁移前状态。hosts 托管块机制在 agent 模式下整体废弃。
+- `cn-check` / `cn-status` / `cn-restore` 命令名与语义保留：agent 模式下内部改为读 agent 本地状态、驱动 agent；`cn-restore` 停用 agent、还原 resolv.conf、清除 `agent.json`。
+- `/api/cn` 保留全部现有字段，新增 `agent_binary_url` 等 agent 相关字段；`/api/cn` 与 `/api/dns/status` 的域名列表改为 live 配置，`DefaultSplitDomains()` 与 bootstrap.sh 的 `CN_DEFAULT_DOMAINS` 只保留为全新安装的初始种子。
+
+### 兼容性
+
+- 升级顺序：先代理机（普通 `warden upgrade` 到 v1.6.0），后国内机，两步互相独立，中间可停留任意久。升级网关后 `/api/agent/*` 可用但注册表为空，老国内机行为完全不变。
+- 已执行过 `cn-setup` 的国内机重跑一次 `cn-setup`（带面板「国内机」页生成的 enroll token）即完成迁移；每台独立迁移，无全局切换开关。迁移是唯一需要登录国内机的动作，完成后分流域名的增删全部在面板远程进行。
+- 无 `--enroll-token` 的旧 `cn-setup` 命令回退 legacy 模式：按 v1.5.x 行为安装 dnsmasq + 看门狗 + hosts 托管块，打印弃用提示；已发出去的旧命令不会失败。`--cn-mode` 语义不变（`auto` / `none`），`none` 模式不安装 agent。
+- agent 不提供远程重启或整机 reboot：升级逐台手动触发（面板「升级」按钮设置该机的目标版本），每台机器可单独打开「自动跟随网关版本」（默认关）。
+- 注销命令在 agent 下次心跳领取时生效并移除注册；长期离线的机器收不到注销命令，会以 401 心跳噪音留在列表，此时在国内机执行 `cn-restore` 即可退出。
+- 心跳请求带 protocol 版本号，网关接受当前与上一版；agent 的自升级目标版本永远来自网关，二进制与协议同步演进，不会出现升到不兼容协议的中间态。心跳被拒（token 吊销或机器注销）时本地照旧运行，不自毁配置，机器永远可以手动恢复。
+- resolv.conf 最终形态为 agent DNS（198.18.0.1）在前 + 公网 DNS 兜底在后：agent 进程整体死亡时解析落到公网 DNS，退化为无分流但绝不断网。
+
 ## v1.5.3
 
 ### 修复

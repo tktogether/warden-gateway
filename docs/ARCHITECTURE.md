@@ -45,6 +45,20 @@ GET https://panel.example.com/github.com/owner/repo/...         -> SNI -> 8443 -
 
 80 端口的明文 handler（`app.App.HTTPHandler`）除 `/healthz` 外，还把命中 `HandlesPath` 的短路径直接交给 GitHub 代理，其余请求（含 `/.well-known/acme-challenge/`）继续交给 TLS 管理器的明文 handler，也就是保持 ACME 校验并 301 到 HTTPS。这样某条线路到 443 的建连不稳定时，仍可以用 `http://panel.example.com/github.com/owner/repo` 完成 clone。
 
+### 国内机 Agent
+
+国内机上运行的 `warden-cn-agent`（`cmd/warden-cn-agent`，逻辑在 `internal/cnagent`）是独立进程，只向网关发起连接：
+
+```text
+国内机 warden-cn-agent
+  POST /api/agent/heartbeat -> 443 SNI(panel.example.com) -> 8443 -> 会话无关的 Bearer token 认证 -> 命令队列 + 分流域名列表 + 目标版本
+  POST /api/agent/enroll    -> 一次性 enroll token 换发 machine token（网关只存 SHA-256 摘要）
+```
+
+agent 内置 DNS 监听 `198.18.0.1:53`（复用 `internal/dnsproxy`）：分流域名答网关 IP，其余转发上游；健康探测判定网关不可达时逐查询降级为直连解析。心跳默认 10 秒（±20% 抖动），网关 30 秒无心跳判定离线，按 token 8 秒限流。agent 命令为 `sync-domains`、`self-check`、`self-upgrade`、`deregister`；自升级经网关的 GitHub 代理短路径下载 Release 二进制并以 `.sha256` 侧车校验。
+
+分流域名的运行时事实源是 `cfg.DNS.Domains`：面板编辑保存后自动补进 SNI 透传列表，随服务重启生效，并在心跳周期内下发到所有在线 agent（版本 hash 变化才带全量）。`DefaultSplitDomains()` 只作为全新安装的初始种子。注册表、machine token 摘要、命令队列、机器快照与事件 journal 持久化在 `<DataDir>/cn-agents.json`（0600），纳入备份/恢复；agent 管理操作记入审计日志。
+
 ### 透传
 
 未命中面板域名且命中透传列表的 SNI 会被原样转发到 `host:443`。TLS 不终止，客户端仍校验原站证书。
@@ -60,6 +74,7 @@ GET https://panel.example.com/github.com/owner/repo/...         -> SNI -> 8443 -
 | `/var/lib/warden-gateway/gateway.log` | 运行日志 |
 | `/var/lib/warden-gateway/audit.log` | 审计日志 |
 | `/var/lib/warden-gateway/history.db` | 指标历史 |
+| `/var/lib/warden-gateway/cn-agents.json` | 国内机注册表：machine token 摘要、命令队列、快照与事件 journal，0600 |
 | `/etc/sing-box/` | sing-box 主配置、节点配置、内核与证书 |
 | `/var/lib/warden-gateway/singbox-core/` | 内核安装前快照与卸载归档 |
 
@@ -97,13 +112,16 @@ GET https://panel.example.com/github.com/owner/repo/...         -> SNI -> 8443 -
 ## 目录
 
 ```text
+cmd/warden-gateway/    命令行入口
+cmd/warden-cn-agent/   国内机 agent 入口
 internal/app/          组件装配与生命周期
+internal/cnagent/      国内机 agent：内置 DNS、健康探测、心跳、命令与自升级
 internal/config/       配置模型、校验、密钥生成
 internal/auth/         会话、CSRF、登录限流
 internal/gateway/      SNI、TLS、Docker 代理
 internal/githubproxy/  GitHub 代理
-internal/dnsproxy/     DNS 服务
-internal/panel/        管理面板、指标、审计
+internal/dnsproxy/     DNS 服务（网关分流与 agent 内置 DNS 共用）
+internal/panel/        管理面板、指标、审计、国内机注册表与 agent 端点
 internal/backup/       备份与恢复
 internal/telemetry/    代理和请求统计
 internal/ui/           终端输出
