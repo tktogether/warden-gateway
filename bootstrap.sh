@@ -538,11 +538,10 @@ cache_agent_binaries() {
   ver_dir="$SCRIPT_DIR/agent/$ver"
   mkdir -p "$ver_dir" 2>/dev/null || { warn "创建 agent 缓存目录失败：$ver_dir"; return 1; }
   local base
-  if [ "$VERSION" = "latest" ]; then
-    base="https://github.com/$REPO/releases/latest/download"
-  else
-    base="https://github.com/$REPO/releases/download/$VERSION"
-  fi
+  # 目录名是解析后的裸版本，下载源必须指向同一个具体 tag（v<ver>），不能再用
+  # releases/latest/download：--binary 时 ver 读自本地二进制的版本，与 latest
+  # 可能不是同一个 release，会让目录和来源不一致。
+  base="https://github.com/$REPO/releases/download/v$ver"
   for arch in amd64 arm64 arm; do
     asset="warden-cn-agent-linux-$arch"
     tmp="$ver_dir/.$asset.$$"
@@ -2012,6 +2011,8 @@ cn_agent_resolve_origin() {
 # cn_agent_version 确定要下载的 agent 版本（release tag = v<版本>）。
 # 依次取：--version 显式值 → 脚本安装目录的 VERSION 文件 → 面板 /api/health
 # 的 version 字段（agent 与网关同版本，对齐面板 agent_binary_url 的语义）。
+# VERSION 文件与 /api/health 的 version 都是 release tag 形态（v1.6.0），
+# 校验前先剥掉前导 v，否则 release 构建会误判成"无法确定版本"；输出始终裸版本。
 cn_agent_version() {
   local v=""
   if [ "$VERSION" != "latest" ]; then
@@ -2020,11 +2021,13 @@ cn_agent_version() {
   fi
   if [ -f "$SCRIPT_DIR/VERSION" ]; then
     v="$(tr -d ' \r\n' < "$SCRIPT_DIR/VERSION")"
+    v="${v#v}"
     case "$v" in ""|*[!0-9.]*) v="";; esac
   fi
   if [ -z "$v" ]; then
     v="$(curl -kfsS --connect-timeout 3 --max-time 8 "$CN_AGENT_ORIGIN/api/health" 2>/dev/null \
       | sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' | head -n 1 || true)"
+    v="${v#v}"
     case "$v" in ""|*[!0-9.]*) v="";; esac
   fi
   [ -n "$v" ] || die "无法确定 agent 版本：请用 --version 指定（例如 --version 1.6.0）"
@@ -2168,12 +2171,15 @@ cn_agent_download() {
 }
 
 # cn_agent_write_guard 生成 agent-rollback-guard.sh（unit 的 ExecStartPre）：
-# upgrade-pending 存在且当前 NRestarts 比写入基线多 >= 2（即新版本启动后又
-# 崩了两次）时，若有自升级备份 .prev 就换回旧二进制并清掉失败计数
-# （spec §8 安全网：新版本启动失败自动回退），结果记入日志文件。
+# upgrade-pending 存在且当前 NRestarts 比写入基线多 >= 3（升级自身的干净
+# 重启占 1 次，之后又连续崩了 2 次）时，若有自升级备份 .prev 就换回旧二进制
+# 并清掉失败计数（spec §8 安全网：新版本连续 2 次崩溃自动回退），结果记入
+# 日志文件。
 # 基线来自 agent 退出前写入的 "<version> <nrestarts>"：升级自身的干净
 # exit-0 重启也会 +1，绝不能把这次算成崩溃（旧版按绝对 NRestarts>=2 判断，
-# 第二次升级在还没跑起来前就被回滚）。没有 pending 标记时一律不动。
+# 第二次升级在还没跑起来前就被回滚）。agent 读不到 NRestarts 时基线写 -1，
+# 表示"未知"：只有当前计数已 >= 3（足以证明反复启动失败）才回退，避免把升级
+# 前就有的重启历史误判成新版本崩溃。没有 pending 标记时一律不动。
 cn_agent_write_guard() {
   cn_snapshot_file "$CN_AGENT_ROLLBACK_GUARD"
   cn_put_file "$CN_AGENT_ROLLBACK_GUARD" 0755 <<GUARDEOF
@@ -2187,10 +2193,20 @@ PENDING="\$STATE_DIR/upgrade-pending"
 nrestarts="\$(systemctl show warden-cn-agent -p NRestarts --value 2>/dev/null || printf '0')"
 case "\$nrestarts" in ''|*[!0-9]*) nrestarts=0;; esac
 [ -f "\$PENDING" ] || exit 0
-baseline="\$(awk '{print \$2; exit}' "\$PENDING" 2>/dev/null || printf '0')"
-case "\$baseline" in ''|*[!0-9]*) baseline=0;; esac
+baseline="\$(awk '{print \$2; exit}' "\$PENDING" 2>/dev/null || printf '%s' '-1')"
+# 基线 -1（或缺失/损坏）表示升级前读不到重启计数，不能做差值判断。
+unknown_baseline=0
+case "\$baseline" in
+  -1|''|*[!0-9]*) unknown_baseline=1; baseline=0;;
+esac
 delta=\$((nrestarts - baseline))
-[ "\$delta" -ge 2 ] || exit 0
+if [ "\$unknown_baseline" -eq 1 ]; then
+  # 未知基线：只有当前计数已 >= 3 才足以证明反复启动失败。
+  [ "\$nrestarts" -ge 3 ] || exit 0
+else
+  # 已知基线：干净升级重启占 1 次，delta >= 3 即新版本之后又崩了 2 次。
+  [ "\$delta" -ge 3 ] || exit 0
+fi
 [ -e "\$BIN.prev" ] || exit 0
 # 回滚前先把「待验证版本」转成「已阻止版本」：恢复后的旧 agent 下次心跳会
 # 看到同一个 target_version，没有这个标记就会再装一次、再崩一次（升级回滚

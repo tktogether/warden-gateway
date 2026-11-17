@@ -177,9 +177,12 @@ func (a *App) Handler() http.Handler {
 			a.serveHealthz(w, r)
 		case strings.HasPrefix(p, a.cfg.PanelPath):
 			a.panel.ServeHTTP(w, r)
-		case strings.HasPrefix(p, "/api/agent/binary/"):
-			// The CN agent bootstrap/downloader uses the origin-root URL; the
-			// panel also serves the same handler under its own prefix.
+		case strings.HasPrefix(p, "/api/agent/"), p == "/api/health":
+			// The CN agent control plane lives at the origin root: enroll and
+			// heartbeat post to {Origin}/api/agent/..., bootstrap.sh probes
+			// {Origin}/api/health, and the binary downloader uses
+			// /api/agent/binary/. The panel serves all of them and also
+			// handles its own prefixed forms.
 			a.panel.ServeHTTP(w, r)
 		case strings.HasPrefix(p, "/v2/"):
 			if a.docker == nil {

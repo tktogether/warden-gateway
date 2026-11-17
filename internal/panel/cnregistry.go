@@ -289,6 +289,22 @@ func (r *CNRegistry) UpdateReport(id string, report map[string]interface{}, auto
 	return effective, r.saveLocked()
 }
 
+// ReportedAgentVersion returns the normalized agent build version from the
+// machine's last heartbeat report. It returns "" when the machine has never
+// reported one (unknown build), so callers can distinguish "same build" from
+// "no information". The read happens under the registry lock because the
+// heartbeat path replaces the report map.
+func (r *CNRegistry) ReportedAgentVersion(id string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := r.machineByIDLocked(id)
+	if m == nil {
+		return "", ErrUnknownMachine
+	}
+	raw, _ := m.Report["agent_version"].(string)
+	return normalizeReportedAgentVersion(raw), nil
+}
+
 // SetPinnedVersion pins the agent build a machine should run. An empty version
 // clears the pin, handing control back to AutoFollow (or leaving the machine
 // alone when follow is off). Both outcomes are recorded as a "pin" event.

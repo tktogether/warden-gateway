@@ -22,9 +22,12 @@ import (
 //	                 "<version> <nrestarts>" — the build the guard is about to
 //	                 validate and the unit's restart counter at that moment.
 //	                 The baseline matters because the upgrade's own clean
-//	                 exit-0 restart increments NRestarts; the guard compares
-//	                 against the baseline instead of an absolute count, so a
-//	                 healthy upgrade restart is not mistaken for a crash.
+//	                 exit-0 restart increments NRestarts; the guard rolls back
+//	                 only when current-baseline >= 3 (the clean restart plus two
+//	                 consecutive crashes), never on an absolute count. When the
+//	                 counter cannot be read the baseline is -1 ("unknown"): the
+//	                 guard then requires current >= 3, so a unit with pre-upgrade
+//	                 restarts is not rolled back on a healthy build.
 //	upgrade-blocked  written by the guard when it rolls that build back.
 //
 // The agent skips automatic upgrade attempts toward a blocked build and reports
@@ -49,7 +52,10 @@ func (a *Agent) upgradePendingExists() bool {
 }
 
 // markUpgradePending records the build about to be validated by the guard and
-// the unit's restart count before the expected clean restart.
+// the unit's restart count before the expected clean restart. An unreadable
+// counter is recorded as -1 ("unknown") so the guard knows not to subtract a
+// baseline it never had; it then requires the absolute counter to prove
+// repeated failures (>= 3) before rolling anything back.
 func (a *Agent) markUpgradePending(ver string) {
 	path := a.stateFile(upgradePendingFile)
 	payload := strings.TrimSpace(ver) + " " + strconv.Itoa(nrestarts()) + "\n"
@@ -90,18 +96,19 @@ func (a *Agent) clearValidatedUpgrade() {
 }
 
 // nrestarts reads the unit's NRestarts counter. Any failure (no systemd, no
-// unit, non-Linux test host) yields 0, which makes the guard fall back to
-// counting from the start of the unit's lifetime.
+// unit, non-Linux test host) yields -1: the pending marker then records an
+// "unknown" baseline, and the guard requires the absolute counter to be high
+// enough (>= 3) instead of subtracting a delta it cannot trust.
 func nrestarts() int {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "systemctl", "show", cnAgentService, "-p", "NRestarts", "--value").Output()
 	if err != nil {
-		return 0
+		return -1
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
 	if err != nil || n < 0 {
-		return 0
+		return -1
 	}
 	return n
 }
@@ -116,9 +123,10 @@ func (a *Agent) blockedUpgrade() string {
 }
 
 // upgradeBlocked reports whether ver is the build that already failed to start
-// on this machine.
+// on this machine. Both sides are normalized: the guard records whatever the
+// pending marker held (release tags carry a "v"), and callers pass either form.
 func (a *Agent) upgradeBlocked(ver string) bool {
-	blocked := a.blockedUpgrade()
+	blocked := normalizeVersion(a.blockedUpgrade())
 	return blocked != "" && blocked == normalizeVersion(ver)
 }
 

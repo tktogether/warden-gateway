@@ -51,11 +51,35 @@ func AgentBinaryVersion() string {
 	return normalizeAgentVersion(version.Version)
 }
 
+// agentBinaryAssetArch resolves the second path segment of the agent binary
+// endpoint to a supported arch. Both shapes clients use are accepted:
+//
+//	{arch}                         (short form kept for existing installs)
+//	warden-cn-agent-linux-{arch}   (bootstrap.sh, SelfUpgrade and the panel URL)
+//
+// each with an optional .sha256 suffix. Anything else is rejected so a crafted
+// request cannot reach a different file.
+func agentBinaryAssetArch(name string) (arch string, sidecar bool, ok bool) {
+	sidecar = strings.HasSuffix(name, ".sha256")
+	if sidecar {
+		name = strings.TrimSuffix(name, ".sha256")
+	}
+	arch = strings.TrimPrefix(name, "warden-cn-agent-linux-")
+	if !agentArchs[arch] {
+		return "", false, false
+	}
+	return arch, sidecar, true
+}
+
 // handleAgentBinary serves a cached CN agent binary and its checksum sidecar.
 //
-// Path shape: /api/agent/binary/{version}/{arch}[.sha256]. The version segment
-// addresses the per-version cache directory, so a machine can hold any build the
-// operator has cached — including an older one it is being pinned back to.
+// Path shape: /api/agent/binary/{version}/{arch}[.sha256] or
+// /api/agent/binary/{version}/warden-cn-agent-linux-{arch}[.sha256] — the
+// release-asset spelling is what bootstrap.sh, internal/cnagent's SelfUpgrade
+// and the panel-advertised URL use; the short form is kept working for older
+// installs. The version segment addresses the per-version cache directory, so
+// a machine can hold any build the operator has cached — including an older
+// one it is being pinned back to.
 // path is the ROUTED path (panel prefix already stripped by route), never
 // r.URL.Path: the prefix exists in production URLs and re-trimming the raw URL
 // here made the endpoint 404 for every real request.
@@ -77,8 +101,8 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request, path 
 		return
 	}
 	wantVersion, name := normalizeAgentVersion(parts[0]), parts[1]
-	arch := strings.TrimSuffix(name, ".sha256")
-	if !agentArchs[arch] || (name != arch && name != arch+".sha256") {
+	arch, withSidecar, ok := agentBinaryAssetArch(name)
+	if !ok {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
@@ -87,7 +111,6 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request, path 
 		return
 	}
 	file := "warden-cn-agent-linux-" + arch
-	withSidecar := strings.HasSuffix(name, ".sha256")
 	if withSidecar {
 		file += ".sha256"
 	}
@@ -116,10 +139,29 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request, path 
 	http.ServeContent(w, r, file, info.ModTime(), f)
 }
 
+// cachedAgentBuildExists reports whether dir holds at least one servable
+// build: a warden-cn-agent-linux-<arch> binary from the allow-list whose
+// .sha256 sidecar is present too. bootstrap.sh creates agent/<ver>/ before the
+// downloads, so an empty (or half-populated) directory must not be offered as
+// a pin target — such a version would 404 forever.
+func cachedAgentBuildExists(dir string) bool {
+	for arch := range agentArchs {
+		bin := filepath.Join(dir, "warden-cn-agent-linux-"+arch)
+		if info, err := os.Stat(bin); err != nil || info.IsDir() {
+			continue
+		}
+		if info, err := os.Stat(bin + ".sha256"); err == nil && !info.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
 // CachedAgentVersions lists the agent versions cached on this gateway, newest
 // first, so the panel can offer them as pin/rollback targets.
 func (s *Server) CachedAgentVersions() []string {
-	entries, err := os.ReadDir(filepath.Join(s.scriptDir, agentAssetDirName))
+	root := filepath.Join(s.scriptDir, agentAssetDirName)
+	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil
 	}
@@ -128,9 +170,13 @@ func (s *Server) CachedAgentVersions() []string {
 		if !e.IsDir() || e.Name() == "latest" {
 			continue
 		}
-		if agentVersionPattern.MatchString(e.Name()) {
-			out = append(out, e.Name())
+		if !agentVersionPattern.MatchString(e.Name()) {
+			continue
 		}
+		if !cachedAgentBuildExists(filepath.Join(root, e.Name())) {
+			continue
+		}
+		out = append(out, e.Name())
 	}
 	sort.Slice(out, func(i, j int) bool { return versionLess(out[j], out[i]) })
 	return out
@@ -187,11 +233,14 @@ func atoiSafe(s string) (int, bool) {
 	return n, true
 }
 
-// agentBinaryURL is the URL a CN machine downloads an agent build from. Empty
-// origin yields an empty URL (callers then print a manual instruction).
+// agentBinaryURL is the URL a CN machine downloads an agent build from. It
+// uses the same release-asset shape bootstrap.sh and SelfUpgrade request
+// (warden-cn-agent-linux-<arch>), and the server accepts this and the short
+// <arch> form. Empty origin yields an empty URL (callers then print a manual
+// instruction).
 func agentBinaryURL(origin, ver, arch string) string {
 	if origin == "" {
 		return ""
 	}
-	return strings.TrimRight(origin, "/") + "/api/agent/binary/" + normalizeAgentVersion(ver) + "/" + arch
+	return strings.TrimRight(origin, "/") + "/api/agent/binary/" + normalizeAgentVersion(ver) + "/warden-cn-agent-linux-" + arch
 }

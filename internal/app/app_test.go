@@ -115,6 +115,47 @@ func TestHandlerHealthz(t *testing.T) {
 	}
 }
 
+// TestHandlerRootAgentControlPlane pins B2: the CN agent posts to the origin
+// root (heartbeat/enroll) and bootstrap.sh probes the root /api/health, so the
+// front handler must route the whole /api/agent/ prefix and /api/health to the
+// panel instead of 404ing them. The assertions check panel-shaped responses
+// (403/400/401 and the panel's own 404 text), not success, because these
+// requests are deliberately incomplete.
+func TestHandlerRootAgentControlPlane(t *testing.T) {
+	a := newTestApp(t)
+	h := a.Handler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/health status %d: %s", rec.Code, rec.Body)
+	}
+	var health map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &health); err != nil || health["version"] == nil {
+		t.Fatalf("/api/health body %s err=%v, want the panel health payload", rec.Body, err)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/agent/enroll", strings.NewReader("{}")))
+	if rec.Code != http.StatusBadRequest && rec.Code != http.StatusForbidden {
+		t.Fatalf("/api/agent/enroll status %d, want 400/403 from the panel (not 404): %s", rec.Code, rec.Body)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/agent/heartbeat", strings.NewReader("{}")))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("/api/agent/heartbeat status %d, want 401 from the panel (not 404): %s", rec.Code, rec.Body)
+	}
+
+	// The binary endpoint is covered by the same case: the panel explains the
+	// empty cache rather than the front handler returning a bare 404.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/agent/binary/1.6.0/warden-cn-agent-linux-amd64", nil))
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "no cached agent build") {
+		t.Fatalf("/api/agent/binary/ status %d body %q, want the panel's cache-miss explanation", rec.Code, rec.Body)
+	}
+}
+
 // TestHandlerShortGitHubPath pins the short /<host>/<path> routing: the path is
 // claimed by the github branch even when the proxy is disabled (503, not 404),
 // and unrelated paths stay 404.

@@ -44,6 +44,14 @@ func TestUpgradeBlockedAfterRollback(t *testing.T) {
 	if a.upgradeBlocked("1.8.0") {
 		t.Fatal("a different build must not be blocked")
 	}
+	// O3: the stored value is normalized too. The guard copies the pending
+	// marker verbatim, so a release tag ("v1.7.0") must match a bare target.
+	if err := os.WriteFile(a.stateFile(upgradeBlockedFile), []byte("v1.7.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !a.upgradeBlocked("1.7.0") || !a.upgradeBlocked("v1.7.0") {
+		t.Fatal("a v-prefixed recorded block must match both spellings")
+	}
 }
 
 // TestMarkPendingClearedOnRestart pins the handshake with the guard script: the
@@ -188,6 +196,50 @@ func TestRunCommandSelfUpgradeCurrentVersionIsNoop(t *testing.T) {
 	}
 	if a.upgradedSnapshot() {
 		t.Error("agent marked upgraded although nothing was swapped")
+	}
+}
+
+// TestNoopUpgradeKeepsExecutingBatch pins N1: a no-op self-upgrade does not
+// exit the process, so it must not stop the rest of the dispatched batch. The
+// deregister queued right after it still has to run and trip the exit sentinel.
+func TestNoopUpgradeKeepsExecutingBatch(t *testing.T) {
+	orig := version.Version
+	t.Cleanup(func() { version.Version = orig })
+	version.Version = "v1.6.0"
+
+	upstream := startFakeUpstream(t, "192.0.2.1")
+	gw := &fakeGateway{reply: func(n int, body map[string]any) (int, any) {
+		return http.StatusOK, HeartbeatReply{Commands: []Command{
+			{ID: "up", Action: cmdActionSelfUpgrade, Params: map[string]string{"version": "1.6.0"}},
+			{ID: "d1", Action: cmdActionDeregister},
+		}}
+	}}
+	cfg := gw.start(t)
+	cfg.Upstream = upstream
+	cfgPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := Save(cfgPath, cfg); err != nil {
+		t.Fatalf("save agent config: %v", err)
+	}
+	ta := newTestAgent(t, cfg)
+	ta.agent.configPath = cfgPath
+	upgrades := 0
+	ta.agent.upgradeFn = func(ctx context.Context, ver string) error {
+		upgrades++
+		return nil
+	}
+
+	err := ta.agent.RunOnce(context.Background())
+	if !errors.Is(err, errAgentDeregistered) {
+		t.Fatalf("RunOnce err = %v, want errAgentDeregistered (deregister must run after the no-op upgrade)", err)
+	}
+	if upgrades != 0 {
+		t.Fatalf("upgradeFn calls = %d, want 0 (same-version upgrade is a no-op)", upgrades)
+	}
+	if !ta.agent.deregisteredSnapshot() {
+		t.Error("deregister command after the no-op upgrade was dropped")
+	}
+	if execs := ta.snapshotExecs(); len(execs) != 2 {
+		t.Fatalf("exec calls = %v, want the two deregister steps", execs)
 	}
 }
 

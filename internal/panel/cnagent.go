@@ -456,6 +456,23 @@ func (s *Server) handleCNMachineCommand(w http.ResponseWriter, r *http.Request, 
 			writeError(w, http.StatusBadRequest, "version "+want+" is not cached on this gateway")
 			return
 		}
+		// Asking a machine to "upgrade" to the build it already reports is a
+		// no-op. Queueing it would also pin that version on dispatch, silently
+		// turning off AutoFollow for a machine that was already current.
+		reported, err := s.cnReg.ReportedAgentVersion(id)
+		if err != nil {
+			if errors.Is(err, ErrUnknownMachine) {
+				writeError(w, http.StatusNotFound, "unknown machine")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "read machine report failed")
+			return
+		}
+		if reported != "" && reported == want {
+			s.audit("cn.command", id+" self-upgrade "+want, "noop: already running", auth.ClientIP(r))
+			writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "note": "already running " + want})
+			return
+		}
 		params["version"] = want
 	}
 	if err := s.cnReg.QueueCommand(id, body.Action, params); err != nil {

@@ -174,13 +174,26 @@ func TestBootstrapAgentMode(t *testing.T) {
 			t.Errorf("cn_agent_rollback is missing %q (re-migration rollback must restore the agent)", want)
 		}
 	}
+	// B3 lock: release builds put a v-prefixed tag in $SCRIPT_DIR/VERSION and
+	// in the /api/health version field, so cn_agent_version must strip it
+	// before validating — in both the VERSION-file read and the HTTP parse.
+	versionFn := bootstrapFuncRegion(script, "cn_agent_version")
+	if versionFn == "" {
+		t.Fatal("cn_agent_version function not found in bootstrap.sh")
+	}
+	if got := strings.Count(versionFn, "${v#v}"); got < 2 {
+		t.Errorf(`cn_agent_version strips the leading v in %d place(s), want the VERSION-file read and the /api/health parse (${v#v})`, got)
+	}
 }
 
 // TestBootstrapRollbackGuardBaseline locks the F5 crash-rollback arithmetic in
 // bootstrap.sh: the guard may only act when an upgrade-pending marker exists,
 // must compare NRestarts against the baseline the agent wrote before its clean
-// upgrade restart (`current - baseline >= 2`), and must not use an absolute
-// count (the upgrade's own exit-0 restart used to trigger it).
+// upgrade restart (`current - baseline >= 3`: the clean restart plus two
+// consecutive crashes), and must not use an absolute count (the upgrade's own
+// exit-0 restart used to trigger it). When the agent could not read the
+// counter it records -1 ("unknown"); the guard then requires the absolute
+// counter to be >= 3 instead of trusting a missing baseline.
 func TestBootstrapRollbackGuardBaseline(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "bootstrap.sh"))
 	if err != nil {
@@ -198,16 +211,19 @@ func TestBootstrapRollbackGuardBaseline(t *testing.T) {
 		`awk '{print \$2; exit}'`, // baseline = second field of the marker
 		"baseline",                // ...
 		`delta=\$((nrestarts - baseline))`,
-		`[ "\$delta" -ge 2 ]`, // crash => two restarts beyond the baseline
-		"upgrade-blocked",     // converted after a rollback
+		`[ "\$delta" -ge 3 ]`,     // clean upgrade restart + two crashes
+		"unknown_baseline",        // -1 marker => unknown, no delta comparison
+		`[ "\$nrestarts" -ge 3 ]`, // unknown baseline => prove repeated failures
+		`printf '%s' '-1'`,        // unreadable counter records "unknown"
+		"upgrade-blocked",         // converted after a rollback
 		`\$STATE_DIR/upgrade-blocked`,
 	} {
 		if !strings.Contains(guard, want) {
 			t.Errorf("cn_agent_write_guard is missing %q", want)
 		}
 	}
-	if strings.Contains(guard, `"\$nrestarts" -ge 2`) {
-		t.Error("guard still rolls back on the absolute NRestarts count (the upgrade's own restart would trigger it)")
+	if strings.Contains(guard, `"\$delta" -ge 2`) || strings.Contains(guard, `"\$nrestarts" -ge 2`) {
+		t.Error("guard still rolls back after only one crash beyond the baseline (want >= 3)")
 	}
 
 	// F4/deferred: the cache resolves a concrete version and verifies the CI
@@ -221,10 +237,16 @@ func TestBootstrapRollbackGuardBaseline(t *testing.T) {
 		`$asset.sha256`,
 		"sha256sum",
 		`"$ver_dir/$asset.sha256"`,
+		// O6: assets come from the concrete resolved tag, never "latest", so
+		// the directory name and the download source agree even with --binary.
+		"releases/download/v$ver",
 	} {
 		if !strings.Contains(cache, want) {
 			t.Errorf("cache_agent_binaries is missing %q", want)
 		}
+	}
+	if strings.Contains(cache, `base="https://github.com/$REPO/releases/latest/download"`) || strings.Contains(cache, `base="https://github.com/$REPO/releases/download/$VERSION"`) {
+		t.Error("cache_agent_binaries downloads prefetch assets by an unresolved ref (latest/$VERSION); use the resolved v<ver> tag")
 	}
 	if !strings.Contains(script, `case "$ver" in`) || !strings.Contains(script, `''|latest|`) {
 		t.Error("cache_agent_version must reject empty/latest resolutions")

@@ -306,7 +306,11 @@ func (a *Agent) RunOnce(ctx context.Context) error {
 		a.mu.Lock()
 		a.lastCommand = &res
 		a.mu.Unlock()
-		if res.OK && (cmd.Action == cmdActionDeregister || cmd.Action == cmdActionSelfUpgrade) {
+		// A deregister tears the machine down; a self-upgrade only stops the
+		// batch once it actually swapped the binary. A no-op upgrade (target
+		// equals the running build) keeps the process alive, so the rest of
+		// the batch — including a later deregister — must still execute.
+		if res.OK && (cmd.Action == cmdActionDeregister || (cmd.Action == cmdActionSelfUpgrade && a.upgradedSnapshot())) {
 			break // the process is about to exit; nothing after teardown matters
 		}
 	}

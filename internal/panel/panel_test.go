@@ -512,7 +512,7 @@ func TestCNCommandsServesLiveDomains(t *testing.T) {
 	// URL that bootstrap.sh and the agent's own SelfUpgrade request. Stamp a
 	// fixed test version and cover both forms (computing the expectation from
 	// version.Version itself would be circular).
-	stampedURL := "http://127.0.0.1:18080/api/agent/binary/9.9.9/amd64"
+	stampedURL := "http://127.0.0.1:18080/api/agent/binary/9.9.9/warden-cn-agent-linux-amd64"
 	origVersion := version.Version
 	t.Cleanup(func() { version.Version = origVersion })
 	for _, stamp := range []string{"v9.9.9", "9.9.9"} {

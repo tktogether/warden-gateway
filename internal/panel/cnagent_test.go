@@ -643,6 +643,58 @@ func TestQueueUpgradeCommandSetsVersion(t *testing.T) {
 	}
 }
 
+// TestUpgradeCommandForRunningBuildIsNoop pins N1's gateway half: asking a
+// machine to install the build it already reports must not queue a command and
+// must not pin that version — a pin would silently disable AutoFollow for a
+// machine that was already current.
+func TestUpgradeCommandForRunningBuildIsNoop(t *testing.T) {
+	srv, key := newAgentPanel(t)
+	srv.scriptDir = t.TempDir()
+	srv.minBeatInterval = 0
+	cacheAgentBuild(t, srv, AgentBinaryVersion(), "amd64", []byte("current"))
+	cookie, csrf := login(t, srv, key)
+	id, token := enrollMachine(t, srv, "current-host")
+
+	// Report the running build in the older "v"-prefixed spelling to prove the
+	// comparison is normalized.
+	report := heartbeatReport(srv, id)
+	report.AgentVersion = "v" + AgentBinaryVersion()
+	if rec := postAgentJSON(t, srv, srv.cfg.PanelPath+"/api/agent/heartbeat", token, report); rec.Code != http.StatusOK {
+		t.Fatalf("heartbeat status %d: %s", rec.Code, rec.Body)
+	}
+	if rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/auto-follow",
+		map[string]bool{"enabled": true}, cookie, csrf); rec.Code != http.StatusOK {
+		t.Fatalf("auto-follow status %d: %s", rec.Code, rec.Body)
+	}
+
+	rec := do(t, srv, "POST", srv.cfg.PanelPath+"/api/cnmachines/"+id+"/command",
+		map[string]string{"action": "self-upgrade"}, cookie, csrf)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("command status %d: %s", rec.Code, rec.Body)
+	}
+	var reply map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &reply); err != nil {
+		t.Fatalf("parse command reply: %v", err)
+	}
+	if reply["ok"] != true || !strings.Contains(reply["note"].(string), "already running") {
+		t.Fatalf("command reply = %s, want ok:true and an \"already running\" note", rec.Body)
+	}
+
+	m := srv.cnReg.MachineByID(id)
+	if m == nil {
+		t.Fatal("machine disappeared")
+	}
+	if len(m.Pending) != 0 {
+		t.Errorf("pending queue = %+v, want no queued no-op upgrade", m.Pending)
+	}
+	if m.PinnedVersion != "" {
+		t.Errorf("PinnedVersion = %q, want empty (the running build must not be pinned)", m.PinnedVersion)
+	}
+	if !m.AutoFollow {
+		t.Error("AutoFollow was silently disabled by the no-op upgrade")
+	}
+}
+
 func TestAutoFollowToggle(t *testing.T) {
 	srv, key := newAgentPanel(t)
 	srv.minBeatInterval = 0

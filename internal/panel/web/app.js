@@ -1619,9 +1619,10 @@
         if (v === chosen) { opt.selected = true; }
         select.appendChild(opt);
       });
-      // Empty value clears the pin and lets the machine follow AutoFollow /
-      // keep its current build, which is the operator's way out of a rollback.
-      var follow = el('option', null, '跟随网关版本（清除钉选）');
+      // Empty value clears the pin and keeps the machine on its current build;
+      // turning AutoFollow on is a separate switch, so the label must not
+      // promise it.
+      var follow = el('option', null, '清除钉选（保持当前版本）');
       follow.value = '';
       select.appendChild(follow);
       body.appendChild(select);

@@ -41,15 +41,17 @@ func cacheAgentBuild(t *testing.T, srv *Server, ver, arch string, body []byte) {
 }
 
 // TestAgentBinaryServesCachedBuild pins the self-hosted distribution path:
-// /api/agent/binary/{version}/{arch}[.sha256] serves the cached release asset
-// without authentication (bootstrap.sh fetches it before it holds a token),
-// while any other version, arch or path shape is refused so a crafted request
-// cannot read arbitrary files.
+// /api/agent/binary/{version}/{arch}[.sha256] and the release-asset spelling
+// /api/agent/binary/{version}/warden-cn-agent-linux-{arch}[.sha256] both serve
+// the cached build without authentication (bootstrap.sh fetches it before it
+// holds a token), while any other version, arch or path shape is refused so a
+// crafted request cannot read arbitrary files.
 func TestAgentBinaryServesCachedBuild(t *testing.T) {
 	srv, _ := agentBinaryPanel(t)
 	ver := AgentBinaryVersion()
 	binary := []byte("\x7fELF fake agent build")
 	cacheAgentBuild(t, srv, ver, "amd64", binary)
+	asset := "warden-cn-agent-linux-amd64"
 
 	cases := []struct {
 		name       string
@@ -61,9 +63,16 @@ func TestAgentBinaryServesCachedBuild(t *testing.T) {
 		{"panel-prefixed", "/warden/api/agent/binary/" + ver + "/amd64", http.StatusOK, string(binary)},
 		{"sidecar", "/api/agent/binary/" + ver + "/amd64.sha256", http.StatusOK, "abc123\n"},
 		{"trailing slash", "/api/agent/binary/" + ver + "/amd64/", http.StatusOK, string(binary)},
+		{"asset binary", "/api/agent/binary/" + ver + "/" + asset, http.StatusOK, string(binary)},
+		{"asset sidecar", "/api/agent/binary/" + ver + "/" + asset + ".sha256", http.StatusOK, "abc123\n"},
+		{"asset v-prefixed", "/api/agent/binary/v" + ver + "/" + asset, http.StatusOK, string(binary)},
 		{"unknown version", "/api/agent/binary/9.9.9/amd64", http.StatusNotFound, ""},
+		{"unknown asset version", "/api/agent/binary/9.9.9/" + asset, http.StatusNotFound, ""},
 		{"uncached arch", "/api/agent/binary/" + ver + "/riscv64", http.StatusNotFound, ""},
+		{"uncached asset arch", "/api/agent/binary/" + ver + "/warden-cn-agent-linux-riscv64", http.StatusNotFound, ""},
 		{"path traversal", "/api/agent/binary/" + ver + "/../../../../etc/passwd", http.StatusNotFound, ""},
+		{"asset prefix traversal", "/api/agent/binary/" + ver + "/warden-cn-agent-linux-../passwd", http.StatusNotFound, ""},
+		{"bare asset prefix", "/api/agent/binary/" + ver + "/warden-cn-agent-linux-", http.StatusNotFound, ""},
 		{"missing version", "/api/agent/binary/amd64", http.StatusNotFound, ""},
 	}
 	for _, tc := range cases {
@@ -148,6 +157,38 @@ func TestCachedAgentVersionsListsNewestFirst(t *testing.T) {
 	}
 }
 
+// TestCachedAgentVersionsRequireServableBuild pins O4: bootstrap.sh creates
+// agent/<ver>/ before any download lands, so an empty (or sidecar-less)
+// directory must not be offered as a pin target — pinning it would make the
+// machine 404 forever.
+func TestCachedAgentVersionsRequireServableBuild(t *testing.T) {
+	srv, _ := agentBinaryPanel(t)
+	cacheAgentBuild(t, srv, "1.6.0", "amd64", []byte("good"))
+	root := filepath.Join(srv.scriptDir, agentAssetDirName)
+
+	// Empty version directory: created but no build downloaded.
+	if err := os.MkdirAll(filepath.Join(root, "1.7.0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Binary without its CI-issued sidecar: not servable (and not verifiable).
+	halfDir := filepath.Join(root, "1.8.0")
+	if err := os.MkdirAll(halfDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(halfDir, "warden-cn-agent-linux-amd64"), []byte("half"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := srv.CachedAgentVersions(), []string{"1.6.0"}; len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("CachedAgentVersions = %v, want %v (empty/partial dirs are not pinnable)", got, want)
+	}
+	for _, v := range []string{"1.7.0", "1.8.0"} {
+		if srv.CachedAgentVersion(v) {
+			t.Errorf("CachedAgentVersion(%q) = true, want false", v)
+		}
+	}
+}
+
 // TestAgentBinaryVersionHasNoVPrefix pins the single-v normalization the URL
 // and both downloaders rely on: CI stamps "v1.6.0", dev builds "1.6.0", and
 // the served path segment is always the bare version.
@@ -168,10 +209,10 @@ func TestAgentBinaryURLShape(t *testing.T) {
 	orig := version.Version
 	t.Cleanup(func() { version.Version = orig })
 	version.Version = "v9.9.9"
-	if got, want := agentBinaryURL("http://gw.example.com/", "9.9.9", "arm64"), "http://gw.example.com/api/agent/binary/9.9.9/arm64"; got != want {
+	if got, want := agentBinaryURL("http://gw.example.com/", "9.9.9", "arm64"), "http://gw.example.com/api/agent/binary/9.9.9/warden-cn-agent-linux-arm64"; got != want {
 		t.Fatalf("agentBinaryURL = %q, want %q", got, want)
 	}
-	if got, want := agentBinaryURL("http://gw.example.com", "v9.9.9", "amd64"), "http://gw.example.com/api/agent/binary/9.9.9/amd64"; got != want {
+	if got, want := agentBinaryURL("http://gw.example.com", "v9.9.9", "amd64"), "http://gw.example.com/api/agent/binary/9.9.9/warden-cn-agent-linux-amd64"; got != want {
 		t.Fatalf("agentBinaryURL with a v-prefixed version = %q, want %q", got, want)
 	}
 	if got := agentBinaryURL("", "9.9.9", "amd64"); got != "" {
@@ -248,7 +289,7 @@ func TestCNCommandsCarriesSelfHostedAgentURL(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	want := "http://127.0.0.1:18080/api/agent/binary/" + AgentBinaryVersion() + "/amd64"
+	want := "http://127.0.0.1:18080/api/agent/binary/" + AgentBinaryVersion() + "/warden-cn-agent-linux-amd64"
 	if payload.AgentBinaryURL != want {
 		t.Fatalf("agent_binary_url = %q, want %q", payload.AgentBinaryURL, want)
 	}
