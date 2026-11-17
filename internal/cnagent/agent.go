@@ -51,6 +51,11 @@ const (
 	// public-only nameservers.
 	resolvConfPath = "/etc/resolv.conf"
 
+	// resolvedGuardPath is the systemd-resolved drop-in cn-setup installs on
+	// hosts where resolved owns resolv.conf. Deregister must remove it: leaving
+	// it behind points libc at a listener that is about to stop.
+	resolvedGuardPath = "/etc/systemd/resolved.conf.d/99-warden-gateway-cn.conf"
+
 	// fallbackPublicDNS is the well-known public resolver written alongside
 	// the configured upstream when resolv.conf is restored during deregister.
 	fallbackPublicDNS = "119.29.29.29"
@@ -787,7 +792,12 @@ func (a *Agent) restoreResolvConfCmd() string {
 	if host, _, err := net.SplitHostPort(upstream); err == nil {
 		upstream = host
 	}
-	return fmt.Sprintf("printf 'nameserver %s\\nnameserver %s\\n' > %s", upstream, fallbackPublicDNS, resolvConfPath)
+	// Also drop the systemd-resolved guard cn-setup may have installed, then let
+	// resolved pick its own upstream again — otherwise libc keeps resolving
+	// through 127.0.0.53 -> a stopped agent.
+	return fmt.Sprintf(
+		"printf 'nameserver %s\\nnameserver %s\\n' > %s; rm -f %s; systemctl restart systemd-resolved >/dev/null 2>&1 || true",
+		upstream, fallbackPublicDNS, resolvConfPath, resolvedGuardPath)
 }
 
 // agentState is the on-disk state file (mode 0644) consumed by warden-cn

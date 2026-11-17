@@ -88,6 +88,11 @@ CN_DNSMASQ_CONF="$CN_SPLIT_DIR/dnsmasq.conf"
 CN_DNS_UNIT="/etc/systemd/system/warden-gateway-cn-dns.service"
 CN_DNS_UNIT_NAME="warden-gateway-cn-dns"
 CN_NM_CONF="/etc/NetworkManager/conf.d/90-warden-gateway-cn.conf"
+# systemd-resolved 主机上 /etc/resolv.conf 是 stub 符号链接（127.0.0.53），
+# 直接改 resolv.conf 会被 resolved 重新生成覆盖（实测：迁移后 getent 绕过
+# agent 走上游）。drop-in 把 resolved 的上游指向 agent，注销/回滚时删除。
+CN_RESOLVED_CONF_DIR="/etc/systemd/resolved.conf.d"
+CN_RESOLVED_CONF="$CN_RESOLVED_CONF_DIR/99-warden-gateway-cn.conf"
 CN_WATCH_SCRIPT="/usr/local/lib/warden-gateway-cn/watchdog.sh"
 CN_WATCH_ENV="$CN_SPLIT_DIR/cn.env"
 CN_WATCH_UNIT="/etc/systemd/system/warden-gateway-cn-watchdog.service"
@@ -2422,6 +2427,57 @@ cn_agent_resolv_write() {
   } | cn_put_file "$target" 0644
 }
 
+# cn_agent_resolved_active：本机是否由 systemd-resolved 托管解析。
+cn_agent_resolved_active() {
+  grep -qs '127\.0\.0\.53' /etc/resolv.conf && return 0
+  have systemctl && systemctl is-active systemd-resolved >/dev/null 2>&1 && return 0
+  return 1
+}
+
+# cn_agent_resolved_guard 让 systemd-resolved 把查询转给本机 agent。
+#
+# 只有在 resolved 托管 resolv.conf 时才需要：那种主机上写 /etc/resolv.conf
+# 无效（stub 会被重新生成），libc 走 127.0.0.53 → resolved 自己的上游，
+# 分流被完全绕过。Domains=~. 让这份 DNS 成为所有域名的默认路由；
+# FallbackDNS 保留公网兜底（agent 挂掉时 resolved 仍能直连）。
+cn_agent_resolved_guard() {
+  cn_agent_resolved_active || return 0
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  + 写入 %s（resolved 上游 -> 198.18.0.1）并重启 systemd-resolved\n' "$CN_RESOLVED_CONF"
+    return 0
+  fi
+  cn_snapshot_file "$CN_RESOLVED_CONF"
+  mkdir -p "$CN_RESOLVED_CONF_DIR" 2>/dev/null || {
+    warn "创建 $CN_RESOLVED_CONF_DIR 失败，跳过 resolved 守卫"
+    return 1
+  }
+  cn_put_file "$CN_RESOLVED_CONF" 0644 <<RESOLVEDEOF
+# 由 warden-gateway cn-setup 生成，请勿手工编辑。
+# 本机 resolv.conf 由 systemd-resolved 托管；这里把 resolved 的上游指向
+# agent（198.18.0.1），否则 resolved 用它自己的上游并绕过分流。
+[Resolve]
+DNS=198.18.0.1
+FallbackDNS=${CN_AGENT_UPSTREAM%%:*} $CN_AGENT_FALLBACK_DNS
+Domains=~.
+RESOLVEDEOF
+  CN_AGENT_RESOLVED_GUARDED=1
+  systemctl restart systemd-resolved >/dev/null 2>&1 || {
+    warn "重启 systemd-resolved 失败，resolved 守卫可能未生效"
+    return 1
+  }
+  return 0
+}
+
+# cn_agent_resolved_guard_remove 撤掉 resolved 守卫并让它恢复自动上游。
+cn_agent_resolved_guard_remove() {
+  [ -f "$CN_RESOLVED_CONF" ] || return 0
+  rm -f "$CN_RESOLVED_CONF" 2>/dev/null || true
+  if have systemctl; then
+    systemctl restart systemd-resolved >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
 # cn_agent_stop_legacy 停止并禁用旧 dnsmasq 单元与看门狗 service+timer，
 # resolv.conf 暂置纯公网直连（spec §9.4 第 3 步：此刻机器回到装 warden 前
 # 的"无分流直连"老状态，业务不中断）。
@@ -2591,6 +2647,8 @@ cn_agent_rollback() {
   else
     cn_agent_resolv_write public || true
   fi
+  # 撤掉 resolved 守卫：留着会把 libc 的解析指向一个即将停掉的 agent。
+  cn_agent_resolved_guard_remove
   if [ "$DRY_RUN" -eq 0 ] && have systemctl; then
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable --now "$CN_DNS_UNIT_NAME" >/dev/null 2>&1 || true
@@ -2629,6 +2687,8 @@ cn_agent_teardown() {
   rm -f "$CN_AGENT_UNIT" "$CN_AGENT_BIN" "$CN_AGENT_BIN.prev" "$CN_AGENT_ROLLBACK_GUARD" \
     "$CN_AGENT_CONFIG" "$CN_AGENT_STATE_DIR/state.json" "$CN_AGENT_GUARD_LOG" \
     >/dev/null 2>&1 || true
+  # agent 停止后必须撤掉 resolved 守卫，否则 libc 仍被指向已停掉的监听。
+  cn_agent_resolved_guard_remove
   if have systemctl; then
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
@@ -2698,6 +2758,7 @@ cn_setup_agent() {
   cn_snapshot_file "$CN_AGENT_UNIT"
   cn_snapshot_file "$CN_AGENT_CONFIG"
   cn_snapshot_file "$CN_AGENT_ROLLBACK_GUARD"
+  cn_snapshot_file "$CN_RESOLVED_CONF"
 
   # 第 2 步：resolv.conf 写公网兜底 DNS（先建立安全网再动任何服务）。
   step "安全网" "写入公网兜底 DNS（${CN_AGENT_UPSTREAM%%:*}）"
@@ -2763,7 +2824,14 @@ cn_setup_agent() {
   fi
 
   # 第 6 步：resolv.conf 定型（agent 在前 + 公网兜底在后），NM 守卫保留。
+  # systemd-resolved 托管 resolv.conf 的主机上，静态 resolv.conf 会被重新
+  # 生成覆盖——先装 resolved 守卫（上游 -> 198.18.0.1），让 libc 经 resolved
+  # 的查询也走分流；写 resolv.conf 对这类主机只是无害的尽力而为。
   step "定型" "resolv.conf 指向 agent 本地 DNS（198.18.0.1 在前 + 公网兜底）"
+  if cn_agent_resolved_active; then
+    kv "resolved 守卫" "$CN_RESOLVED_CONF"
+    cn_agent_resolved_guard || warn "resolved 守卫未完全生效，后续抽查会暴露问题"
+  fi
   if ! cn_agent_resolv_write final; then
     cn_agent_fail
     return 1

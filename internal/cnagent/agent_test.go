@@ -486,6 +486,11 @@ func TestRunOnceDeregisterRestoresAndClearsToken(t *testing.T) {
 		if !strings.Contains(script, "/etc/resolv.conf") || !strings.Contains(script, "nameserver 127.0.0.1") || !strings.Contains(script, "nameserver 119.29.29.29") {
 			t.Errorf("resolv.conf restore script = %q, want public-only nameservers", script)
 		}
+		// The systemd-resolved guard cn-setup may have installed is removed in
+		// the same step: leaving it behind would point libc at a dead listener.
+		if !strings.Contains(script, "resolved.conf.d/99-warden-gateway-cn.conf") {
+			t.Errorf("resolv.conf restore script = %q, want the resolved guard removed", script)
+		}
 		// The token must still be on disk while the resolver is restored:
 		// only the stop may run after the token clear.
 		if ta.tokenAtExec[0] != origToken {

@@ -155,6 +155,11 @@ func TestBootstrapAgentMode(t *testing.T) {
 		// an explicit warning and agent.json field (review R1).
 		"--insecure-tls",
 		"insecure_tls",
+		// systemd-resolved hosts: a static resolv.conf is regenerated, so the
+		// drop-in repoints resolved at the agent instead.
+		"CN_RESOLVED_CONF",
+		"resolved.conf.d",
+		"Domains=~.",
 	}
 	script := string(raw)
 	for _, want := range required {
