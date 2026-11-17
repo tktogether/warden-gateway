@@ -506,12 +506,13 @@ func TestCNCommandsServesLiveDomains(t *testing.T) {
 	if slices.Contains(payload.Domains, "github.com") {
 		t.Fatalf("domains %v still contains a removed default", payload.Domains)
 	}
-	// agent_binary_url must carry exactly one "v" prefix on the release tag:
-	// CI stamps version.Version with a "v" ("v1.6.0") while dev builds are
-	// unstamped ("1.6.0"), and both must land on the same single-v URL. Stamp
-	// a fixed test version and cover both forms (computing the expectation
-	// from version.Version itself would be circular).
-	stampedURL := "http://127.0.0.1:18080/github.com/tktogether/warden-gateway/releases/download/v9.9.9/warden-cn-agent-linux-amd64"
+	// agent_binary_url must point at this gateway's own cached build. The
+	// version segment is the bare version (no "v"): CI stamps version.Version
+	// as "v1.6.0" while dev builds are "1.6.0", and both must land on the same
+	// URL that bootstrap.sh and the agent's own SelfUpgrade request. Stamp a
+	// fixed test version and cover both forms (computing the expectation from
+	// version.Version itself would be circular).
+	stampedURL := "http://127.0.0.1:18080/api/agent/binary/9.9.9/amd64"
 	origVersion := version.Version
 	t.Cleanup(func() { version.Version = origVersion })
 	for _, stamp := range []string{"v9.9.9", "9.9.9"} {

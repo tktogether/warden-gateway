@@ -277,7 +277,7 @@ curl -fsSL https://panel.example.com/bootstrap.sh -o /tmp/wg-bootstrap.sh && sud
 
 1. 快照所有将被改动的文件；resolv.conf 先写入公网兜底 DNS 作为安全网。
 2. 停止并禁用旧 dnsmasq 与看门狗单元，resolv.conf 暂置纯公网直连——此刻就是装 warden 之前的老状态，业务不中断。
-3. 经网关自己的 GitHub 代理短路径下载 agent 二进制，安装 `warden-cn-agent` systemd 服务（`Restart=always` + `WatchdogSec=60` + 内存约束），注册（enroll）并等待首次心跳成功，抽检分流域名在本机解析到网关 IP。
+3. 从网关自托管端点下载 agent 二进制（网关安装/升级时已预取三种架构的构建到 `$SCRIPT_DIR/agent/`），安装 `warden-cn-agent` systemd 服务（`Restart=always` + `WatchdogSec=60` + 内存约束），注册（enroll）并等待首次心跳成功，抽检分流域名在本机解析到网关 IP。
 4. resolv.conf 定型为 agent DNS（`198.18.0.1`）在前 + 公网 DNS 兜底在后：agent 进程整体死亡时解析落到公网 DNS，退化为无分流但绝不断网。NetworkManager `dns=none` 守卫保留。
 5. 摘除 `/etc/hosts` 托管块，清理旧 dnsmasq 配置与看门狗脚本。任何一步失败自动回滚快照，机器回到迁移前状态。
 
@@ -289,7 +289,7 @@ curl -fsSL https://panel.example.com/bootstrap.sh -o /tmp/wg-bootstrap.sh && sud
 | 健康探测 | 沿用 legacy 看门狗的判定分类（见下文），先确认本机外网正常再判定网关故障 |
 | 心跳 | 默认每 10 秒上报状态、领命令、拿最新分流域名列表（±20% 抖动避免多机同拍）；网关 30 秒无心跳判定离线 |
 | workload 发现 | 通过 docker socket 枚举运行中容器（名称、镜像、状态、启动时间），带 Coolify 标签的归组为应用，只采集元数据，不含环境变量与业务数据 |
-| 自升级 | 面板逐台触发，或为单台打开「自动跟随网关版本」（默认关）；经网关 GitHub 代理短路径下载、SHA-256 校验、原子替换，失败下个心跳重试，新版本连续崩溃由 systemd 回退旧二进制 |
+| 自升级 | 面板逐台触发，或为单台打开「自动跟随网关版本」（默认关）；从网关自托管端点 `/api/agent/binary/{version}/{arch}` 下载、SHA-256 校验、原子替换，失败下个心跳重试，新版本连续崩溃由 systemd 回退旧二进制 |
 
 面板「国内机」页展示每台机器的在线状态、健康分类、版本、磁盘/内存/负载、容器与应用摘要、最后心跳时间，可远程触发：立即同步、自检、升级、注销。没有远程重启或整机 reboot。
 

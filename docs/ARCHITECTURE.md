@@ -55,7 +55,7 @@ GET https://panel.example.com/github.com/owner/repo/...         -> SNI -> 8443 -
   POST /api/agent/enroll    -> 一次性 enroll token 换发 machine token（网关只存 SHA-256 摘要）
 ```
 
-agent 内置 DNS 监听 `198.18.0.1:53`（复用 `internal/dnsproxy`）：分流域名答网关 IP，其余转发上游；健康探测判定网关不可达时逐查询降级为直连解析。心跳默认 10 秒（±20% 抖动），网关 30 秒无心跳判定离线，按 token 8 秒限流。agent 命令为 `sync-domains`、`self-check`、`self-upgrade`、`deregister`；自升级经网关的 GitHub 代理短路径下载 Release 二进制并以 `.sha256` 侧车校验。
+agent 内置 DNS 监听 `198.18.0.1:53`（复用 `internal/dnsproxy`）：分流域名答网关 IP，其余转发上游；健康探测判定网关不可达时逐查询降级为直连解析。心跳默认 10 秒（±20% 抖动），网关 30 秒无心跳判定离线，按 token 8 秒限流。agent 命令为 `sync-domains`、`self-check`、`self-upgrade`、`deregister`；自升级从网关**自托管端点** `/api/agent/binary/{version}/{arch}` 取缓存构建并以 `.sha256` 侧车校验，全程不访问 GitHub。网关在安装/升级时由 `cache_agent_binaries` 把三种架构的构建预取到 `$SCRIPT_DIR/agent/`，该目录由面板对外提供。
 
 分流域名的运行时事实源是 `cfg.DNS.Domains`：面板编辑保存后自动补进 SNI 透传列表，随服务重启生效，并在心跳周期内下发到所有在线 agent（版本 hash 变化才带全量）。`DefaultSplitDomains()` 只作为全新安装的初始种子。注册表、machine token 摘要、命令队列、机器快照与事件 journal 持久化在 `<DataDir>/cn-agents.json`（0600），纳入备份/恢复；agent 管理操作记入审计日志。
 

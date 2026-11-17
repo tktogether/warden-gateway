@@ -10,7 +10,6 @@ import (
 
 	"github.com/tktogether/warden-gateway/internal/config"
 	"github.com/tktogether/warden-gateway/internal/diagnostics"
-	"github.com/tktogether/warden-gateway/internal/version"
 )
 
 func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
@@ -123,31 +122,27 @@ func (s *Server) handleCNCommands(w http.ResponseWriter, r *http.Request) {
 		healthURL = origin + "/healthz"
 		checkCommand = "curl -fsSL " + scriptURL + " -o /tmp/wg-bootstrap.sh && sudo bash /tmp/wg-bootstrap.sh cn-check"
 	}
-	// agent_binary_url points the CN machine at the self-hosted agent binary so
-	// the download never touches GitHub directly; without an origin the panel
-	// cannot host it and the URL stays empty. The release tag carries exactly
-	// one "v" prefix: CI stamps version.Version as "v1.6.0", dev builds as
-	// "1.6.0" — TrimPrefix normalizes both to the single-v tag form.
-	agentBinaryURL := ""
-	if origin != "" {
-		agentBinaryURL = origin + "/github.com/tktogether/warden-gateway/releases/download/v" + strings.TrimPrefix(version.Version, "v") + "/warden-cn-agent-linux-amd64"
-	}
+	// agent_binary_url points the CN machine at this gateway's own cached agent
+	// build, so install and upgrade never touch GitHub directly. Without an
+	// origin there is nothing to point at and the URL stays empty.
+	agentBinaryURL := agentBinaryURL(origin, "amd64")
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"as_of":            config.NowUTC(),
-		"origin":           origin,
-		"gateway_ip":       gateway,
-		"panel_host":       host,
-		"domains":          s.liveSplitDomains(),
-		"script_url":       scriptURL,
-		"command":          command,
-		"commands":         commands,
-		"restore_command":  restoreCommand,
-		"health_url":       healthURL,
-		"check_command":    checkCommand,
-		"agent_binary_url": agentBinaryURL,
-		"cn_mode":          "auto",
-		"dns":              info,
-		"dns_ready":        dnsReady,
+		"as_of":                config.NowUTC(),
+		"origin":               origin,
+		"gateway_ip":           gateway,
+		"panel_host":           host,
+		"domains":              s.liveSplitDomains(),
+		"script_url":           scriptURL,
+		"command":              command,
+		"commands":             commands,
+		"restore_command":      restoreCommand,
+		"health_url":           healthURL,
+		"agent_binary_version": AgentBinaryVersion(),
+		"check_command":        checkCommand,
+		"agent_binary_url":     agentBinaryURL,
+		"cn_mode":              "auto",
+		"dns":                  info,
+		"dns_ready":            dnsReady,
 	})
 }
 

@@ -140,6 +140,10 @@ func TestBootstrapAgentMode(t *testing.T) {
 		"warden-cn-agent-linux-$arch.sha256",
 		"sha256sum",
 		"agent 模式必须提供 --gateway-ip",
+		// Self-hosted distribution: CN machines install and upgrade the agent
+		// from this gateway's cached build, never straight from GitHub.
+		"/api/agent/binary/",
+		"cache_agent_binaries",
 	}
 	script := string(raw)
 	for _, want := range required {

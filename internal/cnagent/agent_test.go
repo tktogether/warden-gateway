@@ -637,7 +637,7 @@ func startUpgradeGateway(t *testing.T, reply func(body map[string]any) (int, any
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(payload)
 	})
-	base := "/github.com/" + DefaultRepo + "/releases/download/" + relVersion + "/"
+	base := "/api/agent/binary/" + strings.TrimPrefix(relVersion, "v") + "/"
 	mux.HandleFunc(base+"warden-cn-agent-linux-amd64", func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		_, _ = w.Write(fix.binary)

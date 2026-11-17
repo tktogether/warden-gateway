@@ -27,9 +27,11 @@ var supportedUpgradeArchs = map[string]bool{
 
 // SelfUpgrade installs a new agent binary in place:
 //
-//  1. download {Origin}/github.com/{Repo}/releases/download/{version}/
-//     warden-cn-agent-linux-{arch} and its same-name .sha256 sidecar
-//     (bare hex hash, possibly with trailing whitespace/newline);
+//  1. download {Origin}/api/agent/binary/{version}/warden-cn-agent-linux-{arch}
+//     and its same-name .sha256 sidecar from the gateway that enrolled this
+//     machine (bare hex hash, possibly with trailing whitespace/newline). The
+//     gateway serves its own cached release build, so an upgrade never depends
+//     on this machine reaching GitHub;
 //  2. verify the sha256 (hex compare) BEFORE touching anything on disk —
 //     a failed download or checksum mismatch leaves the local state
 //     completely untouched;
@@ -40,9 +42,10 @@ var supportedUpgradeArchs = map[string]bool{
 //     original state.
 //
 // arch is passed explicitly (production callers pass runtime.GOARCH, tests
-// inject a fixed value); version is used verbatim in the URL, exactly as the
-// heartbeat's target_version delivered it (e.g. "v1.6.0"). A nil httpClient
-// gets an internally built client with upgradeHTTPTimeout.
+// inject a fixed value); version is used verbatim in the URL as the
+// heartbeat's target_version delivered it (e.g. "v1.6.0"), minus its "v"
+// prefix, matching the gateway's cached-build path. A nil httpClient gets an
+// internally built client with upgradeHTTPTimeout.
 func SelfUpgrade(ctx context.Context, cfg *Config, version, arch, selfPath string, httpClient *http.Client) error {
 	if cfg == nil {
 		return fmt.Errorf("cnagent upgrade: config is nil")
@@ -55,8 +58,7 @@ func SelfUpgrade(ctx context.Context, cfg *Config, version, arch, selfPath strin
 	}
 
 	base := strings.TrimRight(cfg.Origin, "/") +
-		"/github.com/" + cfg.Repo +
-		"/releases/download/" + version
+		"/api/agent/binary/" + strings.TrimPrefix(strings.TrimSpace(version), "v")
 	asset := "warden-cn-agent-linux-" + arch
 
 	body, err := downloadReleaseFile(ctx, httpClient, base+"/"+asset)

@@ -226,6 +226,12 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, p string) {
 	case "/api/agent/heartbeat":
 		s.handleAgentHeartbeat(w, r)
 		return
+	}
+	if strings.HasPrefix(p, "/api/agent/binary/") {
+		s.handleAgentBinary(w, r)
+		return
+	}
+	switch p {
 	case "/api/overview":
 		s.handleOverview(w, r)
 		return

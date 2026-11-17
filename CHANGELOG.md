@@ -6,11 +6,11 @@
 
 - 国内机常驻 agent `warden-cn-agent`（新 `cmd/warden-cn-agent`，`internal/cnagent`）：单二进制 systemd 常驻服务，接管国内机分流。内置 DNS 监听 `198.18.0.1:53`（复用 `internal/dnsproxy`，地址与 v1.5.x 的 dnsmasq 一致）：分流域名答网关 IP，其余转发上游；健康探测判定网关不可达时逐查询降级为直连解析，不再有"60 秒一次摘 hosts 块"的状态机延迟。健康探测沿用 `OK` / `LINK_443_BLOCKED` / `LINK_PORTS_BLOCKED` / `C_DOWN` / `LOCAL_BROKEN` 分类，先确认本机外网正常再判定网关故障。通过 docker socket 自动发现容器（名称、镜像、状态、启动时间），带 Coolify 标签的容器归组为应用上报，只采集元数据。
 - agent 心跳：默认每 10 秒（±20% 抖动避免多台机器同拍）`POST /api/agent/heartbeat`，Bearer machine token 认证。一个心跳往返完成三件事：上报状态、健康探测结果与容器/资源摘要，领命令（`sync-domains`、`self-check`、`self-upgrade`、`deregister`），拿最新分流域名列表——网关侧带版本 hash，hash 没变不下发全量。网关连续 30 秒（3 个周期）无心跳判定离线；每个 token 按 8 秒间隔限流（心跳间隔最低 10 秒）。心跳失败时本地维持现状运行，绝不因远端异常清空本地配置。
-- agent 自升级：经网关的 GitHub 代理短路径 `{origin}/github.com/tktogether/warden-gateway/releases/download/{tag}/...` 下载目标版本二进制，同源拉取 `.sha256` 侧车校验，通过后临时文件写入、原子 rename 替换自身、退出交 systemd 重启；下载或校验失败本次不动，下个心跳重试。新版本连续崩溃时 systemd 自动回退到备份的旧二进制。systemd 单元为 `Restart=always` + `WatchdogSec=60`（agent 周期性 sd_notify，卡死强杀重启）加 `MemoryMax` 资源约束。
+- agent 自升级：经网关**自托管端点** `{origin}/api/agent/binary/{version}/{arch}` 下载目标版本二进制，同源拉取 `.sha256` 侧车校验，通过后临时文件写入、原子 rename 替换自身、退出交 systemd 重启；国内机全程不访问 GitHub。下载或校验失败本次不动，下个心跳重试。新版本连续崩溃时 systemd 自动回退到备份的旧二进制。systemd 单元为 `Restart=always` + `WatchdogSec=60`（agent 周期性 sd_notify，卡死强杀重启）加 `MemoryMax` 资源约束。
 - 网关 `/api/agent/*`：`POST /api/agent/enroll` 用一次性 enroll token 换发 machine token（随机 32 字节，网关只存 SHA-256 摘要，agent 端 0600）；`POST /api/agent/heartbeat` 返回命令队列、域名列表与目标版本。注册表、token 摘要、待执行命令、机器快照与事件 journal 持久化到 `<DataDir>/cn-agents.json`（0600），网关重启或升级不丢已注册机器，纳入现有备份/恢复；所有 agent 管理操作进审计日志。
 - 面板新增「国内机」页：每台机器的在线/离线状态、健康分类、版本、磁盘/内存/负载、容器与应用摘要、最后心跳时间；操作按钮为立即同步、自检、升级、注销——没有远程重启或整机 reboot 入口。注册流程：面板生成一次性 enroll token 与安装命令，国内机执行后自动出现在列表。
 - 分流域名在线编辑：面板「设置」页新增分流域名编辑器，保存后写入 `cfg.DNS.Domains` 成为运行时唯一事实源，自动补进 SNI 透传列表保证每个分流域名都被覆盖，随服务重启生效并在心跳周期内下发到所有在线 agent，全程无需发版。
-- CI：GitHub Release 在网关二进制之外同时发布 `warden-cn-agent-linux-amd64` / `-arm64` 二进制、`.sha256` 侧车与 tar.gz。agent 二进制经网关 GitHub 代理短路径分发，网关不为它设托管端点。
+- CI：GitHub Release 在网关二进制之外同时发布 `warden-cn-agent-linux-amd64` / `-arm64` / `-arm` 二进制、`.sha256` 侧车与 tar.gz。网关安装/升级时把这些构建预取到 `$SCRIPT_DIR/agent/`，由 `GET /api/agent/binary/{version}/{arch}` **自托管**对外分发，国内机安装与升级都只连网关。
 
 ### 改进
 

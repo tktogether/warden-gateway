@@ -495,6 +495,47 @@ install_binary() {
   mv -f "$BIN_PATH.new" "$BIN_PATH"
 }
 
+# cache_agent_binaries 把本版本的 agent 构建（三种架构 + 裸 hex sha256 侧车）
+# 预取到 $SCRIPT_DIR/agent/，由面板 /api/agent/binary/{version}/{arch} 对外提供。
+# 国内机的安装与自升级因此只连本网关，不必访问 GitHub；预取失败不阻塞网关安装
+# （面板会返回 404 并提示重跑安装器），但会在输出里明确告警。
+cache_agent_binaries() {
+  local arch asset tmp ok_flag=0
+  [ "$DRY_RUN" -eq 1 ] && { printf '  + 预取 agent 构建到 %s/agent/\n' "$SCRIPT_DIR"; return 0; }
+  mkdir -p "$SCRIPT_DIR/agent" 2>/dev/null || { warn "创建 agent 缓存目录失败"; return 1; }
+  local base
+  if [ "$VERSION" = "latest" ]; then
+    base="https://github.com/$REPO/releases/latest/download"
+  else
+    base="https://github.com/$REPO/releases/download/$VERSION"
+  fi
+  for arch in amd64 arm64 arm; do
+    asset="warden-cn-agent-linux-$arch"
+    tmp="$SCRIPT_DIR/agent/.$asset.$$"
+    if ! download "$base/$asset" "$tmp"; then
+      rm -f "$tmp"
+      warn "预取 agent 构建失败：$asset（面板将无法分发该架构的 agent）"
+      continue
+    fi
+    if [ ! -s "$tmp" ]; then
+      rm -f "$tmp"
+      warn "预取的 agent 构建为空：$asset"
+      continue
+    fi
+    mv -f "$tmp" "$SCRIPT_DIR/agent/$asset"
+    sha256sum "$SCRIPT_DIR/agent/$asset" 2>/dev/null | awk '{print $1}' > "$SCRIPT_DIR/agent/$asset.sha256" || {
+      rm -f "$SCRIPT_DIR/agent/$asset" "$SCRIPT_DIR/agent/$asset.sha256"
+      warn "生成 agent 校验和失败：$asset"
+      continue
+    }
+    chmod 0755 "$SCRIPT_DIR/agent/$asset"
+    chmod 0644 "$SCRIPT_DIR/agent/$asset.sha256"
+    ok_flag=1
+  done
+  [ "$ok_flag" -eq 1 ] && ok "agent 构建已缓存到 $SCRIPT_DIR/agent（国内机只连本网关下载）"
+  return 0
+}
+
 is_cn_mirror() {
   case "$1" in
     *://mirrors.aliyun.com*|*://mirrors.cloud.aliyuncs.com*|*://mirrors.tuna.tsinghua.edu.cn*|*://mirrors.ustc.edu.cn*|*://mirrors.cloud.tencent.com*|*://mirrors.huaweicloud.com*|*://mirrors.163.com*|*://mirrors.bfsu.edu.cn*|*://mirrors.nju.edu.cn*|*cmecloud.cn*|*://mirrors.zju.edu.cn*|*://mirrors.sjtug.sjtu.edu.cn*) return 0;;
@@ -1977,7 +2018,9 @@ EOF
 # 校验通过才原子替换到 $CN_AGENT_BIN。
 cn_agent_download() {
   local version="$1" arch="$2" url tmp sidecar expected actual
-  url="$CN_AGENT_ORIGIN/github.com/$REPO/releases/download/v$version/warden-cn-agent-linux-$arch"
+  # 网关自托管：面板把与自身同版本的 agent 构建缓存在本地，国内机只连网关，
+  # 安装与升级都不必再访问 GitHub（agent 自升级走同一条路径）。
+  url="$CN_AGENT_ORIGIN/api/agent/binary/${version#v}/warden-cn-agent-linux-$arch"
   step "下载" "$url"
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '  + curl -fsSL %s -o %s\n' "$url" "$CN_AGENT_BIN"
@@ -2001,7 +2044,7 @@ cn_agent_download() {
     return 1
   fi
   # .sha256 侧车校验（缺侧车或格式不符都算失败）。
-  local sidecar="$CN_AGENT_ORIGIN/github.com/$REPO/releases/download/v$version/warden-cn-agent-linux-$arch.sha256"
+  local sidecar="$CN_AGENT_ORIGIN/api/agent/binary/${version#v}/warden-cn-agent-linux-$arch.sha256"
   if ! curl -kfsS --connect-timeout 10 --max-time 60 \
       -o "$tmp.sha" "$sidecar"; then
     rm -f "$tmp" "$tmp.sha"
@@ -3093,6 +3136,7 @@ cmd_install() {
     install_binary
     init_config
     install_scripts
+    cache_agent_binaries || true
     install_cli
     write_version_from_binary
     install_unit
@@ -3147,6 +3191,7 @@ cmd_update() {
   if [ -z "$PUBLIC_URL" ]; then PUBLIC_URL="$(config_public_url)"; fi
   if [ "$MODE" = "docker" ]; then
     install_scripts
+    cache_agent_binaries || true
     install_cli
     pull_docker_image
     run_docker_container
@@ -3154,6 +3199,7 @@ cmd_update() {
     systemctl stop "$SERVICE" >/dev/null 2>&1 || true
     install_binary
     install_scripts
+    cache_agent_binaries || true
     install_cli
     write_version_from_binary
     install_unit

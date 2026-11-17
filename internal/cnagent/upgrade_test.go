@@ -22,15 +22,15 @@ type releaseFixture struct {
 	sidecar string
 }
 
-// startReleaseServer serves the Task 7 release layout,
-// /github.com/{Repo}/releases/download/{version}/warden-cn-agent-linux-{arch}
+// startReleaseServer serves the gateway-hosted agent layout,
+// /api/agent/binary/{version}/warden-cn-agent-linux-{arch}
 // plus the .sha256 sidecar, and counts requests so tests can assert how much
 // network traffic a call made.
 func startReleaseServer(t *testing.T, version string, fix releaseFixture) (*httptest.Server, *atomic.Int64) {
 	t.Helper()
 	var hits atomic.Int64
 	mux := http.NewServeMux()
-	base := "/github.com/" + DefaultRepo + "/releases/download/" + version + "/"
+	base := "/api/agent/binary/" + strings.TrimPrefix(version, "v") + "/"
 	mux.HandleFunc(base+"warden-cn-agent-linux-amd64", func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		_, _ = w.Write(fix.binary)
