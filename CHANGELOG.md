@@ -1,5 +1,17 @@
 # 更新记录
 
+## v1.6.4
+
+### 修复
+
+- **agent 自升级可能被看门狗打断**：`SelfUpgrade` 每次请求（二进制、`.sha256` 各一次）允许 60 秒，而 systemd 单元 `WatchdogSec=60`、当轮的 watchdog ping 又早在探测之前就发过了。慢链路上排队的自升级会在下载中途被 SIGABRT，而且网关已经 pop 掉该命令，操作员只会看到同一条升级反复出现、永远拿不到结果。现在下载前补发一次 ping（`pingWatchdog()`），两条调用点不会各写一份。
+- **源码构建自报版本滞后**：`internal/version/version.go` 仍写 `1.6.2`，而 `VERSION`/CHANGELOG 已是 `1.6.3`。CI 用 `-ldflags` 注入版本，所以正式发布的 v1.6.3 产物本身是对的（已下载产物核对为 `v1.6.3`），但 `go build`、`bootstrap.sh --binary`、手工装的二进制都自报 `1.6.2`，而面板的 `AgentBinaryVersion()` 与心跳 `target_version` 正是取自这个字面值——可能让机器「升级」到自己已在跑的版本，或被要求降级。v1.6.0（`ec98a7c`）犯过同样的错。新增 `TestVersionMatchesVersionFile` 防止再犯。
+- 测试补强（都是审查发现的空覆盖）：`TestRateLimitedBeatRetriesShortly` 从不驱动 `Run`，删掉 429 重试分支整套测试仍然全绿；429 的等待决策抽成 `nextWait()` 并由 `TestNextWaitUsesShortRetryWhenRateLimited` 锁定。抽象命名空间分支原先只比对字符串，新增 `TestSDNotifyAbstractNamespaceDelivery` 走真实抽象 socket 投递，漏掉 `@` → NUL 转换就会失败。两项新测试都验证过「回退修复即失败」。
+
+### 文档
+
+- 修正两处陈旧注释：`notifyFn` 里写死的 `WatchdogSec=30`（单元实际是 60）、`sdnotify_other.go` 把该 socket 描述成仅抽象命名空间。
+
 ## v1.6.3
 
 ### 修复

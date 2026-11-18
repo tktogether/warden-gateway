@@ -7,7 +7,7 @@ package version
 // step with the VERSION file (TestVersionMatchesVersionFile enforces that).
 // Forgetting it in v1.6.0 (ec98a7c) shipped agents that misreported 1.5.x.
 var (
-	Version   = "1.6.3"
+	Version   = "1.6.4"
 	Commit    = "dev"
 	BuildTime = "unknown"
 )
