@@ -3,7 +3,9 @@
 package cnagent
 
 import (
+	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -97,6 +99,44 @@ func TestSDNotifySocketFallsBackToFilesystemPath(t *testing.T) {
 	}
 	if got != "/run/systemd/notify" {
 		t.Errorf("fallback = %q, want the filesystem path /run/systemd/notify", got)
+	}
+}
+
+// TestSDNotifyAbstractNamespaceDelivery exercises the '@' → NUL translation end
+// to end against a real abstract-namespace listener. TestNotifySocketAddr-
+// HonoursEnv only compares strings, so a regression in dialNotifySocket (for
+// example dropping the "\x00" prefix, which would silently dial a filesystem
+// path named "@...") would pass every other test while breaking the abstract
+// builds the old code was written for.
+func TestSDNotifyAbstractNamespaceDelivery(t *testing.T) {
+	// A unique abstract name: the NUL prefix is what net.ListenPacket wants for
+	// the abstract namespace, and '@' is how systemd spells the same address.
+	name := fmt.Sprintf("@warden-sdnotify-test-%d", os.Getpid())
+	pc, err := net.ListenPacket("unixgram", "\x00"+name[1:])
+	if err != nil {
+		t.Skipf("abstract namespace unavailable on this host: %v", err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+
+	old := sdNotifySocket
+	sdNotifySocket = ""
+	t.Cleanup(func() { sdNotifySocket = old })
+
+	t.Setenv(sdNotifySocketEnv, name)
+
+	if err := SDNotify(watchdogPing); err != nil {
+		t.Fatalf("SDNotify via abstract address %q: %v", name, err)
+	}
+	buf := make([]byte, 128)
+	if err := pc.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	n, _, err := pc.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("read from abstract listener (the '@' prefix was not translated to NUL): %v", err)
+	}
+	if got := string(buf[:n]); got != watchdogPing {
+		t.Errorf("SDNotify delivered %q, want %q", got, watchdogPing)
 	}
 }
 

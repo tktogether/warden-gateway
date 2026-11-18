@@ -349,6 +349,63 @@ func TestRateLimitedBeatRetriesShortly(t *testing.T) {
 	}
 }
 
+// TestNextWaitUsesShortRetryWhenRateLimited covers the half of the 429 fix that
+// Run actually consults. Without this, deleting the branch in nextWait would
+// leave every other test green while the retry silently waited a whole
+// heartbeat period — which is exactly the regression the 429 handling exists to
+// prevent. Run itself is not driven here because that would take real seconds;
+// nextWait is the decision point.
+func TestNextWaitUsesShortRetryWhenRateLimited(t *testing.T) {
+	cfg := testConfig(t)
+	a, err := newAgent(cfg, nil, filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatalf("newAgent: %v", err)
+	}
+
+	base := 10 // heartbeat_seconds: a full interval is 8s..12s with jitter
+	if got := a.nextWait(base); got < 8*time.Second || got > 12*time.Second {
+		t.Errorf("normal nextWait = %s, want the jittered interval (8s..12s)", got)
+	}
+
+	a.mu.Lock()
+	a.rateLimited = true
+	a.mu.Unlock()
+	if got := a.nextWait(base); got != cnBeatMinRetry {
+		t.Errorf("rate-limited nextWait = %s, want %s", got, cnBeatMinRetry)
+	}
+
+	a.mu.Lock()
+	a.rateLimited = false
+	a.mu.Unlock()
+	if got := a.nextWait(base); got == cnBeatMinRetry {
+		t.Errorf("nextWait still = %s after the flag cleared, want the jittered interval", cnBeatMinRetry)
+	}
+}
+
+// TestUpgradePingsWatchdogBeforeDownload pins the second watchdog ping. A
+// queued self-upgrade spends up to upgradeHTTPTimeout (60s) downloading the
+// binary under the unit's WatchdogSec=60, so the cycle's single ping is not
+// enough; without the extra ping systemd SIGABRTs the download and the popped
+// command never reports a result.
+func TestUpgradePingsWatchdogBeforeDownload(t *testing.T) {
+	cfg := testConfig(t)
+	ta := newTestAgent(t, cfg)
+	ta.agent.upgradeFn = func(ctx context.Context, ver string) error { return nil }
+
+	before := len(ta.snapshotNotifies())
+	ok, detail := ta.agent.doUpgrade(context.Background(), "v9.9.9")
+	if !ok {
+		t.Fatalf("doUpgrade = %q, want success", detail)
+	}
+	after := ta.snapshotNotifies()
+	if len(after) <= before {
+		t.Fatalf("watchdog pings before=%d after=%d; the pre-download ping is missing", before, len(after))
+	}
+	if last := after[len(after)-1]; last != watchdogPing {
+		t.Errorf("last notify = %q, want %q", last, watchdogPing)
+	}
+}
+
 // TestNon200KeepsLocalState pins Review Focus #4: a rejected heartbeat must
 // change nothing locally — the DNS proxy keeps answering and the state file
 // stays byte-identical to the last successful cycle.

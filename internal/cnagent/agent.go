@@ -114,10 +114,10 @@ type Agent struct {
 	// tests inject a scripted fake (ruling 2).
 	prober prober
 	// notifyFn is the sd_notify hook invoked once per cycle with
-	// watchdogPing. New wires it to SDNotify (Task 8) so the systemd
-	// watchdog (WatchdogSec=30) sees liveness every cycle; hand-built Agent
-	// structs (tests) keep a nil notifyFn, which RunOnce skips; do not
-	// remove or move this call.
+	// watchdogPing (plus once before an upgrade download). New wires it to
+	// SDNotify so the systemd watchdog (WatchdogSec=60 in the unit
+	// bootstrap.sh writes) sees liveness every cycle; hand-built Agent
+	// structs (tests) keep a nil notifyFn, which pingWatchdog skips.
 	notifyFn func(state string)
 	// upgradeFn is the self-upgrade dispatch (Task 7). New wires it to
 	// SelfUpgrade with the executable path resolved at call time; only
@@ -294,19 +294,27 @@ func (a *Agent) Close() {
 	a.shutdown()
 }
 
+// pingWatchdog sends one sd_notify watchdog keepalive through the notifyFn
+// hook. It is called once per cycle, plus once before an upgrade download
+// (SelfUpgrade's per-request budget can exceed WatchdogSec). A nil hook
+// (hand-built Agent structs in tests) makes it a no-op.
+func (a *Agent) pingWatchdog() {
+	if a.notifyFn != nil {
+		a.notifyFn(watchdogPing)
+	}
+}
+
 // RunOnce executes one complete cycle: probe → dns sync → heartbeat → apply
 // reply → write state file. It returns errAgentDeregistered after a completed
 // deregister and errAgentUpgraded after a completed self-upgrade (either the
 // command or the auto-follow target-version check); every other failure is
 // logged and retried next cycle by Run.
 func (a *Agent) RunOnce(ctx context.Context) error {
-	// systemd watchdog ping, once per cycle. Keep this exactly once per cycle so
-	// the WatchdogSec budget holds: one full cycle is probe (~13s typical) +
-	// workload discovery (8s cap) + heartbeat (8s cap), well under the unit's
-	// WatchdogSec even in the worst case where every probe times out.
-	if a.notifyFn != nil {
-		a.notifyFn(watchdogPing)
-	}
+	// systemd watchdog ping, once per cycle. The further pings below (before an
+	// upgrade download) are the only exceptions: a cycle that runs a queued
+	// self-upgrade spends up to upgradeHTTPTimeout just downloading, which is
+	// the one path that can outlast WatchdogSec=60 from the cycle's ping.
+	a.pingWatchdog()
 
 	// 1. Probe the gateway (bounded timeouts live in probe.go).
 	pr := ProbeGatewayWith(ctx, a.cfg.GatewayIP, time.Now, a.prober)
@@ -457,11 +465,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		// gateway's per-token interval after the previous one) retries on the
 		// short interval so the fresh process gets its domain payload promptly
 		// instead of spending a full heartbeat period unresolvable.
-		wait := jitteredInterval(base)
-		if a.rateLimitedSnapshot() {
-			wait = cnBeatMinRetry
-		}
-		timer := time.NewTimer(wait)
+		timer := time.NewTimer(a.nextWait(base))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -470,6 +474,18 @@ func (a *Agent) Run(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
+}
+
+// nextWait returns how long Run sleeps before the next cycle. A rate-limited
+// beat (HTTP 429) waits cnBeatMinRetry so a just-restarted agent recovers its
+// domain payload promptly instead of idling a whole heartbeat period; every
+// other outcome uses the jittered heartbeat interval. It is a method (not an
+// inline expression) so tests can pin the 429 branch without sleeping.
+func (a *Agent) nextWait(base int) time.Duration {
+	if a.rateLimitedSnapshot() {
+		return cnBeatMinRetry
+	}
+	return jitteredInterval(base)
 }
 
 // jitteredInterval scales base seconds by a random factor in [0.8, 1.2].
@@ -661,6 +677,15 @@ func (a *Agent) doUpgrade(ctx context.Context, target string) (bool, string) {
 	if normalizeVersion(target) != "" && normalizeVersion(target) == normalizeVersion(version.Version) {
 		return true, "already running " + normalizeVersion(version.Version)
 	}
+	// Ping the watchdog before a download that can outlast WatchdogSec. The
+	// cycle's ping was sent before the probe and the heartbeat, and SelfUpgrade
+	// allows up to upgradeHTTPTimeout (60s) per request for the binary and
+	// again for the .sha256 sidecar — on a slow link that exceeds the unit's
+	// WatchdogSec=60 from the cycle's ping alone, so systemd would SIGABRT the
+	// download mid-stream. The gateway had already popped the command, so the
+	// operator would only ever see the same queued upgrade repeat, never the
+	// result.
+	a.pingWatchdog()
 	if err := a.upgradeFn(ctx, target); err != nil {
 		return false, err.Error()
 	}
