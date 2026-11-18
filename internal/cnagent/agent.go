@@ -75,6 +75,12 @@ const (
 	// (Task 5 review: the nil-client path has no default timeout, so the run
 	// loop supplies the deadline itself).
 	workloadDiscoverTimeout = 8 * time.Second
+
+	// cnBeatMinRetry is how long Run waits after the gateway rate limited a
+	// heartbeat (HTTP 429). The gateway's per-token floor is 8s, so a beat
+	// right after a restart lands inside it; retrying on this interval instead
+	// of a full heartbeat period recovers within one short beat.
+	cnBeatMinRetry = 9 * time.Second
 )
 
 // Command actions the gateway can queue for the agent.
@@ -148,6 +154,7 @@ type Agent struct {
 	targetVersion string          // gateway-requested agent version from the latest reply
 	lastCommand   *CommandResult  // result of the last executed command, reported next cycle
 	lastError     string          // last local failure (proxy build), surfaced in the state file
+	rateLimited   bool            // the last heartbeat was rejected with HTTP 429; Run retries shortly
 	applies       int             // count of successful proxy builds (tests pin "no rebuild")
 	deregistered  bool            // set once deregister completed; RunOnce returns the sentinel
 	upgraded      bool            // set once a self-upgrade swapped the binary; RunOnce returns the sentinel
@@ -197,9 +204,16 @@ func newAgent(cfg *Config, log *logging.Logger, statePath string) (*Agent, error
 	}
 
 	// Task 8 wiring (ruling 2): the sd_notify watchdog ping goes through
-	// SDNotify; the returned error is deliberately dropped here — a missing
-	// socket (running outside systemd) must never break a cycle.
-	a.notifyFn = func(state string) { _ = SDNotify(state) }
+	// SDNotify. A failed send is logged, not swallowed: a silently dropped ping
+	// makes systemd SIGABRT a perfectly healthy agent every WatchdogSec (the
+	// hard-coded abstract socket did exactly that — 990 kills in one day on a
+	// live CN machine). Running outside systemd still cannot break a cycle, the
+	// error is only recorded.
+	a.notifyFn = func(state string) {
+		if err := SDNotify(state); err != nil {
+			a.log.Warnf("sd_notify %q failed (systemd will not see this cycle's watchdog ping): %v", state, err)
+		}
+	}
 
 	// Task 8 wiring (ruling 1): dispatch self-check into SelfCheck. The
 	// closure reads statePath and the bound DNS listener AT CALL TIME so
@@ -286,9 +300,10 @@ func (a *Agent) Close() {
 // command or the auto-follow target-version check); every other failure is
 // logged and retried next cycle by Run.
 func (a *Agent) RunOnce(ctx context.Context) error {
-	// systemd watchdog ping, once per cycle. Task 8 replaces the default
-	// no-op with SDNotify; keep this exactly once per cycle so the
-	// WatchdogSec=30 budget holds.
+	// systemd watchdog ping, once per cycle. Keep this exactly once per cycle so
+	// the WatchdogSec budget holds: one full cycle is probe (~13s typical) +
+	// workload discovery (8s cap) + heartbeat (8s cap), well under the unit's
+	// WatchdogSec even in the worst case where every probe times out.
 	if a.notifyFn != nil {
 		a.notifyFn(watchdogPing)
 	}
@@ -314,6 +329,19 @@ func (a *Agent) RunOnce(ctx context.Context) error {
 	report := a.buildReport(ctx, pr, degraded)
 	reply, err := SendHeartbeat(ctx, a.cfg, report, a.httpClient)
 	if err != nil {
+		// A 429 means this process started less than the gateway's per-token
+		// minimum interval after the previous beat: the normal case right after
+		// a self-upgrade restart. It is not a failure of this cycle — mark it so
+		// Run retries on the short interval instead of waiting a whole heartbeat
+		// period and leaving the fresh process without a domain payload.
+		var se *StatusError
+		if errors.As(err, &se) && se.Code == http.StatusTooManyRequests {
+			a.mu.Lock()
+			a.rateLimited = true
+			a.mu.Unlock()
+			a.log.Infof("heartbeat rate limited by the gateway (restarted within %s), retrying shortly", cnBeatMinRetry)
+			return nil
+		}
 		// Locked (Review Focus #4 / spec §8 safety net #6): a failed
 		// heartbeat produces no local action at all — no state file write,
 		// no DNS change. The machine keeps running on its current state
@@ -322,6 +350,7 @@ func (a *Agent) RunOnce(ctx context.Context) error {
 		return nil
 	}
 	a.mu.Lock()
+	a.rateLimited = false
 	a.targetVersion = reply.TargetVersion
 	a.mu.Unlock()
 
@@ -424,7 +453,15 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.log.Errorf("cycle failed: %v", err)
 		}
 
-		timer := time.NewTimer(jitteredInterval(base))
+		// A rate-limited beat (normally: this process restarted less than the
+		// gateway's per-token interval after the previous one) retries on the
+		// short interval so the fresh process gets its domain payload promptly
+		// instead of spending a full heartbeat period unresolvable.
+		wait := jitteredInterval(base)
+		if a.rateLimitedSnapshot() {
+			wait = cnBeatMinRetry
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -917,6 +954,12 @@ func (a *Agent) deregisteredSnapshot() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.deregistered
+}
+
+func (a *Agent) rateLimitedSnapshot() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.rateLimited
 }
 
 func (a *Agent) upgradedSnapshot() bool {

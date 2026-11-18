@@ -128,12 +128,17 @@ type testAgent struct {
 
 func newTestAgent(t *testing.T, cfg *Config) *testAgent {
 	t.Helper()
-	a, err := New(cfg, nil) // nil logger: logging methods are nil-safe and tests stay quiet
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	// Build through newAgent with a temp state path instead of New: New seeds the
+	// domain cache from the PRODUCTION state file (/var/lib/warden-gateway-cn/
+	// state.json) inside the constructor, so on a host that actually runs the
+	// agent these tests inherited the live split list and failed. Same class of
+	// leak as configPath (ccdf2e0); the seed read happens during construction, so
+	// the path must be right BEFORE the constructor runs.
 	ta := &testAgent{statePath: filepath.Join(t.TempDir(), "state.json")}
-	a.statePath = ta.statePath
+	a, err := newAgent(cfg, nil, ta.statePath) // nil logger: logging methods are nil-safe and tests stay quiet
+	if err != nil {
+		t.Fatalf("newAgent: %v", err)
+	}
 	// Deregister rewrites the agent config (it clears the token), so the test
 	// agent must own a writable config path. The production default is
 	// /etc/warden-gateway-cn/agent.json, which an unprivileged CI runner cannot
@@ -308,6 +313,42 @@ func TestRunOnceDegradesWhenProbeFails(t *testing.T) {
 	}
 }
 
+// TestRateLimitedBeatRetriesShortly pins the restart path: the gateway's
+// per-token heartbeat floor is 8s, so the first beat of a process that
+// restarted (self-upgrade, systemd) lands inside it and gets 429. That must be
+// treated as "retry soon", not as a generic failure that waits a whole
+// heartbeat period — otherwise the fresh process spends that period without a
+// domain payload and resolves everything upstream.
+func TestRateLimitedBeatRetriesShortly(t *testing.T) {
+	gw := &fakeGateway{reply: func(n int, body map[string]any) (int, any) {
+		if n == 1 {
+			return http.StatusTooManyRequests, nil
+		}
+		return http.StatusOK, HeartbeatReply{
+			Domains: &DomainPayload{Hash: "h1", Domains: []string{"app1.example.com"}},
+		}
+	}}
+	cfg := gw.start(t)
+	ta := newTestAgent(t, cfg)
+
+	if err := ta.agent.RunOnce(context.Background()); err != nil {
+		t.Fatalf("429 must not fail RunOnce: %v", err)
+	}
+	if !ta.agent.rateLimitedSnapshot() {
+		t.Fatal("rateLimited = false after a 429, want true so Run retries shortly")
+	}
+
+	if err := ta.agent.RunOnce(context.Background()); err != nil {
+		t.Fatalf("second cycle: %v", err)
+	}
+	if ta.agent.rateLimitedSnapshot() {
+		t.Error("rateLimited still true after a successful beat, want cleared")
+	}
+	if got := ta.agent.domainsHashSnapshot(); got != "h1" {
+		t.Errorf("domains hash after successful retry = %q, want h1 (payload applied)", got)
+	}
+}
+
 // TestNon200KeepsLocalState pins Review Focus #4: a rejected heartbeat must
 // change nothing locally — the DNS proxy keeps answering and the state file
 // stays byte-identical to the last successful cycle.
@@ -352,8 +393,7 @@ func TestNon200KeepsLocalState(t *testing.T) {
 }
 
 // TestRunOnceExecutesCommand pins command execution: a sync-domains command
-// carrying a new list applies it, the next heartbeat reports the new hash,
-// and the state file records the successful last_command.
+// carrying a new list applies it, the next heartbeat reports the new hash,// and the state file records the successful last_command.
 func TestRunOnceExecutesCommand(t *testing.T) {
 	upstream := startFakeUpstream(t, "192.0.2.1")
 	gw := &fakeGateway{reply: func(n int, body map[string]any) (int, any) {

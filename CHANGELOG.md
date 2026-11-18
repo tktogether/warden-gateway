@@ -1,5 +1,14 @@
 # 更新记录
 
+## v1.6.3
+
+### 修复
+
+- **agent 被 systemd 看门狗每 60 秒强杀一次（严重）**：`SDNotify` 把 watchdog ping 发到硬编码的抽象命名空间地址 `@/run/systemd/notify`，而 Ubuntu 22.04（systemd 249）绑定的是文件系统路径 `/run/systemd/notify`，两者不是同一个 socket。ping 每次都被丢弃，systemd 到 `WatchdogSec=60` 就把**完全健康**的 agent SIGABRT 掉。实测一台国内机一天被强杀 990 次、`NRestarts=256`，而进程栈显示 goroutine 1 正常停在心跳间隔的 `select`。现在改为读 `NOTIFY_SOCKET` 环境变量（兼容 `@` 抽象命名空间前缀），只在缺失时回退到文件系统路径，并且**不再静默吞掉发送错误**——静默丢弃正是这个 bug 得以长期存在的原因。
+- **`github.com` 偶发解析到真实 IP，Coolify 构建报 `unexpected eof while reading`**：这是上一条的下游症状。agent 每次被强杀到重启的约 2 秒里 `198.18.0.1:53` 无人监听，`resolv.conf` 的第二个 nameserver（`223.5.5.5`）接手，分流域名就答出真实 GitHub IP，容器随即直连 GitHub 并被切断。修复后实测 120 次连续采样全部解析到网关 IP、0 次回落。用户侧表现为「偶现、连续失败几次、过一会儿或重新部署又好了」。
+- **重启后首次心跳必然 429**：网关对每个 machine token 有 8 秒心跳下限，agent 自升级或 systemd 重启后立刻发心跳必然撞上，白等一个完整心跳周期才拿得到域名列表。现在 429 被单独识别并按 9 秒快速重试，不再当作普通失败处理。
+- 测试夹具泄漏：`newTestAgent` 原先经过 `New()`，会在构造期间从**生产**状态文件 `/var/lib/warden-gateway-cn/state.json` 读入域名列表。在本机真正跑着 agent 的机器上，整套测试会继承线上分流列表而失败。现在直接走 `newAgent(cfg, log, tempPath)`，构造时就用临时路径。
+
 ## v1.6.2
 
 ### 修复
