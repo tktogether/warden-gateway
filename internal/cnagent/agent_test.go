@@ -393,7 +393,8 @@ func TestNon200KeepsLocalState(t *testing.T) {
 }
 
 // TestRunOnceExecutesCommand pins command execution: a sync-domains command
-// carrying a new list applies it, the next heartbeat reports the new hash,// and the state file records the successful last_command.
+// carrying a new list applies it, the next heartbeat reports the new hash,
+// and the state file records the successful last_command.
 func TestRunOnceExecutesCommand(t *testing.T) {
 	upstream := startFakeUpstream(t, "192.0.2.1")
 	gw := &fakeGateway{reply: func(n int, body map[string]any) (int, any) {
